@@ -13,6 +13,8 @@ xcom_lua/*.lib
 xcom_lua/*.exp
 xcom_lua/*.pdb
 xcom_lua/*.log
+xcom_lua/*.out
+xcom_lua/*.err
 xcom_lua/imgui.ini
 xcom_lua/config.ini
 
