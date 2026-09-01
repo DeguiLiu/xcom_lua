@@ -1,0 +1,65 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 21,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "native-base",
+      "hidden": true,
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_CXX_STANDARD": "17",
+        "CMAKE_CXX_EXTENSIONS": "OFF",
+        "XCOM_BUILD_NATIVE_TESTS": "ON"
+      }
+    },
+    {
+      "name": "native-release",
+      "displayName": "Native Release",
+      "inherits": "native-base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "XCOM_ENABLE_IPO": "ON"
+      }
+    },
+    {
+      "name": "native-debug",
+      "displayName": "Native Debug",
+      "inherits": "native-base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "XCOM_ENABLE_IPO": "OFF"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "build-native-release",
+      "configurePreset": "native-release"
+    },
+    {
+      "name": "build-native-debug",
+      "configurePreset": "native-debug"
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "test-native-release",
+      "configurePreset": "native-release",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "test-native-debug",
+      "configurePreset": "native-debug",
+      "output": {
+        "outputOnFailure": true
+      }
+    }
+  ]
+}

@@ -1,0 +1,370 @@
+/* xcom.h - versioned C ABI contract for xcom_core.dll.
+ *
+ * THE authoritative cross-language contract between the C++17 core and the
+ * PySide6 client (xcom_client/services/core_wrapper.py via ctypes).
+ *
+ * All functions never throw across the boundary; every exported function
+ * wraps its body and returns XcomStatus / safe values.  Struct layouts are
+ * fixed (no hidden padding: explicit _pad fields), MSVC x64 natural
+ * alignment (/Zp8 default), so the ctypes mirrors MUST match exactly.
+ *
+ * Concurrency: only ONE caller thread (the CoreWorker QThread) may call into
+ * this ABI at a time.  Inside the core all work is serialized onto the coact
+ * Dispatcher.  No exported function blocks the caller thread waiting on a
+ * Win32 HANDLE; the CoreWorker drives visibility with a 10 ms poll of
+ * xcom_drain_display (there is deliberately no exported xcom_wait_display).
+ *
+ * v1.1 (2026-08-31):
+ *  - xcom_send: synchronous-copy semantics (DLL copies data[0:size] into
+ *    TxBlockPool before returning, or returns rejected/error; never retains
+ *    the caller pointer).  It does NOT block waiting for the WriteResult;
+ *    that result is returned asynchronously via snapshot/error.
+ *  - Removed public xcom_wait_display.
+ *  - Replaced xcom_set_autosend(const XcomAutoSendConfig*) with
+ *    xcom_set_auto_template(h, data, size, interval_ms, flags); the struct is
+ *    gone and Python must pre-encode (HEX via bytes.fromhex).
+ *
+ * v1.3 (2026-09-01):
+ *  - Added xcom_open_async + xcom_take_open_result so the LuaJIT client can
+ *    move the ~2 s blocking open off its single message-loop thread.  The
+ *    synchronous xcom_open remains byte-for-byte compatible.
+ */
+#ifndef XCOM_H_
+#define XCOM_H_
+
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#ifdef _WIN32
+#  if defined(XCOM_CORE_BUILD)
+#    define XCOM_API __declspec(dllexport)
+#  else
+#    define XCOM_API __declspec(dllimport)
+#  endif
+#else
+#  define XCOM_API
+#endif
+
+#define XCOM_VERSION_MAJOR 1
+#define XCOM_VERSION_MINOR 3
+#define XCOM_VERSION_PATCH 0
+
+/* ---------------------------------------------------------------------------
+ * Result codes (must match xcom_client/services/core_wrapper.py)
+ * ------------------------------------------------------------------------- */
+typedef int32_t XcomStatus;
+enum {
+  XCOM_OK = 0,
+  XCOM_ERR_PARAM = -1,          /* bad argument / bad struct_size / bad hex */
+  XCOM_ERR_NOT_OPEN = -2,       /* operation requires an open port */
+  XCOM_ERR_ALREADY_OPEN = -3,
+  XCOM_ERR_BUSY = -4,           /* open in progress / closing */
+  XCOM_ERR_FULL = -5,           /* queue / TxBlockPool full (tx_rejected++) */
+  XCOM_ERR_IO = -6,             /* serial / Win32 error (see XcomError) */
+  XCOM_ERR_TIMEOUT = -7,        /* close/send timed out */
+  XCOM_ERR_DRAIN_INCOMPLETE = -8,
+  XCOM_ERR_UNSUPPORTED = -9,
+};
+
+/* ---------------------------------------------------------------------------
+ * Opaque handle
+ * ------------------------------------------------------------------------- */
+typedef void* XcomHandle;
+
+/* ---------------------------------------------------------------------------
+ * Create options
+ * ------------------------------------------------------------------------- */
+typedef struct XcomCreateOptions {
+  uint32_t struct_size;   /* sizeof(XcomCreateOptions) */
+  uint32_t flags;         /* reserved, must be 0 */
+} XcomCreateOptions;
+
+/* ---------------------------------------------------------------------------
+ * Port configuration
+ * ------------------------------------------------------------------------- */
+typedef struct XcomPortConfig {
+  uint32_t struct_size;   /* sizeof(XcomPortConfig) */
+  const char* port;       /* e.g. "COM3"; UTF-8, NUL-terminated, borrowed for call */
+  uint32_t baud_rate;     /* 9600 .. 115200 .. 921600 .. 1500000 */
+  uint8_t  data_bits;     /* 5..8 */
+  uint8_t  stop_bits;     /* 0 = 1, 1 = 1.5, 2 = 2 */
+  uint8_t  parity;        /* 0 = none, 1 = odd, 2 = even, 3 = mark, 4 = space */
+  uint8_t  flow_control;  /* 0 = none, 1 = hw(RTS/CTS), 2 = sw(XON/XOFF) */
+  uint8_t  dtr_enable;    /* 0/1 */
+  uint8_t  rts_enable;    /* 0/1 */
+  uint8_t  _pad[2];
+} XcomPortConfig;
+
+/* ---------------------------------------------------------------------------
+ * Send flags
+ *
+ * NOTE (v1.1): the Python client pre-encodes the payload once before calling
+ * xcom_send / xcom_set_auto_template.  HEX input is produced with
+ * bytes.fromhex in Python; the core does NOT parse hex itself.  The default
+ * data is therefore always already-encoded raw bytes.
+ * ------------------------------------------------------------------------- */
+typedef uint32_t XcomSendFlags;
+enum {
+  XCOM_SEND_TEXT = 0,     /* data is already-encoded raw bytes (default) */
+  /* XCOM_SEND_HEX is retained ONLY for source compatibility / optional use.
+   * Python has already pre-encoded the payload (HEX via bytes.fromhex), so
+   * the core does not parse hex; this flag is accepted but treated as opaque
+   * and does not trigger any core-side re-encoding. */
+  XCOM_SEND_HEX  = 1,
+  XCOM_SEND_CRLF = 2,     /* append CR LF after the payload
+                           * (optional; Python may already have appended it) */
+};
+
+/* ---------------------------------------------------------------------------
+ * Display / receive formatting options
+ * ------------------------------------------------------------------------- */
+typedef struct XcomDisplayOptions {
+  uint32_t struct_size;   /* sizeof(XcomDisplayOptions) */
+  uint8_t  hex_view;      /* 0 = text, 1 = hex */
+  uint8_t  timestamp;     /* 0 = off, 1 = prefix [HH:MM:SS.mmm] */
+  uint8_t  pause_display; /* 0 = off, 1 = freeze view; retained Rx applies backpressure */
+  uint8_t  _pad0;
+  uint32_t auto_clear_bytes;   /* 0 = off; else trim threshold on the widget */
+  uint32_t max_display_bytes;  /* default 2 MiB */
+} XcomDisplayOptions;
+
+/* NOTE: the v1.0 XcomAutoSendConfig struct / xcom_set_autosend have been
+ * removed.  Auto-send is configured via xcom_set_auto_template(h, data,
+ * size, interval_ms, flags).  ctypes must no longer bind XcomAutoSendConfig
+ * and the SIZEOF_XCOM_AUTO_SEND_CONFIG constant in core_wrapper.py is
+ * deleted (see docs/abi-realign-checklist.md). */
+
+/* ---------------------------------------------------------------------------
+ * Snapshot (diagnostics + status bar).  All counters are monotonic.
+ * ------------------------------------------------------------------------- */
+typedef struct XcomSnapshot {
+  uint32_t struct_size;        /* sizeof(XcomSnapshot) */
+  uint32_t rx_bytes;           /* bytes read from the port, always counted */
+  uint32_t tx_bytes;           /* bytes written to the port */
+  uint32_t rx_pool_exhausted_bytes;
+  uint32_t tx_rejected;
+  uint32_t auto_tick_coalesced;
+  uint32_t ui_trimmed_bytes;
+  uint32_t save_rejected_bytes;
+  uint32_t display_paused_bytes;   /* bytes retained at the paused display boundary */
+  uint32_t callback_count;
+  uint32_t generation;             /* session generation (increments per open) */
+  uint32_t display_pending;        /* >0: more display batches are buffered */
+  uint16_t port_state;             /* XCOM_PORT_* */
+  uint8_t  _pad[2];
+} XcomSnapshot;
+
+enum {
+  XCOM_PORT_CLOSED = 0,
+  XCOM_PORT_OPENING = 1,
+  XCOM_PORT_OPEN = 2,
+  XCOM_PORT_CLOSING = 3,
+  XCOM_PORT_FAULT = 4,
+};
+
+/* ---------------------------------------------------------------------------
+ * Error record (128-entry ring; xcom_take_error pops one)
+ * ------------------------------------------------------------------------- */
+typedef struct XcomError {
+  uint32_t struct_size;   /* sizeof(XcomError) */
+  int32_t  code;          /* XcomStatus or native Win32 serial error code */
+  uint16_t source;        /* 0 = core, 1 = serial backend, 2 = Win32 */
+  uint16_t _pad;
+  char     message[256];
+} XcomError;
+
+/* ---------------------------------------------------------------------------
+ * Port enumeration
+ * ------------------------------------------------------------------------- */
+typedef struct XcomPortInfo {
+  char     name[64];          /* "COM3" */
+  char     description[256];  /* friendly name if available */
+  uint8_t  busy;              /* 1 = currently open by another handle */
+  uint8_t  _pad[3];
+} XcomPortInfo;
+
+/* ---------------------------------------------------------------------------
+ * ABI functions
+ * ------------------------------------------------------------------------- */
+
+/* Returns (major << 16) | (minor << 8) | patch. */
+XCOM_API uint32_t xcom_version(void);
+
+/* Enumerate available serial ports into out[0..capacity). `count` always
+ * receives the total discovered. A nullptr `out` with capacity == 0 is a valid
+ * size query; insufficient capacity returns XCOM_ERR_FULL without writing past
+ * the supplied buffer. */
+XCOM_API XcomStatus xcom_list_ports(XcomPortInfo* out, uint32_t capacity,
+                                    uint32_t* count);
+
+/* Create the process-wide core instance. Only one XcomHandle may be active at
+ * a time; returns nullptr for invalid options, initialization failure, or when
+ * another active handle already owns the fixed runtime resources. */
+XCOM_API XcomHandle xcom_create(const XcomCreateOptions* options);
+
+/* Open + configure the port. Blocks the caller for at most about 2 s until the
+ * open completes or fails. A timeout requests owner-side cancellation; a
+ * subsequent xcom_close may return BUSY/TIMEOUT until that cancellation drains.
+ * On success the session generation increments and rx counting starts. */
+XCOM_API XcomStatus xcom_open(XcomHandle h, const XcomPortConfig* config);
+
+/* v1.3 async open.  Queue the open request without blocking; the SerialAo
+ * performs it on the Dispatcher.  Returns XCOM_OK when the request was queued
+ * (NOT that the port is open), or an immediate error (XCOM_ERR_PARAM /
+ * XCOM_ERR_BUSY / XCOM_ERR_ALREADY_OPEN / XCOM_ERR_FULL) that a caller of the
+ * synchronous xcom_open would otherwise have returned before blocking.
+ * Poll the result with xcom_take_open_result. */
+XCOM_API XcomStatus xcom_open_async(XcomHandle h, const XcomPortConfig* config);
+
+/* v1.3 non-blocking open-result query.  XCOM_OK means the port is OPEN.
+ * XCOM_ERR_BUSY means the open is still in progress (poll again). Any other
+ * status means the open failed; the detailed error is in the error ring
+ * (xcom_take_error), matching the synchronous xcom_open failure contract. */
+XCOM_API XcomStatus xcom_take_open_result(XcomHandle h);
+
+/* Graceful close.  timeout_ms bounds the whole drain+close.  Idempotent. */
+XCOM_API XcomStatus xcom_close(XcomHandle h, uint32_t timeout_ms);
+
+/* Manual / quick send.  SYNCHRONOUS-COPY semantics (v1.1): the DLL copies
+ * data[0:size] verbatim into a unique TxBlockPool slot before returning, OR
+ * returns rejected/error.  The caller pointer is never retained.  Python has
+ * already pre-encoded the payload (HEX via bytes.fromhex, optional CRLF
+ * applied), so the core does not re-encode or parse HEX.  The function does
+ * NOT block for the actual serial WriteResult: it returns as soon as the
+ * payload is queued (hence "queue-and-return"); the eventual write success or
+ * failure is reported asynchronously via xcom_get_snapshot / xcom_take_error.
+ * Python may freely release/reuse its bytes/ctypes buffer after return. */
+XCOM_API XcomStatus xcom_send(XcomHandle h, const uint8_t* data,
+                              uint32_t size, XcomSendFlags flags);
+
+/* Configure receive display options (hex/timestamp/pause/trim).  Applies to
+ * subsequent blocks only; never reformats history. */
+XCOM_API XcomStatus xcom_set_options(XcomHandle h,
+                                     const XcomDisplayOptions* options);
+
+/* Configure auto-send template.  data is the pre-encoded payload (same
+ * synchronous-copy / queue-and-return contract as xcom_send; the core copies
+ * into a dedicated template TxBlockSlot before returning).  interval_ms==0
+ * disables auto-send.  flags uses XCOM_SEND_TEXT (Python encodes HEX/CRLF).
+ * A subsequent uncommitted re-configuration replaces the template descriptor
+ * atomically on the Dispatcher; coalesced ticks increment
+ * auto_tick_coalesced. */
+XCOM_API XcomStatus xcom_set_auto_template(XcomHandle h, const uint8_t* data,
+                                           uint32_t size, uint32_t interval_ms,
+                                           XcomSendFlags flags);
+
+/* Copy up to `capacity` bytes of the next formatted display batch into
+ * output.  On success *written is the byte count (0 = none).  The bytes are
+ * UTF-8 text: in text view the raw bytes (optionally timestamp-prefixed), in
+ * hex view "AA BB CC " sequences.  May be called repeatedly until
+ * snapshot.display_pending == 0.  The CoreWorker polls this with a 10 ms
+ * timer (Qt::PreciseTimer). */
+XCOM_API XcomStatus xcom_drain_display(XcomHandle h, char* output,
+                                       uint32_t capacity, uint32_t* written);
+
+/* Cheap non-blocking snapshot for the status bar. */
+XCOM_API XcomStatus xcom_get_snapshot(XcomHandle h, XcomSnapshot* output);
+
+/* Pop one error record from the ring; returns XCOM_OK and fills output, or
+ * XCOM_ERR_PARAM / no-error (XCOM_OK with code 0). */
+XCOM_API XcomStatus xcom_take_error(XcomHandle h, XcomError* output);
+
+/* ---------------------------------------------------------------------------
+ * Dedicated file writer
+ *
+ * All file I/O runs on the core-owned writer thread, never in a coact handler
+ * or the GUI/CoreWorker caller. `append` and `submit_atomic` synchronously
+ * copy their input before returning. A full writer queue returns XCOM_ERR_FULL
+ * without accepting or dropping bytes; callers retry after draining/errors.
+ * ------------------------------------------------------------------------- */
+
+/* Open the ordered receive-log destination. `utf8_path` is borrowed only for
+ * this call. `append != 0` preserves existing contents, otherwise truncates.
+ * The call waits (at most 2 s) for the dedicated writer to open the file. */
+XCOM_API XcomStatus xcom_log_open(XcomHandle h, const char* utf8_path,
+                                  uint8_t append);
+
+/* Queue raw bytes after all previous log appends. No caller pointer is kept. */
+XCOM_API XcomStatus xcom_log_append(XcomHandle h, const uint8_t* data,
+                                    uint32_t size);
+
+/* Drain ordered log appends and FlushFileBuffers on the writer thread. */
+XCOM_API XcomStatus xcom_log_flush(XcomHandle h, uint32_t timeout_ms);
+
+/* Drain, flush, and close the log destination on the writer thread. */
+XCOM_API XcomStatus xcom_log_close(XcomHandle h, uint32_t timeout_ms);
+
+/* Queue an atomic UTF-8-path replacement for settings/config data. The core
+ * writes a temporary sibling, flushes it, then MoveFileEx(REPLACE_EXISTING |
+ * WRITE_THROUGH). Completion is polled by request_id; the input is copied. */
+XCOM_API XcomStatus xcom_file_submit_atomic(XcomHandle h,
+                                            const char* utf8_path,
+                                            const uint8_t* data,
+                                            uint32_t size,
+                                            uint64_t request_id);
+
+/* Queue an atomic replacement without copying `data` into the C++ file pool.
+ * `data` is borrowed and MUST remain valid until `xcom_file_take_completion`
+ * returns this request_id. This is intended for FFI owners that keep a counted
+ * reference to an immutable buffer until completion. Reusing a request_id
+ * before its completion is invalid. */
+XCOM_API XcomStatus xcom_file_submit_atomic_borrowed(XcomHandle h,
+                                                     const char* utf8_path,
+                                                     const uint8_t* data,
+                                                     uint32_t size,
+                                                     uint64_t request_id);
+
+/* Incrementally build an atomic UTF-8-path replacement on the core-owned
+ * writer thread. `stream_id` identifies one active replacement. Begin,
+ * every append, commit, and abort each publish their own `request_id`
+ * completion. `data` in append is borrowed until that append completion is
+ * polled. A failed append or commit automatically removes the temporary
+ * sibling; abort is idempotent cleanup for a still-active stream. */
+XCOM_API XcomStatus xcom_file_stream_begin(XcomHandle h,
+                                           const char* utf8_path,
+                                           uint64_t stream_id,
+                                           uint64_t request_id);
+XCOM_API XcomStatus xcom_file_stream_append_borrowed(XcomHandle h,
+                                                     uint64_t stream_id,
+                                                     const uint8_t* data,
+                                                     uint32_t size,
+                                                     uint64_t request_id);
+XCOM_API XcomStatus xcom_file_stream_commit(XcomHandle h,
+                                            uint64_t stream_id,
+                                            uint64_t request_id);
+XCOM_API XcomStatus xcom_file_stream_abort(XcomHandle h,
+                                           uint64_t stream_id,
+                                           uint64_t request_id);
+
+/* Pop one completed atomic-write result. An empty completion queue returns
+ * XCOM_OK with *request_id == 0 and *status == XCOM_OK. */
+XCOM_API XcomStatus xcom_file_take_completion(XcomHandle h,
+                                               uint64_t* request_id,
+                                               XcomStatus* status);
+
+/* Destroy the handle.  Only valid after CLOSED (xcom_close succeeded or the
+ * port never opened); performs a bounded background cleanup otherwise. */
+XCOM_API void xcom_destroy(XcomHandle h);
+
+/* ---------------------------------------------------------------------------
+ * TEST-ONLY seam (guarded; not a product serial channel)
+ * Inject bytes exactly as a native serial-backend read callback would: copies into
+ * RxBlockPool and pushes an RxDescriptor through the same ready ring + wake
+ * path as real reception.  Enables automated receive-path E2E on machines
+ * without serial hardware.  Returns XCOM_ERR_NOT_OPEN when no session. */
+XCOM_API XcomStatus xcom_test_inject_rx(XcomHandle h, const uint8_t* data,
+                                        uint32_t size);
+
+/* NOTE (v1.1 ABI removal): there is deliberately NO exported xcom_wait_display.
+ * The Python side must NOT wait on a Win32 HANDLE.  CoreWorker polls
+ * xcom_drain_display on a 10 ms timer; the DLL keeps its own internal display
+ * wake event for the Dispatcher but that event is NOT exported. */
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* XCOM_H_ */

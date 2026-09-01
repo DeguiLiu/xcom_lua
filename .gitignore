@@ -1,0 +1,39 @@
+# Generated build products and caches
+build/
+**/build/
+.pytest_cache/
+
+# Local runtime binaries and logs
+xcom_lua/luvjit.exe
+xcom_lua/luajit.exe
+xcom_lua/lua51.dll
+xcom_lua/luv.dll
+xcom_lua/*.dll
+xcom_lua/*.lib
+xcom_lua/*.exp
+xcom_lua/*.pdb
+xcom_lua/*.log
+xcom_lua/imgui.ini
+xcom_lua/config.ini
+
+# Local review captures
+xcom_lua/ui_review*.png
+
+# Downloaded runtimes and reference snapshots
+openresty-1.29.2.1-win64/
+openresty-1.29.2.1-win64.zip
+ref/
+_review_*/
+luajit2/
+
+# Python reference application is maintained in the parent project
+xcom_client/
+
+# Only the Dear ImGui source used by the bridge is vendored here
+third_party/*/
+third_party/*.zip
+!third_party/xcom_imgui/
+third_party/xcom_imgui/*
+!third_party/xcom_imgui/imgui/
+!third_party/xcom_imgui/imgui/**
+!third_party/xcom_imgui/LICENSE.txt

@@ -1,0 +1,12 @@
+# Runtime layout metrics. Values are validated and safely defaulted by the bridge.
+[layout]
+sidebar_width = 194
+compact_threshold = 760
+receive_height = 0
+send_height = 212
+header_height = 46
+panel_gap = 6
+window_padding = 8
+item_spacing = 7
+frame_padding_y = 4
+section_gap = 4
