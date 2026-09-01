@@ -10,7 +10,7 @@ Build from the workspace root with:
 
 ```powershell
 cmd /c "call D:\BuildTools\VC\Auxiliary\Build\vcvars64.bat && ninja -C build/xcom-imgui"
-Copy-Item build\xcom-imgui\xcom_imgui.dll xcom_lua\xcom_imgui.dll -Force
+Copy-Item build\xcom-imgui\xcom_imgui.dll xcom_lua\runtime\xcom_imgui.dll -Force
 ```
 
 Dear ImGui is distributed under the MIT License. Its source remains vendored

@@ -10,8 +10,11 @@ set ROOT=D:\workspace\SSCOM_lua
 set APP=%ROOT%\xcom_lua
 rem luv.dll is built against the bundled luvjit.exe; the older luajit.exe
 rem has a different LuaJIT ABI and crashes while loading it.
-set LUAJIT=%APP%\luvjit.exe
+set RUNTIME=%APP%\runtime
+set LUAJIT=%RUNTIME%\luvjit.exe
 set DLL=%ROOT%\build\native-release\bin\xcom_core.dll
+
+if not exist "%DLL%" set DLL=%RUNTIME%\xcom_core.dll
 
 if not exist "%LUAJIT%" (
     echo [run] luajit.exe not found at %LUAJIT%

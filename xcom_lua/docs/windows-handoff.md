@@ -106,7 +106,7 @@ cd xcom_lua
 - `xcom_session_churn_test.exe` PASS(句柄无泄漏)。`xcom_smoke_test.exe` PASS(64 断言全绿)。
 
 **Lua 侧窗口实跑(luajit.exe main.lua):**
-- 把 `openresty-1.29.2.1-win64/luajit.exe` + `lua51.dll` 复制到 `xcom_lua/`(同目录,Windows 加载器按 exe 目录找 lua51.dll)。使用 `run_xcom_lua.cmd`。
+- 把 `openresty-1.29.2.1-win64/luajit.exe` + `lua51.dll` 放入 `xcom_lua/runtime/`(与 `luvjit.exe` 同目录,Windows 加载器按 exe 目录找 lua51.dll)。使用 `run_xcom_lua.cmd`。
 - 逐项修复 7 类 Windows 运行时必崩缺陷(均 Linux 单测未覆盖):
 
 | # | 缺陷 | 修复 |

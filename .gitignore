@@ -31,6 +31,14 @@ luajit2/
 # Python reference application is maintained in the parent project
 xcom_client/
 
+# Checked-in runtime bundle for users who do not build locally
+!xcom_lua/luvjit.exe
+!xcom_lua/luajit.exe
+!xcom_lua/lua51.dll
+!xcom_lua/luv.dll
+!xcom_lua/xcom_imgui.dll
+!xcom_lua/xcom_core.dll
+
 # Only the Dear ImGui source used by the bridge is vendored here
 third_party/*/
 third_party/*.zip
