@@ -479,6 +479,14 @@ BOOL GetMessageW(void* lpMsg, HWND hWnd, UINT wMsgFilterMin, UINT wMsgFilterMax)
 BOOL GetClassNameW(HWND hWnd, LPWSTR lpClassName, int nMaxCount);
 
 void GetCursorPos(POINT* lpPoint);
+BOOL SetCursorPos(int X, int Y);
+
+/* winmm timer resolution: MsgWaitForMultipleObjectsEx sleeps in units of the
+ * system timer (15.6 ms by default), which delays the 10 ms luv drain
+ * deadline to ~23 ms under a full-bandwidth stream.  timeBeginPeriod(1)
+ * raises the resolution process-wide while the app runs. */
+UINT timeBeginPeriod(UINT uPeriod);
+UINT timeEndPeriod(UINT uPeriod);
 HWND WindowFromPoint(POINT pt);
 BOOL SetWindowPos(HWND hWnd, HWND hWndInsertAfter, int x, int y, int cx, int cy, UINT uFlags);
 BOOL EnableWindow(HWND hWnd, BOOL bEnable);
@@ -558,6 +566,14 @@ function M.load()
     shell32 = ffi.load("shell32")
     comctl32 = ffi.load("comctl32")
     comdlg32 = ffi.load("comdlg32")
+    -- Best-effort: winmm provides timeBeginPeriod; absent on rare reduced
+    -- images, in which case the loop falls back to the default timer
+    -- resolution (15.6 ms).
+    ok, winmm = pcall(ffi.load, "winmm")
+    if ok then
+        M.winmm = winmm
+        winmm.timeBeginPeriod(1)
+    end
     -- RICHEDIT lives in riched20.dll.
     ok, riched20 = pcall(ffi.load, "riched20")
     if not ok then

@@ -21,11 +21,15 @@ Usage: runtime\luvjit.exe tests/stress_warp_ui.lua [seconds] [kib_per_s]
 
 if arg and arg[0] and arg[0]:sub(1, 1) ~= "@" then
     local dir = arg[0]:match("^(.*)[/\\]") or "."
-    -- Tests live in <root>/tests; strip a trailing "tests" path component so
+    -- Tests live in <root>/tests; strip the trailing "tests" component so
     -- core/ and ui/ resolve from the app root whether arg[0] is relative
     -- ("tests/x.lua" -> ".") or absolute ("<root>/tests/x.lua" -> "<root>").
-    local root = dir:gsub("[/\\]tests$", "")
-    if root == "" then root = "." end
+    local root
+    if dir == "tests" then
+        root = "."
+    else
+        root = dir:gsub("[/\\]tests$", "")
+    end
     package.path = root .. "/core/?.lua;" .. root .. "/ui/?.lua;" ..
                    package.path
 end
@@ -82,10 +86,7 @@ end
 -- ---- statistics plumbing -------------------------------------------------
 local stats = {
     injected = 0,          -- bytes appended into the receive path
-    frames = 0,            -- rendered ImGui frames (data + interactive + idle)
-    data_frames = 0,       -- frames the data cadence actually triggered
-    gc_steps = 0,          -- P3 collectgarbage("step") invocations
-    gc_full = 0,           -- emergency full collects (should stay 0)
+    frames = 0,            -- rendered ImGui frames (counted at the bridge)
     appended_ticks = 0,    -- 10 ms injection ticks
 }
 -- Hook the bridge frame counter directly: a frame is counted only when the
@@ -109,15 +110,26 @@ local function backlog() return win._imgui_receive_chunk_bytes or 0 end
 
 -- ---- line-rate injection: 10 ms luv timer --------------------------------
 -- poll_display drains on the 10 ms cadence while connected; the UI stress
--- therefore appends on the same cadence at line rate.
+-- therefore appends on the same cadence at line rate.  The loop's effective
+-- tick rate drops when a WARP frame occupies the thread (a periodic libuv
+-- timer does not replay missed fires), so each tick injects by ELAPSED time
+-- (elapsed_ms * rate) — the stream stays at line rate regardless of how many
+-- ticks actually fire.
 local per_tick = math.floor(rate_kib * 1024 * 10 / 1000)
+local last_tick_at
 local inject_timer = uv.new_timer()
 win._stress_inject = inject_timer
 local inject_tick = function()
+    local now = uv.now()
+    if not last_tick_at then last_tick_at = now end
+    local elapsed = now - last_tick_at
+    last_tick_at = now
+    local budget = math.floor(rate_kib * 1024 * elapsed / 1000)
+    if budget < per_tick then budget = per_tick end  -- at least one tick's worth
     stats.appended_ticks = stats.appended_ticks + 1
     local acc = {}
     local n = 0
-    while n < per_tick do
+    while n < budget do
         local l = line()
         acc[#acc + 1] = l
         n = n + #l
@@ -128,6 +140,7 @@ local inject_tick = function()
     -- Mirror poll_display's frame request at data cadence.
     win:request_frame(100)
 end
+jit.off(inject_tick, true)  -- luv C-callback entry: never JIT-compiled
 -- Seed one full window so the first frame is not near-empty.
 for _ = 1, 30 do inject_tick() end
 inject_timer:start(10, 10, inject_tick)
@@ -146,15 +159,14 @@ local function move_mouse()
         w.user32.SetCursorPos(cx - 100 + (seq % 200), cy - 40 + (seq % 80))
     end
 end
+jit.off(move_mouse, true)
 interact_timer:start(500, 500, move_mouse)
 
 -- ---- periodic report ------------------------------------------------------
 local report_timer = uv.new_timer()
 win._stress_report = report_timer
 local t0 = uv.now()
-local reports = 0
 local function report()
-    reports = reports + 1
     print(string.format(
         "  t=%4.1fs heap=%6.1f KiB backlog=%5d B frames=%5d ticks=%5d rate=%6.1f KiB/s",
         (uv.now() - t0) / 1000,
@@ -165,12 +177,15 @@ local function report()
         stats.injected / 1024 / math.max(0.001, (uv.now() - t0) / 1000)))
     io.stdout:flush()
 end
+jit.off(report, true)
 report_timer:start(5000, 5000, report)
 
 -- ---- shutdown summary -----------------------------------------------------
-local shutdown = uv.new_timer()
-win._stress_shutdown = shutdown
-shutdown:start(seconds * 1000, 0, function()
+-- Close the window: on_close saves config and destroys the window, the
+-- message loop then sees WM_QUIT and win:run() returns.  (uv.stop() alone
+-- would only mark the loop stopped — the Win32 pump would keep the process
+-- alive forever.)
+local shutdown = function()
     inject_timer:stop()
     interact_timer:stop()
     report_timer:stop()
@@ -188,7 +203,11 @@ shutdown:start(seconds * 1000, 0, function()
     print(string.format("final backlog:   %d B (cap 65535)", backlog()))
     print(string.format("trim happened:   %s",
                         stats.injected > 70000 and "yes (rolling window)" or "no"))
-    uv.stop()
-end)
+    win:on_close()
+end
+jit.off(shutdown, true)
+local shutdown_timer = uv.new_timer()
+win._stress_shutdown = shutdown_timer
+shutdown_timer:start(seconds * 1000, 0, shutdown)
 
 return win:run()

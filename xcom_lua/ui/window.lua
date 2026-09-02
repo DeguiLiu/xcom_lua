@@ -934,7 +934,9 @@ function Window:on_chk_autosave_toggled()
                            "auto-save: " .. (STATUS_TEXT[rc] or tostring(rc)))
             end
         else
-            self:_log_close_with_retry()
+            -- Deferred: log_close is a synchronous drain wait; the retry loop
+            -- must not freeze the UI when the writer still has bytes.
+            self:_log_close_deferred()
         end
     end
 end
@@ -1222,15 +1224,21 @@ function Window:_sync_imgui_autosave()
             c.set_text(self.status.labels[3], "auto-save: cannot open " .. path)
         end
     else
-        self:_log_close_with_retry()
+        -- Deferred: same drain-wait concern as on_chk_autosave_toggled.
+        self:_log_close_deferred()
     end
 end
 
--- Close the log with a bounded retry (Python retries the close on a 250 ms
--- timer until the writer drains; here we retry synchronously a few times,
--- reporting the final status).  A no-log-open close returns err_io from the
--- ABI, so skip silently when no log session is active.  Returns true on
--- success or "nothing to do".
+-- Close the log with a bounded retry.  The core's log_close(timeout_ms) is a
+-- SYNCHRONOUS wait for the writer to drain; calling it four times back-to-
+-- back froze the UI for up to 2 s whenever the user toggled auto-save off
+-- mid-stream.  The runtime paths (auto-save toggle, save-path change) now
+-- retry through the P2 defer queue — one log_close(500) attempt per loop
+-- iteration, so the UI keeps pumping messages between attempts.  The close
+-- path stays synchronous: quitting must guarantee the log is flushed.
+--
+-- A no-log-open close returns err_io from the ABI, so skip silently when no
+-- log session is active.  Returns true on success or "nothing to do".
 function Window:_log_close_with_retry()
     if not self.core or not self._log_active then return true end
     local rc = tonumber(xcom.log_close(self.core, 500))
@@ -1248,6 +1256,29 @@ function Window:_log_close_with_retry()
     c.set_text(self.status.labels[3],
                "log close failed: " .. (STATUS_TEXT[rc] or tostring(rc)))
     return false
+end
+
+-- Non-blocking variant for runtime paths: try once now; if the writer is
+-- still draining, requeue one attempt via schedule_defer instead of spinning
+-- in place.  Bounded to _log_close_defer_attempts so a wedged writer cannot
+-- queue retries forever.
+function Window:_log_close_deferred()
+    if not self.core or not self._log_active then return end
+    local rc = tonumber(xcom.log_close(self.core, 50))  -- short probe
+    if rc == xcom.ok then
+        self._log_active = false
+        self._log_close_defer_attempts = nil
+        c.set_text(self.status.labels[3], "log closed")
+        return
+    end
+    self._log_close_defer_attempts = (self._log_close_defer_attempts or 0) + 1
+    if self._log_close_defer_attempts <= 20 then
+        self:schedule_defer(function() self:_log_close_deferred() end)
+    else
+        self._log_close_defer_attempts = nil
+        c.set_text(self.status.labels[3],
+                   "log close failed: " .. (STATUS_TEXT[rc] or tostring(rc)))
+    end
 end
 
 function Window:_choose_imgui_log_path()
@@ -1632,15 +1663,16 @@ end
 --                      250 ms status snapshot and the multi-send cycle when
 --                      they are due — never late because the loop slept.
 --   P2 deferred jobs — high-priority task queue drained fully (schedule_defer).
---   P3 idle GC       — only when this iteration saw no input: one bounded
---                      collectgarbage("step"), so a sustained serial stream
---                      (which never yields to a full GC) still compacts.
+--   P3 GC step       — triggered by >=128 KiB of heap growth since the last
+--                      step (dense input bursts don't starve the collector;
+--                      a steady receive stream doesn't over-commit it).
 --
 -- Then render (paced by cause inside render_imgui) and SLEEP until the next
 -- event: MsgWaitForMultipleObjectsEx wakes on any queued message or at the
 -- earlier of the luv timer deadline (uv.backend_timeout) and the next frame
--- deadline.  This replaces the old uv.sleep(1) poll — the process wakes a
--- handful of times per idle second instead of ~64.
+-- deadline (0 if the deadline already passed).  This replaces the old
+-- uv.sleep(1) poll — the process wakes a handful of times per idle second
+-- instead of ~64.
 --
 -- jit.off on this function only: it calls into DispatchMessageW, which in
 -- turn re-enters the WndProc callback (an FFI closure created via
@@ -1652,12 +1684,10 @@ local run_message_loop = function(self)
     local msg = ffi.new("MSG")
     while true do
         -- P0: pump ALL pending Win32 messages (non-blocking).
-        local saw_input = false
         while w.user32.PeekMessageW(msg, nil, 0, 0, 1) ~= 0 do  -- 1 = PM_REMOVE
             if msg.message == w.wm.WM_QUIT then
                 return
             end
-            saw_input = true
             w.user32.TranslateMessage(msg)
             w.user32.DispatchMessageW(msg)
         end
@@ -1677,11 +1707,15 @@ local run_message_loop = function(self)
             end
         end
 
-        -- P3: idle-only bounded GC step.  A steady receive stream produces a
-        -- constant supply of dead chunk strings; without this the collector
-        -- only ever runs on explicit collectgarbage() calls.
-        if not saw_input then
-            collectgarbage("step", 8)
+        -- P3: bounded GC step.  Trigger by heap growth since the last step,
+        -- not by "this iteration saw input": a dense input burst must not
+        -- starve the collector (chunks keep piling), and a sustained receive
+        -- stream must not step every 10 ms either (step(8) is 8 KiB of GC
+        -- budget per call — 100 calls/s would over-commit the collector).
+        local heap_now = collectgarbage("count")
+        if heap_now - (self._gc_last_heap or 0) >= 128 then  -- >= 128 KiB new
+            collectgarbage("step", 32)
+            self._gc_last_heap = collectgarbage("count")
         end
 
         self:render_imgui()
@@ -1693,7 +1727,12 @@ local run_message_loop = function(self)
         if not timeout_ms or timeout_ms < 0 then timeout_ms = 100 end
         local frame_wait = self._imgui_next_frame and
             (self._imgui_next_frame - uv.now()) or 0
-        if frame_wait > 0 and frame_wait < timeout_ms then
+        if frame_wait <= 0 then
+            -- The frame deadline already passed while the layers above ran
+            -- (e.g. a WARP frame or drain overran the budget): render on the
+            -- very next iteration instead of sleeping out the timer deadline.
+            timeout_ms = 0
+        elseif frame_wait < timeout_ms then
             timeout_ms = frame_wait
         end
         w.user32.MsgWaitForMultipleObjectsEx(
@@ -1712,6 +1751,10 @@ function Window:run()
             t:stop()
             t:close()
         end
+    end
+    -- Release the 1 ms system-timer resolution requested in w.load().
+    if w.winmm then
+        w.winmm.timeEndPeriod(1)
     end
     if self.imgui then
         self.imgui:close()
