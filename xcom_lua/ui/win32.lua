@@ -74,6 +74,12 @@ M.style = {
     SW_RESTORE = 9,
     SW_MAXIMIZE = 3,
     SW_MINIMIZE = 6,
+    -- SetWindowPos flags / insert-after pseudo-handles.
+    SWP_NOSIZE = 0x0001,
+    SWP_NOMOVE = 0x0002,
+    SWP_NOACTIVATE = 0x0010,
+    HWND_TOPMOST = -1,
+    HWND_NOTOPMOST = -2,
 }
 
 M.ctrl = {

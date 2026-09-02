@@ -5,6 +5,7 @@ int xcom_imgui_init(void* hwnd);
 void xcom_imgui_set_ports(const char* const* names, int count);
 int xcom_imgui_new_frame(void);
 int xcom_imgui_render(void);
+void xcom_imgui_set_receive_text(const char* text, size_t length);
 int xcom_imgui_wndproc(void* hwnd, unsigned int msg, uintptr_t wparam, intptr_t lparam);
 int xcom_imgui_draw_console(char* port, size_t port_capacity, int connected,
   int rx_bytes, int tx_bytes, int* baud, int* data_bits, int* stop_bits,
@@ -84,9 +85,13 @@ function M.new(hwnd, cfg)
     return setmetatable(self, { __index = M })
 end
 
-function M:draw(connected, rx_bytes, tx_bytes, text)
+function M:set_receive_text(text)
     text = text or ""
     local n = math.min(#text, RECEIVE_CAPACITY - 1)
+    self.lib.xcom_imgui_set_receive_text(text, n)
+end
+
+function M:draw(connected, rx_bytes, tx_bytes)
     local actions = self.lib.xcom_imgui_draw_console(
         self.port, PORT_CAPACITY, connected and 1 or 0, rx_bytes or 0, tx_bytes or 0,
         self.baud, self.data_bits, self.stop_bits, self.parity, self.flow, self.dtr, self.rts,
@@ -94,8 +99,8 @@ function M:draw(connected, rx_bytes, tx_bytes, text)
         self.send, SEND_CAPACITY, self.send_hex, self.send_crlf, self.send_auto, self.send_period,
         self.multi_text, MULTI_SLOT_CAPACITY, self.multi_enabled, self.multi_hex, self.multi_crlf,
         self.multi_page, self.multi_page_count, self.multi_auto, self.multi_period, self.auto_save,
-        text, n)
-    return tonumber(actions)
+        nil, 0)
+    return actions
 end
 
 function M:port_name()

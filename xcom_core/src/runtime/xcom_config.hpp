@@ -26,14 +26,14 @@ struct XcomCoactConfig : coact::DefaultConfig {
 };
 
 // Resource budgets (design §4). These are quantities, not enum variants.
-inline constexpr std::uint32_t kRxBlockCount = 1024U;
+inline constexpr std::uint32_t kRxBlockCount = 256U;
 inline constexpr std::uint32_t kRxBlockBytes = 4096U;
 inline constexpr std::uint32_t kSerialReadBufferBytes =
     kRxBlockCount * kRxBlockBytes;
 inline constexpr std::uint32_t kTxBlockCount = 32U;
 inline constexpr std::uint32_t kTxBlockBytes = 4096U;
-inline constexpr std::uint32_t kDisplayBatchCount = 256U;
-inline constexpr std::uint32_t kDisplayBatchBytes = 65536U;
+inline constexpr std::uint32_t kDisplayBatchCount = 64U;
+inline constexpr std::uint32_t kDisplayBatchBytes = 16384U;
 inline constexpr std::uint32_t kErrorRingCount = 128U;
 
 enum class Signal : std::uint16_t {

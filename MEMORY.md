@@ -32,7 +32,7 @@
 
 ### coact 实时核心
 
-- **零开销抽象 / CRTP**：`Hsm<Context>` 以模板静态绑定状态转移，保存表指针而不复制上下文，不在热路径执行 `new/delete`。
+- **零开销抽象 / 类模板静态绑定**：`Hsm<Context>` 以模板静态绑定状态转移，保存表指针而不复制上下文，不在热路径执行 `new/delete`。
 - **类型擦除 + 虚接口**：`AoBase` 提供最小 vtable，`Ao<Config>` 覆盖 `dispatch` 等操作；AO 使用静态或自动存储期，禁止经基类指针释放。
 - **受限单例**：`g_pool_registry` 是唯一允许的可变全局注册表，保存非拥有指针；其它组件不得添加隐式可变单例。
 - **策略模式（Policy-based design）**：`policy.hpp` 和 `config.hpp` 通过模板参数注入 core/profile 策略，在编译期决定批量回收、队列和调度行为。
@@ -44,7 +44,7 @@
 - **组件模式**：`PanelScope`、`Section`、`Field`、`Toggle`、`PrimaryAction`、`EmptyState` 统一视觉和生命周期。
 - **命令模式（模板化）**：`Command<Action>::Execute()` 在编译期绑定动作类型，按钮只返回 ABI 兼容的动作掩码。
 - **装饰器模式**：`StyleDecorator`/`WithRounding` 以 RAII 包装 ImGui style stack，确保异常或提前返回时成对 Pop。
-- **观察者模式**：`ActionObserver` 发布 UI 动作，`ImGuiRuntime` 汇总观察结果，再由 Lua 消费稳定的 C ABI 位掩码。
+- **动作掩码直返**：`xcom_imgui_draw_console` 累积的 Action 位掩码直接作为 C ABI 返回值交给 Lua 消费（单消费者场景不引入观察者间接层）。
 - **描述表驱动**：`ComboSpec`、`ToggleSpec` 与 `std::array` 生成串口配置和发送选项，减少重复控件代码。
 - **非拥有切片**：`Slice<T>` 只借用端口列表内存，提供 `constexpr/noexcept` 迭代，不产生临时容器拷贝。
 - **策略化布局**：`assets/layout.toml` 提供侧栏宽度、间距、字体内边距和区域高度；解析失败时回退到编译期安全默认值。
@@ -59,9 +59,9 @@
 
 | 模式 | 当前实现 | 使用约束 |
 | --- | --- | --- |
-| 模板命令（Command） | `Command<Action>::Execute()` | Invocable 必须返回 `bool`；动作值在 C ABI 边界显式转换。 |
+| 命令（Command） | `Command<Action>::Execute()` | Invocable 必须返回 `bool`；动作值在 C ABI 边界显式转换。 |
 | 装饰器（Decorator） | `StyleDecorator<DrawFn>`、`WithRounding()` | 只包装可调用对象；style push/pop 必须由 RAII 配对。 |
-| 观察者（Observer） | `ActionObserver` → `ImGuiRuntime::dispatch()` | 观察者不拥有 UI 状态；发布零动作时不回调。 |
+| 动作掩码直返 | `xcom_imgui_draw_console` 返回 Action 位掩码 | 单消费者时优先直接返回；只有多订阅者解耦才引入观察者。 |
 | 单例（Singleton） | `ImGuiRuntime::instance()`、coact `g_pool_registry` | 仅允许一个受控可变实例；禁止新增隐式全局状态。 |
 | 策略（Policy-based） | coact `policy.hpp` / `config.hpp` | 用模板参数选择策略，避免热路径虚调用。 |
 | 零开销抽象 | `Hsm<Context>`、`Slice<T>`、描述表模板 | 优先静态绑定、借用视图和 `constexpr`，不复制上下文。 |

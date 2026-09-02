@@ -14,9 +14,8 @@ add_library(xcom_imgui SHARED
     ${IMGUI_ROOT}/imgui_draw.cpp
     ${IMGUI_ROOT}/imgui_tables.cpp
     ${IMGUI_ROOT}/imgui_widgets.cpp
-    ${IMGUI_ROOT}/imgui_demo.cpp
     ${IMGUI_ROOT}/imgui_impl_win32.cpp
-    ${IMGUI_ROOT}/imgui_impl_opengl2.cpp
+    ${IMGUI_ROOT}/imgui_impl_dx11.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/xcom_imgui_bridge.cpp
 )
 
@@ -28,7 +27,7 @@ target_compile_definitions(xcom_imgui PRIVATE WIN32_LEAN_AND_MEAN)
 if(MSVC)
     target_compile_options(xcom_imgui PRIVATE /EHsc)
 endif()
-target_link_libraries(xcom_imgui PRIVATE opengl32 gdi32 user32 imm32)
+target_link_libraries(xcom_imgui PRIVATE d3d11 dxgi gdi32 user32 imm32)
 set_target_properties(xcom_imgui PROPERTIES PREFIX "")
 
 foreach(font_file IN ITEMS SiemensSlabRoman.ttf SiemensSlabBold.TTF)

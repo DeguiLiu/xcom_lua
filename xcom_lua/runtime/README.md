@@ -10,6 +10,11 @@ delete this directory and rebuild/download the same components locally.
 | `luvjit.exe`, `lua51.dll`, `luv.dll` | Downloaded LuaJIT + libuv runtime |
 | `xcom_imgui.dll` | Generated from `native/xcom_imgui` and vendored Dear ImGui |
 | `xcom_core.dll` | Generated from the project `xcom_core` CMake target |
+| `xcom.exe` | Small Win32 launcher with an embedded application icon |
+
+Launch `xcom.exe` for the packaged client. It starts `luvjit.exe` from the
+same directory with the parent `main.lua`, preserving the existing runtime
+layout while giving Explorer and shortcuts a real application icon.
 
 The bundle is intentionally isolated from source and build caches. The
 launcher prefers a locally built `build/native-release/bin/xcom_core.dll` and

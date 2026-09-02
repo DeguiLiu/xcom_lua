@@ -160,10 +160,6 @@ function M.build(panel, x, y, w_, h, row_h)
         view._trimmed = 0
     end
 
-    function view.set_max_bytes(v)
-        -- compatibility; the real bound is the block budget below.
-    end
-
     -- Feed one entire display batch (UTF-8 string) and colour it.
     function view.feed(batch_bytes)
         if not batch_bytes or #batch_bytes == 0 then

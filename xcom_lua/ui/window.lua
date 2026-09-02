@@ -41,7 +41,9 @@ local function stop_index(t) return STOP_MAP[t] or 0 end
 local function parity_index(t) return PARITY_MAP[t] or 0 end
 local function flow_index(t) return FLOW_MAP[t] or 0 end
 
--- The single active window captured by the WndProc callback.
+-- The single active window captured by the WndProc callback.  Kept as a
+-- module-level local so the FFI callback closure has one upvalue that stays
+-- reachable for the whole process lifetime (never GC'd).
 local Active = nil
 
 -- Siemens light palette (Win32 COLORREF).
@@ -64,7 +66,7 @@ local PAL = {
 -- STATUS_FATAL_USER_CALLBACK_EXCEPTION / exit code 0xC000041D, with no
 -- diagnostic).  On error we print the offending message + error to stderr and
 -- return 0 so the window can keep pumping messages during bring-up.
-local WndProc = ffi.new("WNDPROC", function(hwnd, msg, wparam, lparam)
+local wndproc_callback = function(hwnd, msg, wparam, lparam)
     local win = Active
     if not win then
         return 0
@@ -76,7 +78,9 @@ local WndProc = ffi.new("WNDPROC", function(hwnd, msg, wparam, lparam)
         return 0
     end
     return tonumber(result) or 0
-end)
+end
+jit.off(wndproc_callback, true)
+local WndProc = ffi.new("WNDPROC", wndproc_callback)
 
 local Window = {}
 Window.__index = Window
@@ -169,6 +173,10 @@ function M.new(cfg, cfg_data, config_path)
     self._handlers = {}             -- id -> handler name string
     self._autosend_on = false
     self._max_display_bytes = 2 * 1024 * 1024
+    self._imgui_receive = ""
+    self._imgui_receive_chunks = {}
+    self._imgui_receive_chunk_bytes = 0
+    self._imgui_receive_dirty = false
     -- HSM mirror of the native port state (design: interlock parity with the
     -- Python client's ViewModel — see core/view_model.lua).
     self.vm = view_model.new()
@@ -210,7 +218,19 @@ function Window:init_window()
     self:_init_imgui()
     w.user32.ShowWindow(self.hwnd, w.style.SW_SHOW)
     w.user32.UpdateWindow(self.hwnd)
+    if self.cfg.always_on_top then
+        self:_set_always_on_top(true)
+    end
     return true
+end
+
+-- Apply/clear HWND_TOPMOST without moving or resizing (persisted in
+-- config.ini as display.always_on_top; previously saved but never applied).
+function Window:_set_always_on_top(enabled)
+    w.user32.SetWindowPos(self.hwnd,
+        ffi.cast("HWND", enabled and w.style.HWND_TOPMOST or w.style.HWND_NOTOPMOST),
+        0, 0, 0, 0, w.style.SWP_NOMOVE + w.style.SWP_NOSIZE + w.style.SWP_NOACTIVATE)
+    self._always_on_top = enabled
 end
 
 local function set_tree_visible(value, node, seen)
@@ -328,6 +348,8 @@ flow_text = function(i) return FLOW_TEXT[i] or "None" end
 -- ---------------------------------------------------------------------------
 -- WndProc dispatch
 -- ---------------------------------------------------------------------------
+-- jit.off: entered from the WndProc FFI callback (C re-entry).  Must never be
+-- JIT-compiled — see the LuaJIT FFI callback rule in run_message_loop's note.
 function Window:dispatch(hwnd, msg, wparam, lparam)
     local m = msg
     local imgui_handled = false
@@ -402,6 +424,14 @@ function Window:dispatch(hwnd, msg, wparam, lparam)
         self:on_size(wparam, lparam)
         return 0
     end
+    if m == w.wm.WM_SYSKEYDOWN then
+        -- Alt+0..7: fire the matching multi-send entry (Python's QShortcut
+        -- Alt+0..7 parity).  Alt+<digit> arrives as WM_SYSKEYDOWN; we consume
+        -- only the digit range so other Alt combos (menu mnemonics) pass on.
+        if self:_on_alt_digit(tonumber(wparam) or 0) then
+            return 0
+        end
+    end
     if m == w.wm.WM_DESTROY then
         w.user32.PostQuitMessage(0)
         return 0
@@ -420,6 +450,40 @@ function Window:dispatch(hwnd, msg, wparam, lparam)
     end
 
     return w.user32.DefWindowProcA(hwnd, msg, wparam, lparam)
+end
+jit.off(Window.dispatch)
+
+-- Alt+digit handling (WM_SYSKEYDOWN).  Returns true when the key was a
+-- digit we consumed, so the caller can skip DefWindowProc.
+function Window:_on_alt_digit(vk)
+    local index
+    if vk >= 0x30 and vk <= 0x39 then        -- '0'..'9' main row
+        index = vk - 0x30
+    elseif vk >= 0x60 and vk <= 0x69 then    -- VK_NUMPAD0..9
+        index = vk - 0x60
+    else
+        return false
+    end
+    if index > 7 then
+        return false  -- only slots 0..7 exist
+    end
+    if self.imgui then
+        local text, enabled = self.imgui:multi_entry(index)
+        if enabled and text ~= "" then
+            local payload = xcom.build_send_payload(text,
+                self.imgui.multi_hex[0] ~= 0, self.imgui.multi_crlf[0] ~= 0)
+            if payload then self:core_send(payload, xcom.send_text) end
+        end
+    elseif self.send then
+        local sp = self.send
+        if sp.entry_enabled(index) then
+            local payload = xcom.build_send_payload(
+                sp.entry_text(index), c.checkbox_checked(sp.multi.hex),
+                c.checkbox_checked(sp.multi.crlf))
+            if payload then self:core_send(payload, xcom.send_text) end
+        end
+    end
+    return true
 end
 
 -- Header hit-test: title bar drag + edge resize + custom window buttons.
@@ -528,15 +592,49 @@ function Window:on_command(wparam, lparam)
     return 0
 end
 
--- WM_COMMAND: child-id dispatch.
--- (on_command is defined just above; on_close below handles teardown.)
+-- Bounded final drain: after the port is closed the core may still hold
+-- accepted-but-undisplayed bytes.  Pump drain_display in 64 KiB rounds (same
+-- budget as the 10 ms poller) with a hard round cap so a pathological stream
+-- can never spin the close path or balloon the receive buffer — the ImGui
+-- tail is already clamped to 64 KiB chars by poll_display's substring.
+-- Python parity: MainWindow._drain_for_close polls until display_pending
+-- reaches zero before quitting.
+function Window:_final_drain()
+    if not self.core then
+        return
+    end
+    local max_rounds = 500  -- 500 * 64 KiB = 32 MiB hard ceiling
+    for _ = 1, max_rounds do
+        local rc, text = xcom.drain_display(self.core, 64 * 1024)
+        if rc ~= xcom.ok or not text or #text == 0 then
+            break
+        end
+        self:_append_imgui_receive(text)
+        if self._log_active then
+            xcom.log_append(self.core, text, #text)
+        end
+        if self.recv and self.recv.feed then
+            self.recv.feed(text)
+        end
+    end
+end
+
 function Window:on_close()
-    -- Mirrors Python's closeEvent: stop any auto-send before tearing down.
+    -- Mirrors Python's closeEvent pipeline: stop auto-send, stop the poll
+    -- timers (no new data while we drain), drain accepted bytes to the
+    -- display, flush the log, then close the port and destroy the window.
     self:_set_autosend_enabled(false)
+    if self._multi_timer then self._multi_timer:stop() end
+    if self._display_timer then self._display_timer:stop() end
+    if self._status_timer then self._status_timer:stop() end
+    self:_final_drain()
     self:_save_config()
-    if self.core and self.connected then
-        xcom.close(self.core, 2000)
-        self.connected = false
+    if self.core then
+        self:_log_close_with_retry()
+        if self.connected then
+            xcom.close(self.core, 2000)
+            self.connected = false
+        end
     end
     if self.imgui then
         self.imgui:close()
@@ -565,44 +663,24 @@ function Window:_save_config()
     end
     local conn = self.conn
     if conn then
-        config.set(data, "port", "name", self._imgui_port or c.get_text(conn.port))
-        local baud, data_bits, stop, parity, flow, dtr, rts
-        if self.imgui then
-            baud, data_bits, stop, parity, flow, dtr, rts = self.imgui:serial_config()
-        else
-            baud = tonumber(c.combo_text(conn.baud)) or 115200
-            data_bits = tonumber(c.combo_text(conn.data)) or 8
-            stop = stop_index(c.combo_text(conn.stop))
-            parity = parity_index(c.combo_text(conn.parity))
-            flow = flow_index(c.combo_text(conn.flow))
-            dtr = c.checkbox_checked(conn.dtr)
-            rts = c.checkbox_checked(conn.rts)
-        end
-        config.set(data, "serial", "baud_rate", baud)
-        config.set(data, "serial", "data_bits", data_bits)
-        config.set(data, "serial", "stop_bits", stop)
-        config.set(data, "serial", "parity", parity)
-        config.set(data, "serial", "flow_control", flow)
-        config.set(data, "serial", "dtr_enable", dtr)
-        config.set(data, "serial", "rts_enable", rts)
+        local serial = self:_serial_config()
+        config.set(data, "port", "name", serial.port)
+        config.set(data, "serial", "baud_rate", serial.baud_rate)
+        config.set(data, "serial", "data_bits", serial.data_bits)
+        config.set(data, "serial", "stop_bits", serial.stop_bits)
+        config.set(data, "serial", "parity", serial.parity)
+        config.set(data, "serial", "flow_control", serial.flow_control)
+        config.set(data, "serial", "dtr_enable", serial.dtr)
+        config.set(data, "serial", "rts_enable", serial.rts)
     end
     local recv = self.recv
     if recv then
-        local hex_view, timestamp, pause_display, auto_clear_bytes
-        if self.imgui then
-            hex_view, timestamp, pause_display, auto_clear_bytes = self.imgui:display_options()
-        else
-            hex_view = c.checkbox_checked(recv.rx_hex_cb)
-            timestamp = c.checkbox_checked(recv.ts_cb)
-            pause_display = c.checkbox_checked(recv.pause_cb)
-            auto_clear_bytes = c.checkbox_checked(recv.auto_clear_cb) and
-                (tonumber(c.get_text(recv.auto_clear_sb)) or 0) or 0
-        end
-        config.set(data, "display", "timestamp", timestamp)
-        config.set(data, "display", "pause_display", pause_display)
-        config.set(data, "display", "auto_clear_bytes", auto_clear_bytes)
+        local opts = self:_display_options()
+        config.set(data, "display", "timestamp", opts.timestamp)
+        config.set(data, "display", "pause_display", opts.pause_display)
+        config.set(data, "display", "auto_clear_bytes", opts.auto_clear_bytes)
         config.set(data, "display", "auto_save", c.checkbox_checked(recv.auto_save_cb))
-        config.set(data, "send", "receive_hex", hex_view)
+        config.set(data, "send", "receive_hex", opts.receive_hex)
     end
     if self.imgui then
         config.set(data, "send", "hex", self.imgui.send_hex[0] ~= 0)
@@ -626,6 +704,52 @@ end
 -- ABI lifecycle helpers (single-thread; called from message-loop handlers).
 -- ---------------------------------------------------------------------------
 
+-- Current serial configuration as a plain record
+-- {port, baud_rate, data_bits, stop_bits, parity, flow_control, dtr, rts},
+-- read from the ImGui bridge when active and from the native panel controls
+-- otherwise.  Single source for core_open() and _save_config(), which used to
+-- each duplicate the imgui-vs-native branch.
+function Window:_serial_config()
+    local conn = self.conn
+    if self.imgui then
+        local baud, data_bits, stop, parity, flow, dtr, rts = self.imgui:serial_config()
+        return {
+            port = self._imgui_port or ffi.string(self.imgui.port),
+            baud_rate = baud, data_bits = data_bits, stop_bits = stop,
+            parity = parity, flow_control = flow, dtr = dtr, rts = rts,
+        }
+    end
+    return {
+        port = c.get_text(conn.port),
+        baud_rate = tonumber(c.combo_text(conn.baud)) or 115200,
+        data_bits = tonumber(c.combo_text(conn.data)) or 8,
+        stop_bits = stop_index(c.combo_text(conn.stop)),
+        parity = parity_index(c.combo_text(conn.parity)),
+        flow_control = flow_index(c.combo_text(conn.flow)),
+        dtr = c.checkbox_checked(conn.dtr),
+        rts = c.checkbox_checked(conn.rts),
+    }
+end
+
+-- Current display options as a plain record {receive_hex, timestamp,
+-- pause_display, auto_clear_bytes}, from the same dual source.  Shared by
+-- _push_display_options() and _save_config().
+function Window:_display_options()
+    local recv = self.recv
+    if self.imgui then
+        local hex_view, timestamp, pause_display, auto_clear_bytes = self.imgui:display_options()
+        return { receive_hex = hex_view, timestamp = timestamp,
+                 pause_display = pause_display, auto_clear_bytes = auto_clear_bytes }
+    end
+    return {
+        receive_hex = c.checkbox_checked(recv.rx_hex_cb),
+        timestamp = c.checkbox_checked(recv.ts_cb),
+        pause_display = c.checkbox_checked(recv.pause_cb),
+        auto_clear_bytes = c.checkbox_checked(recv.auto_clear_cb) and
+            (tonumber(c.get_text(recv.auto_clear_sb)) or 0) or 0,
+    }
+end
+
 -- Open intent: mirrors Python MainWindow._on_open_clicked — the HSM must
 -- accept the intent (CLOSED/FAULT only) before any ABI call is made; a
 -- rejected intent (e.g. already opening) leaves state untouched.
@@ -645,27 +769,16 @@ function Window:core_open()
         return
     end
     self:_render_ui_state()
-    local conn = self.conn
-    local port = self._imgui_port or c.get_text(conn.port)
-    local baud, data, stop, par, flow, dtr, rts
-    if self.imgui then
-        baud, data, stop, par, flow, dtr, rts = self.imgui:serial_config()
-    else
-        baud = tonumber(c.combo_text(conn.baud)) or 115200
-        data = tonumber(c.combo_text(conn.data)) or 8
-        stop = stop_index(c.combo_text(conn.stop))
-        par = parity_index(c.combo_text(conn.parity))
-        flow = flow_index(c.combo_text(conn.flow))
-        dtr = c.checkbox_checked(conn.dtr)
-        rts = c.checkbox_checked(conn.rts)
-    end
     -- xcom_open_async returns XCOM_OK when the request is *queued* on the
     -- Dispatcher (NOT that the port is open); completion is observed via
     -- xcom_take_open_result() in poll_status().  A non-OK result is an
     -- immediate failure the synchronous path would also have returned before
     -- blocking, so roll the intent back instead of waiting for a snapshot
     -- that will never report OPEN.
-    local rc = xcom.open_async(self.core, port, baud, data, stop, par, flow, dtr, rts)
+    local serial = self:_serial_config()
+    local rc = xcom.open_async(self.core, serial.port, serial.baud_rate,
+        serial.data_bits, serial.stop_bits, serial.parity, serial.flow_control,
+        serial.dtr, serial.rts)
     if rc ~= xcom.ok then
         self.vm:reject_open()
         c.set_text(self.status.labels[1], "OPEN FAILED")
@@ -713,23 +826,14 @@ function Window:_push_display_options()
     if not recv then
         return
     end
-    local hex_view, timestamp, pause_display, auto_clear_bytes
-    if self.imgui then
-        hex_view, timestamp, pause_display, auto_clear_bytes = self.imgui:display_options()
-    else
-        hex_view = c.checkbox_checked(recv.rx_hex_cb)
-        timestamp = c.checkbox_checked(recv.ts_cb)
-        pause_display = c.checkbox_checked(recv.pause_cb)
-        local auto_clear_on = c.checkbox_checked(recv.auto_clear_cb)
-        auto_clear_bytes = auto_clear_on and (tonumber(c.get_text(recv.auto_clear_sb)) or 0) or 0
-    end
-    recv.hex_view = hex_view
-    recv.timestamp = timestamp
+    local opts = self:_display_options()
+    recv.hex_view = opts.receive_hex
+    recv.timestamp = opts.timestamp
     self:core_set_options({
-        hex_view = hex_view,
-        timestamp = timestamp,
-        pause_display = pause_display,
-        auto_clear_bytes = auto_clear_bytes,
+        hex_view = opts.receive_hex,
+        timestamp = opts.timestamp,
+        pause_display = opts.pause_display,
+        auto_clear_bytes = opts.auto_clear_bytes,
         max_display_bytes = self._max_display_bytes,
     })
 end
@@ -756,47 +860,104 @@ function Window:on_chk_autosave_toggled()
     end
     if self.core then
         if enabled then
-            xcom.log_open(self.core, path, true)  -- append
+            local rc = tonumber(xcom.log_open(self.core, path, true))  -- append
+            if rc == xcom.ok then
+                self._log_active = true
+            else
+                c.set_checked(self.recv.auto_save_cb, false)
+                c.set_text(self.status.labels[3],
+                           "auto-save: " .. (STATUS_TEXT[rc] or tostring(rc)))
+            end
         else
-            xcom.log_close(self.core, 2000)
+            self:_log_close_with_retry()
         end
     end
 end
 
 -- Timer poll 1: 10 ms display drain.
+-- jit.off: invoked from a libuv timer callback (C re-entry into Lua).
+-- LuaJIT forbids FFI callbacks being entered from JIT-compiled traces; when
+-- the timer chain was traced the process died with PANIC "bad callback"
+-- within seconds of startup (see run_message_loop note below).
 function Window:poll_display()
     if not self.core or not self.connected then
         return
     end
     -- bounded drain budget 64 KiB per round like the Python worker.
-    local budget = 64 * 1024
-    local cap = math.min(budget, self._max_display_bytes)
-    local rc, text = xcom.drain_display(self.core, cap)
-    if rc == xcom.ok and text then
-        self._imgui_receive = ((self._imgui_receive or "") .. text):sub(-65535)
-        if self.recv and self.recv.feed then
-            self.recv.feed(text)
-        end
+    local rc, text = xcom.drain_display(self.core, 64 * 1024)
+    if rc ~= xcom.ok or not text or #text == 0 then
+        return
+    end
+    self:_append_imgui_receive(text)
+    if self._log_active then
+        xcom.log_append(self.core, text, #text)
+    end
+    -- The native RICHEDIT is hidden while the ImGui dashboard is active;
+    -- feeding it is invisible work that still walks the whole batch through
+    -- EM_REPLACESEL + colouring.  Only feed when the panel is on screen.
+    if not self.imgui and self.recv and self.recv.feed then
+        self.recv.feed(text)
     end
 end
+jit.off(Window.poll_display)
 
+function Window:_append_imgui_receive(text)
+    if not text or #text == 0 then return end
+    local chunks = self._imgui_receive_chunks
+    chunks[#chunks + 1] = text
+    self._imgui_receive_chunk_bytes = self._imgui_receive_chunk_bytes + #text
+    while self._imgui_receive_chunk_bytes > 65535 and #chunks > 1 do
+        self._imgui_receive_chunk_bytes = self._imgui_receive_chunk_bytes - #chunks[1]
+        table.remove(chunks, 1)
+    end
+    if #chunks == 1 and #chunks[1] > 65535 then
+        chunks[1] = chunks[1]:sub(-65535)
+        self._imgui_receive_chunk_bytes = #chunks[1]
+    end
+    self._imgui_receive_dirty = true
+end
+
+function Window:_flush_imgui_receive()
+    if not self._imgui_receive_dirty then return false end
+    local chunks = self._imgui_receive_chunks
+    -- One concat produces the tail in a single allocation; the chunks list is
+    -- already trimmed to <= 64 KiB by _append_imgui_receive, so no second
+    -- concatenation or :sub() copy is needed here.
+    self._imgui_receive = #chunks == 1 and chunks[1] or table.concat(chunks)
+    self._imgui_receive_chunks = {}
+    self._imgui_receive_chunk_bytes = 0
+    self._imgui_receive_dirty = false
+    return true
+end
+
+-- jit.off: this is the ImGui frame driver — it calls into the xcom_imgui C
+-- DLL, whose wndproc path re-enters Lua through the WndProc FFI callback.
+-- Traced frames were the second source of the "bad callback" PANIC.
 function Window:render_imgui()
     if not self.imgui then return end
     local now = uv.now()
     if self._imgui_next_frame and now < self._imgui_next_frame then return end
     self._imgui_next_frame = now + 16
-    local rx = self._imgui_receive or ""
     if not self.imgui:frame() then return end
+    local receive_changed = self:_flush_imgui_receive()
+    local rx = self._imgui_receive or ""
+    if receive_changed then
+        self.imgui:set_receive_text(rx)
+    end
     local actions = self.imgui:draw(
-        self.connected, self._rx_bytes or 0, self._tx_bytes or 0, rx)
+        self.connected, self._rx_bytes or 0, self._tx_bytes or 0)
+    -- The action handlers may tear the bridge down (on_close destroys the
+    -- window); re-check self.imgui before rendering the finished frame.
     local dispatch_ok, dispatch_error = pcall(self._dispatch_imgui_actions, self,
-        tonumber(actions) or 0)
+        actions or 0)
     if not dispatch_ok then
         io.stderr:write("[imgui] action dispatch failed: " .. tostring(dispatch_error) .. "\n")
     end
-    if not self.imgui then return end
-    self.imgui:render()
+    if self.imgui then
+        self.imgui:render()
+    end
 end
+jit.off(Window.render_imgui)
 
 function Window:_dispatch_imgui_actions(actions)
     if bit.band(actions, IMGUI_ACTION.open) ~= 0 or
@@ -826,6 +987,8 @@ function Window:_imgui_send_single()
     if payload then self:core_send(payload, xcom.send_text) end
 end
 
+-- Send every enabled entry on the current multi page.  Serves both the "Send
+-- enabled" button and the auto-cycle timer (they used to duplicate this loop).
 function Window:_imgui_send_enabled()
     for index = 0, 7 do
         local text, enabled = self.imgui:multi_entry(index)
@@ -876,15 +1039,9 @@ end
 
 function Window:_send_imgui_multi()
     if not self.imgui then return end
-    for index = 0, 7 do
-        local text, enabled = self.imgui:multi_entry(index)
-        if enabled and text ~= "" then
-            local payload = xcom.build_send_payload(text,
-                self.imgui.multi_hex[0] ~= 0, self.imgui.multi_crlf[0] ~= 0)
-            if payload then self:core_send(payload, xcom.send_text) end
-        end
-    end
+    self:_imgui_send_enabled()
 end
+jit.off(Window._send_imgui_multi)  -- entered from a libuv timer callback
 
 function Window:_sync_imgui_multi_auto()
     if not self.imgui then return end
@@ -894,7 +1051,13 @@ function Window:_sync_imgui_multi_auto()
     end
     local period = math.max(10, self.imgui.multi_period[0])
     if not self._multi_timer then self._multi_timer = uv.new_timer() else self._multi_timer:stop() end
-    self._multi_timer:start(period, period, function() self:_send_imgui_multi() end)
+    local timer_callback = function()
+        local ok, err = pcall(self._send_imgui_multi, self)
+        if not ok then io.stderr:write("[uv multi] " .. tostring(err) .. "\n") end
+    end
+    jit.off(timer_callback, true)
+    self._multi_timer_callback = timer_callback
+    self._multi_timer:start(period, period, timer_callback)
 end
 
 function Window:_sync_imgui_autosave()
@@ -906,7 +1069,50 @@ function Window:_sync_imgui_autosave()
         c.set_text(self.status.labels[3], "auto-save: choose a log path first")
         return
     end
-    if enabled then xcom.log_open(self.core, path, true) else xcom.log_close(self.core, 2000) end
+    if enabled then
+        -- Status codes are cdata ints; 0 is truthy in Lua, so compare
+        -- explicitly against xcom.ok rather than using `not`.
+        if tonumber(xcom.log_open(self.core, path, true)) == xcom.ok then
+            self._log_active = true
+        else
+            self.imgui.auto_save[0] = 0
+            c.set_text(self.status.labels[3], "auto-save: cannot open " .. path)
+        end
+    else
+        self:_log_close_with_retry()
+    end
+end
+
+-- Status code -> short label for status-bar messages.
+local STATUS_TEXT = {
+    [0] = "ok", [-1] = "bad parameter", [-2] = "not open",
+    [-3] = "already open", [-4] = "busy", [-5] = "full",
+    [-6] = "io error", [-7] = "timeout", [-8] = "drain incomplete",
+    [-9] = "unsupported",
+}
+
+-- Close the log with a bounded retry (Python retries the close on a 250 ms
+-- timer until the writer drains; here we retry synchronously a few times,
+-- reporting the final status).  A no-log-open close returns err_io from the
+-- ABI, so skip silently when no log session is active.  Returns true on
+-- success or "nothing to do".
+function Window:_log_close_with_retry()
+    if not self.core or not self._log_active then return true end
+    local rc = tonumber(xcom.log_close(self.core, 500))
+    if rc == xcom.ok then
+        self._log_active = false
+        return true
+    end
+    for _ = 1, 3 do
+        rc = tonumber(xcom.log_close(self.core, 500))
+        if rc == xcom.ok then
+            self._log_active = false
+            return true
+        end
+    end
+    c.set_text(self.status.labels[3],
+               "log close failed: " .. (STATUS_TEXT[rc] or tostring(rc)))
+    return false
 end
 
 function Window:_choose_imgui_log_path()
@@ -915,6 +1121,19 @@ function Window:_choose_imgui_log_path()
     self.cfg.save_path = path
     if self.imgui and self.imgui.auto_save[0] ~= 0 then self:_sync_imgui_autosave() end
     c.set_text(self.status.labels[3], "auto-save: " .. path)
+end
+
+-- Drain the core's error ring into the status bar.  The ring lives in the
+-- core; Lua only materialises the *last* record as one short status string
+-- (no accumulation), keeping the per-poll cost to one bounded pop.
+-- Python parity: MainWindow drains take_error() and shows the message in the
+-- status bar.
+function Window:_poll_errors()
+    local err = xcom.take_error(self.core)
+    if err then
+        c.set_text(self.status.labels[4],
+                   string.format("E%d: %s", err.code, err.message))
+    end
 end
 
 -- Timer poll 2: 250 ms status snapshot.  Feeds the HSM mirror (design parity
@@ -949,16 +1168,32 @@ function Window:poll_status()
         if self.vm:on_snapshot(snap) then
             self:_render_ui_state()
         end
-        local ps = xcom.port_text[snap.port_state] or tostring(snap.port_state)
-        c.set_text(self.status.labels[1], ps)
-        c.set_text(self.status.labels[2],
-                   string.format("RX %d  TX %d", snap.rx_bytes, snap.tx_bytes))
-        c.set_text(self.status.labels[3],
-                   string.format("drops: %d  trim: %d  pause: %d",
-                                 snap.rx_pool_exhausted_bytes + snap.tx_rejected,
-                                 snap.ui_trimmed_bytes, snap.display_paused_bytes))
+        -- Skip the string.format allocations when the counters are unchanged
+        -- (the 250 ms poller otherwise formats four identical strings per
+        -- second even on a quiet line).
+        if snap.port_state ~= self._last_port_state then
+            self._last_port_state = snap.port_state
+            c.set_text(self.status.labels[1],
+                       xcom.port_text[snap.port_state] or tostring(snap.port_state))
+        end
+        if snap.rx_bytes ~= self._last_rx_fmt or snap.tx_bytes ~= self._last_tx_fmt then
+            self._last_rx_fmt = snap.rx_bytes
+            self._last_tx_fmt = snap.tx_bytes
+            c.set_text(self.status.labels[2],
+                       string.format("RX %d  TX %d", snap.rx_bytes, snap.tx_bytes))
+        end
+        local drops = snap.rx_pool_exhausted_bytes + snap.tx_rejected
+        local trim = snap.ui_trimmed_bytes
+        local paused = snap.display_paused_bytes
+        if drops ~= self._last_drops or trim ~= self._last_trim or paused ~= self._last_paused then
+            self._last_drops, self._last_trim, self._last_paused = drops, trim, paused
+            c.set_text(self.status.labels[3],
+                       string.format("drops: %d  trim: %d  pause: %d", drops, trim, paused))
+        end
     end
+    self:_poll_errors()
 end
+jit.off(Window.poll_status)
 
 -- Render every connection-dependent control from one HSM snapshot (mirrors
 -- Python's MainWindow._render_ui_state).  params_enabled gates the serial
@@ -1010,10 +1245,6 @@ function Window:_render_ui_state()
         self.recv.set_monitor_connected(state.connected)
     end
 end
-
--- (STOP_MAP/PARITY_MAP/FLOW_MAP and stop_index/parity_index/flow_index are
--- declared near the top of this file, before first use in core_open.)
-Window._stop = STOP_MAP
 
 -- dispatch helpers used by panels.
 function Window:on_size(wparam, lparam)
@@ -1175,15 +1406,24 @@ function Window:start()
     -- uv.run("nowait") right after the Win32 message pump, so the two loops
     -- coexist on this single thread.
     self._display_timer = uv.new_timer()
-    self._display_timer:start(10, 10, function()
-        self:poll_display()
-    end)
+    local display_timer_callback = function()
+        local ok, err = pcall(self.poll_display, self)
+        if not ok then io.stderr:write("[uv display] " .. tostring(err) .. "\n") end
+    end
+    jit.off(display_timer_callback, true)
+    self._display_timer_callback = display_timer_callback
+    self._display_timer:start(10, 10, display_timer_callback)
     self._status_timer = uv.new_timer()
-    self._status_timer:start(250, 250, function()
-        self:poll_status()
-    end)
+    local status_timer_callback = function()
+        local ok, err = pcall(self.poll_status, self)
+        if not ok then io.stderr:write("[uv status] " .. tostring(err) .. "\n") end
+    end
+    jit.off(status_timer_callback, true)
+    self._status_timer_callback = status_timer_callback
+    self._status_timer:start(250, 250, status_timer_callback)
 
     self:poll_status()
+    collectgarbage("collect")
 end
 
 -- Message loop; blocks until WM_QUIT.  Returns when the window closes.
@@ -1268,6 +1508,12 @@ end
 
 function Window:on_btn_clear()
     self._imgui_receive = ""
+    self._imgui_receive_chunks = {}
+    self._imgui_receive_chunk_bytes = 0
+    self._imgui_receive_dirty = false
+    if self.imgui then
+        self.imgui:set_receive_text("")
+    end
     if self.recv and self.recv.clear then
         self.recv.clear(self.recv)
     end
@@ -1321,13 +1567,25 @@ function Window:on_btn_save()
     if not self.core then
         return
     end
-    -- Pull the full RICHEDIT text and submit it to the native writer.
-    local data = receive_text(self.recv.richedit.hwnd)
+    -- ImGui owns the visible receive buffer; the native RichEdit is hidden and
+    -- intentionally not fed in that mode.
+    local data = self.imgui and (self._imgui_receive or "") or
+        receive_text(self.recv.richedit.hwnd)
     if data and #data > 0 then
-        xcom.log_open(self.core, path, false)  -- truncate
+        -- Explicit status comparisons: ABI codes are cdata ints (0 is truthy
+        -- in Lua), so `not rc` would misread success as failure.
+        local rc = tonumber(xcom.log_open(self.core, path, false))  -- truncate
+        if rc ~= xcom.ok then
+            c.set_text(self.status.labels[3],
+                       "save failed: " .. (STATUS_TEXT[rc] or tostring(rc)))
+            return
+        end
+        self._log_active = true
         xcom.log_append(self.core, data, #data)
-        xcom.log_close(self.core, 2000)
+        xcom.log_flush(self.core, 2000)
+        self:_log_close_with_retry()
         c.set_text(self.status.labels[3], "saved: " .. path)
+        self.cfg.save_path = path
     end
 end
 
@@ -1377,9 +1635,13 @@ function Window:on_chk_multi_auto_toggled()
         else
             self._multi_timer:stop()
         end
-        self._multi_timer:start(period, period, function()
-            self:on_btn_send_enabled()
-        end)
+        local timer_callback = function()
+            local ok, err = pcall(self.on_btn_send_enabled, self)
+            if not ok then io.stderr:write("[uv multi] " .. tostring(err) .. "\n") end
+        end
+        jit.off(timer_callback, true)
+        self._multi_timer_callback = timer_callback
+        self._multi_timer:start(period, period, timer_callback)
     else
         if self._multi_timer then
             self._multi_timer:stop()

@@ -21,3 +21,10 @@ set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib")
 
 add_subdirectory(xcom_core)
+add_executable(xcom WIN32
+    xcom_lua/native/launcher/xcom_launcher.cpp
+    xcom_lua/native/launcher/xcom_launcher.rc
+)
+set_target_properties(xcom PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/xcom_lua/runtime"
+)

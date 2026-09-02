@@ -480,9 +480,6 @@ struct CoreState {
         if (!core.init() || !rx_capacity_waiter.valid()) {
             return false;
         }
-        if (!log_writer.start(&core)) {
-            return false;
-        }
         // Best-effort diag log (optional; failure is not fatal to the core).
         diag_writer.start(&core);
 
@@ -940,7 +937,9 @@ struct CoreState {
                                     bool append) noexcept
     {
         CoreState* st = static_cast<CoreState*>(core->sink.impl);
-        return st != nullptr ? st->log_writer.open(path, append) : XCOM_ERR_IO;
+        return st != nullptr && st->log_writer.start(core)
+                   ? st->log_writer.open(path, append)
+                   : XCOM_ERR_IO;
     }
 
     static XcomStatus sink_log_append(CoreCtx* core, const uint8_t* data,
@@ -968,6 +967,7 @@ struct CoreState {
     {
         CoreState* st = static_cast<CoreState*>(core->sink.impl);
         return st != nullptr
+                   && st->log_writer.start(core)
                    ? st->log_writer.submit_atomic(path, data, size, request_id)
                    : XCOM_ERR_IO;
     }
@@ -978,6 +978,7 @@ struct CoreState {
     {
         CoreState* st = static_cast<CoreState*>(core->sink.impl);
         return st != nullptr
+                   && st->log_writer.start(core)
                    ? st->log_writer.submit_atomic_borrowed(path, data, size,
                                                            request_id)
                    : XCOM_ERR_IO;
@@ -989,6 +990,7 @@ struct CoreState {
     {
         CoreState* st = static_cast<CoreState*>(core->sink.impl);
         return st != nullptr
+                   && st->log_writer.start(core)
                    ? st->log_writer.stream_begin(path, stream_id, request_id)
                    : XCOM_ERR_IO;
     }

@@ -185,7 +185,12 @@ function M.richedit(parent, opts)
 end
 
 -- Common window-message helpers used by panels --------------------------
+-- Skips the SetWindowTextA round trip when the text is unchanged: the status
+-- bar refreshes four labels every 250 ms even when values are identical, and
+-- each redundant call schedules a repaint of the label.
 function M.set_text(ctl, text)
+    if ctl._last_text == text then return end
+    ctl._last_text = text
     w.user32.SetWindowTextA(ctl.hwnd, text)
 end
 

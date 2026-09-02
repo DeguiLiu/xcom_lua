@@ -25,10 +25,13 @@ namespace xcom {
 namespace {
 
 constexpr std::uint32_t kFileBlockBytes = 64U * 1024U;
-constexpr std::uint16_t kFileBlockCount = 256U;
-constexpr std::uint16_t kFileJobCapacity = 256U;
-constexpr std::uint16_t kCompletionCapacity = 1024U;
-constexpr std::uint16_t kCompletionPoolCapacity = 32U;
+// The writer is single-consumer and the UI submits at most one batch per
+// frame.  Keep a small bounded backlog instead of reserving several MiB at
+// startup; saturation reports XCOM_ERR_FULL and applies natural backpressure.
+constexpr std::uint16_t kFileBlockCount = 16U;
+constexpr std::uint16_t kFileJobCapacity = 16U;
+constexpr std::uint16_t kCompletionCapacity = 32U;
+constexpr std::uint16_t kCompletionPoolCapacity = 8U;
 constexpr std::size_t kPathChars = 520U;
 constexpr std::size_t kTemporaryPathChars = kPathChars + 48U;
 constexpr std::uint16_t kInvalidBlockId = 0xFFFFU;
@@ -547,7 +550,7 @@ struct LogWriter::Impl {
     }
 };
 
-LogWriter::LogWriter() noexcept : impl_(Impl::slot().try_emplace()) {}
+LogWriter::LogWriter() noexcept = default;
 
 LogWriter::~LogWriter()
 {
@@ -560,8 +563,14 @@ LogWriter::~LogWriter()
 
 bool LogWriter::start(CoreCtx* core) noexcept
 {
-    if (impl_ == nullptr || core == nullptr) {
+    if (core == nullptr) {
         return false;
+    }
+    if (impl_ == nullptr) {
+        impl_ = Impl::slot().try_emplace();
+        if (impl_ == nullptr) {
+            return false;
+        }
     }
     if (impl_->running.load(std::memory_order_acquire)) {
         return true;

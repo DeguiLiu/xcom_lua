@@ -180,6 +180,8 @@ end
 
 local lib
 local loaded = false
+local display_scratch
+local display_written
 function M.load()
     if loaded then
         return lib
@@ -413,16 +415,22 @@ snapshot.display_pending == 0.
 ------------------------------------------------------------------------]]--
 function M.drain_display(h, capacity)
     local cap = capacity or 65536
-    local buf = ffi.new("char[?]", cap)
-    local written = ffi.new("uint32_t[1]")
-    local rc = M.drain_display_c(h, buf, cap, written)
+    -- Reuse the single-threaded poll buffer.  Allocating a 64 KiB cdata block
+    -- every 10 ms creates avoidable allocator/GC churn even when no bytes are
+    -- pending; grow only when a caller requests a larger capacity.
+    if not display_scratch or display_scratch.capacity < cap then
+        display_scratch = { capacity = cap, data = ffi.new("char[?]", cap) }
+        display_written = ffi.new("uint32_t[1]")
+    end
+    local rc = M.drain_display_c(h, display_scratch.data,
+                                  display_scratch.capacity, display_written)
     if rc ~= M.ok then
         return rc, nil
     end
-    if written[0] == 0 then
+    if display_written[0] == 0 then
         return M.ok, nil
     end
-    return M.ok, ffi.string(buf, written[0])
+    return M.ok, ffi.string(display_scratch.data, display_written[0])
 end
 
 --[[-------------------------------------------------------------------------

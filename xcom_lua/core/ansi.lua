@@ -60,10 +60,6 @@ local function bg_color(code, pal)
 end
 
 local CSI_TERM_MIN, CSI_TERM_MAX = string.byte("@"), string.byte("~")
-local function is_csi_terminator(c)
-    local b = c:byte()
-    return b and b >= CSI_TERM_MIN and b <= CSI_TERM_MAX
-end
 
 --[[-------------------------------------------------------------------------
 _parse_params(param) -> list of int
@@ -78,21 +74,24 @@ local function parse_params(param)
     -- A plain gmatch("[^;]*") would emit a spurious trailing empty match for a
     -- string that is itself ";"-free plus one (e.g. "31" -> {"31",""}), which
     -- would then be read as a reset (SGR 0).  Hand-roll the split instead.
+    local sfind = string.find
+    local ssub = string.sub
+    local smatch = string.match
+    local tonumber_ = tonumber
     local out = {}
     local normalized = param:gsub(":", ";")
     local pos = 1
-    local n = #normalized
     while true do
-        local next_semi = normalized:find(";", pos, true)
+        local next_semi = sfind(normalized, ";", pos, true)
         local part
         if next_semi then
-            part = normalized:sub(pos, next_semi - 1)
+            part = ssub(normalized, pos, next_semi - 1)
             pos = next_semi + 1
         else
-            part = normalized:sub(pos)
+            part = ssub(normalized, pos)
         end
-        local digits = part:match("%d+")
-        out[#out + 1] = digits and tonumber(digits) or 0
+        local digits = smatch(part, "%d+")
+        out[#out + 1] = digits and tonumber_(digits) or 0
         if not next_semi then
             break
         end
@@ -135,18 +134,20 @@ function AnsiParser.new()
 end
 
 -- Match a complete CSI at buf[i] (buf[i]=ESC, buf[i+1]='[').
--- Returns (final_index, terminator_char) if complete, else nil.
+-- Returns (final_index, terminator_byte) if complete, else nil.  The caller
+-- compares the terminator against 109 ('m') — returning the byte avoids
+-- re-slicing a one-char string for every scanned parameter byte.
 local function match_csi(buf, i)
     local n = #buf
     local j = i + 2
+    local sbyte = string.byte  -- hot loop: hoist the method lookup
     while j < n do  -- Lua 1-indexed; j runs over bytes after '['
-        local c = buf:sub(j, j)
-        local b = c:byte()
+        local b = sbyte(buf, j)
         if b < 0x20 or b == 0x7f then
             return nil  -- raw C0 inside parameters -> malformed
         end
-        if is_csi_terminator(c) then
-            return j, c
+        if b >= CSI_TERM_MIN and b <= CSI_TERM_MAX then
+            return j, b
         end
         j = j + 1
     end
@@ -162,27 +163,33 @@ function AnsiParser:feed(text, palette)
         return {}
     end
 
+    -- Cache string methods as locals: feed() runs on every display batch (up
+    -- to 64 KiB each 10 ms) in interpreted mode, so each `buf:sub`/`buf:byte`
+    -- here is a metamethod lookup + call unless hoisted to an upvalue.
+    local sbyte = string.byte
+    local ssub = string.sub
+
     local fg, bg, bold = nil, nil, false
     local segments = {}
     local start, i = 1, 1
     local n = #buf
 
     while i <= n do
-        local ch = buf:sub(i, i)
-        if ch ~= "\27" then  -- ESC
+        local ch = sbyte(buf, i)
+        if ch ~= 27 then  -- ESC
             i = i + 1
         else
             -- buf[i] is ESC
             if i == n then
                 -- lone trailing ESC -> residue for next batch, don't emit yet
                 if start < i then
-                    segments[#segments + 1] = { text = buf:sub(start, i - 1), fg = fg, bg = bg, bold = bold }
+                    segments[#segments + 1] = { text = ssub(buf, start, i - 1), fg = fg, bg = bg, bold = bold }
                 end
                 self.residue = "\27"
                 start = n + 1
                 break
             end
-            if buf:sub(i + 1, i + 1) ~= "[" then
+            if sbyte(buf, i + 1) ~= 91 then  -- '['
                 -- ESC not followed by '[' (and not at end): stray/literal ESC
                 i = i + 1
             else
@@ -191,17 +198,17 @@ function AnsiParser:feed(text, palette)
                 if idx == nil then
                     -- incomplete CSI at end of input -> carry forward
                     if start < i then
-                        segments[#segments + 1] = { text = buf:sub(start, i - 1), fg = fg, bg = bg, bold = bold }
+                        segments[#segments + 1] = { text = ssub(buf, start, i - 1), fg = fg, bg = bg, bold = bold }
                     end
-                    self.residue = buf:sub(i)
+                    self.residue = ssub(buf, i)
                     start = n + 1
                     break
                 end
                 if start < i then
-                    segments[#segments + 1] = { text = buf:sub(start, i - 1), fg = fg, bg = bg, bold = bold }
+                    segments[#segments + 1] = { text = ssub(buf, start, i - 1), fg = fg, bg = bg, bold = bold }
                 end
-                if term == "m" then
-                    local param_s = buf:sub(i + 2, idx - 1)
+                if term == 109 then  -- 'm' = SGR
+                    local param_s = ssub(buf, i + 2, idx - 1)
                     local params = parse_params(param_s)
                     fg, bg, bold = apply_sgr(params, fg, bg, bold, pal)
                 end
@@ -212,7 +219,7 @@ function AnsiParser:feed(text, palette)
     end
 
     if start <= n then
-        segments[#segments + 1] = { text = buf:sub(start), fg = fg, bg = bg, bold = bold }
+        segments[#segments + 1] = { text = ssub(buf, start), fg = fg, bg = bg, bold = bold }
     end
     return segments
 end

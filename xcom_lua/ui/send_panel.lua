@@ -22,7 +22,6 @@ local c = require("controls")
 local M = {}
 
 local MAX_MULTI = 8
-local MAX_PAGES = 50
 
 -- build(panel, x, y, w, h) -> send panel record.
 function M.build(panel, x, y, panel_w, h)
@@ -36,7 +35,6 @@ function M.build(panel, x, y, panel_w, h)
     cy = cy + 26
 
     -- ---- single-send group ----
-    local single_top = cy
     sp.single_edit = c.edit(panel, "", { x = x, y = cy, w = panel_w - 110, h = 70, multiline = true, wantreturn = true })
     sp.single_send = c.button(panel, "Send", { x = x + panel_w - 98, y = cy, w = 90, h = 70 })
     cy = cy + 74
@@ -51,7 +49,6 @@ function M.build(panel, x, y, panel_w, h)
                            auto = sp.single_auto, period = sp.single_period, ms = sp.single_ms }
 
     -- ---- multi-send group ----
-    local multi_top = cy
     local entries = {}
     for i = 0, MAX_MULTI - 1 do
         local ey = cy + (i % 4) * row_h
@@ -126,10 +123,6 @@ function M.build(panel, x, y, panel_w, h)
         page_index = 1,
     }
 
-    function sp.entries()
-        return entries
-    end
-
     sp.single = single_group
     sp.multi = multi_group
     sp.show_single()
@@ -147,12 +140,6 @@ function M.build(panel, x, y, panel_w, h)
     function sp.entry_enabled(i)
         local p = sp.current_page()
         return p.enabled[i] == true
-    end
-
-    function sp.set_entry(i, text, enabled)
-        local p = sp.current_page()
-        p.text[i] = text or ""
-        p.enabled[i] = enabled == true
     end
 
     return sp

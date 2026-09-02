@@ -1,5 +1,6 @@
 #include <windows.h>
-#include <GL/gl.h>
+#include <d3d11.h>
+#include <dxgi.h>
 #include <algorithm>
 #include <string>
 #include <string_view>
@@ -11,19 +12,19 @@
 #include <vector>
 #include <array>
 #include <cstdint>
+#include <cfloat>
 
 #include "imgui.h"
-#include "imgui_impl_opengl2.h"
+#include "imgui_impl_dx11.h"
 #include "imgui_impl_win32.h"
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(
     HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam);
-extern IMGUI_IMPL_API bool ImGui_ImplWin32_InitForOpenGL(void* hwnd);
 
 namespace {
 struct LayoutConfig final {
     static constexpr size_t kFieldCount = 10U;
-    static constexpr float kSidebarWidth = 194.0f;
+    static constexpr float kSidebarWidth = 164.0f;
     static constexpr float kCompactThreshold = 760.0f;
     static constexpr float kReceiveHeight = 0.0f;
     static constexpr float kSendHeight = 212.0f;
@@ -47,6 +48,7 @@ struct LayoutConfig final {
 };
 static_assert(LayoutConfig::kSidebarWidth > 0.0f);
 static_assert(LayoutConfig::kSendHeight >= 140.0f);
+constexpr float kReceiveFallbackHeight = 228.0f;
 
 template <typename T>
 class Slice final {
@@ -61,17 +63,17 @@ private:
     size_t size_;
 };
 
-class ActionObserver final {
-public:
-    using Callback = std::function<void(int)>;
-    void subscribe(Callback callback) { observers_.emplace_back(std::move(callback)); }
-    void publish(int actions) const {
-        if (actions == 0) return;
-        for (const auto& observer : observers_) observer(actions);
-    }
-private:
-    std::vector<Callback> observers_;
+// Fixed serial-config dropdown labels (one entry per ABI value).  Shared with
+// the Lua client's own value tables, so these are the single source of truth
+// for the human-readable form of each baud/data/stop/parity/flow index.
+constexpr const char* kBaudItems[] = {
+    "1200", "2400", "4800", "9600", "19200", "38400", "57600", "115200",
+    "230400", "460800", "921600", "1M", "2M", "3M",
 };
+constexpr const char* kDataItems[] = { "5", "6", "7", "8" };
+constexpr const char* kStopItems[] = { "1", "1.5", "2" };
+constexpr const char* kParityItems[] = { "None", "Odd", "Even", "Mark", "Space" };
+constexpr const char* kFlowItems[] = { "None", "RTS / CTS", "XON / XOFF" };
 
 class ImGuiRuntime final {
 public:
@@ -84,27 +86,22 @@ public:
     // singleton confined to this translation unit, so direct field access is
     // clearer than a dozen trivially-returning accessors (see MEMORY.md:
     // "avoid abstractions that don't reduce copies/branches/lifetime bugs").
-    ActionObserver actions_;
     std::vector<std::string> ports_;
-    int observed_actions_ = 0;
-    HDC hdc_ = nullptr;
-    HGLRC glrc_ = nullptr;
+    ID3D11Device* device_ = nullptr;
+    ID3D11DeviceContext* context_ = nullptr;
+    IDXGISwapChain* swap_chain_ = nullptr;
+    ID3D11RenderTargetView* render_target_ = nullptr;
     HWND hwnd_ = nullptr;
-    DWORD owner_thread_ = 0;
+    std::uint32_t owner_thread_ = 0;  // thread id; DWORD == uint32_t on Windows
     bool initialized_ = false;
     bool frame_active_ = false;
     ImFont* heading_font_ = nullptr;
     LayoutConfig layout_{};
-
-    int dispatch(int actions) {
-        actions_.publish(actions);
-        return std::exchange(observed_actions_, 0);
-    }
-    void reset() {
-        actions_ = ActionObserver{};
-        observed_actions_ = 0;
-        actions_.subscribe([this](int actions) { observed_actions_ |= actions; });
-    }
+    std::string receive_text_{};
+    // Byte offset of every line start in receive_text_ (offset 0 included);
+    // rescanned by xcom_imgui_set_receive_text and consumed by the receive
+    // clipper so per-frame rendering walks only visible lines.
+    std::vector<std::size_t> receive_line_offsets_{};
 };
 enum class Action : std::uint32_t {
     ActionOpen = 1 << 0,
@@ -156,6 +153,27 @@ ImVec4 rgb(unsigned int value, float alpha = 1.0f) {
                  (value & 0xff) / 255.0f, alpha);
 }
 
+// Named Siemens-style palette (single source for every hard-coded colour in
+// the dashboard; keep in sync with ui/window.lua's PAL and assets/layout.toml).
+namespace palette {
+    constexpr unsigned int kHeaderDark = 0x1E1E1E;   // header strip / dark buttons
+    constexpr unsigned int kAccentTeal = 0x009999;   // primary brand accent
+    constexpr unsigned int kAccentHover = 0x00B3B3;  // primary button hover
+    constexpr unsigned int kAccentPress = 0x007F80;  // primary button press
+    constexpr unsigned int kHeaderChrome = 0x106EBE; // window button hover
+    constexpr unsigned int kHeaderChromeDown = 0x005A9E; // window button press
+    constexpr unsigned int kTextInverse = 0xFFFFFF;  // on-dark text / knob
+    constexpr unsigned int kTextHeading = 0x008080;  // section heading
+    constexpr unsigned int kTextMuted = 0x5A6B7A;    // field labels / disabled
+    constexpr unsigned int kTextBody = 0x1F2933;     // default text
+    constexpr unsigned int kStatusOnline = 0x7AD8D8; // ONLINE badge
+    constexpr unsigned int kStatusOffline = 0xFFD28A; // OFFLINE badge
+    constexpr unsigned int kHeaderSubtitle = 0xCDEBFA; // header strapline
+    constexpr unsigned int kToggleOff = 0xD5DCE3;    // toggle track (disabled)
+    constexpr unsigned int kSurfaceLight = 0xF7F9FB; // receive panel card
+    constexpr unsigned int kSurfaceDefault = 0xF4F7F9; // default child panel
+}
+
 namespace ui {
 class PanelScope final {
 public:
@@ -205,19 +223,21 @@ auto WithRounding(float radius, DrawFn&& draw_fn) {
 
 // Pushes the heading font (when configured) and pops it on scope exit, so the
 // PushFont/PopFont pair stays balanced even on an early return or exception.
-// Mirrors the RAII discipline of PanelScope / StyleDecorator above.
+// Mirrors the RAII discipline of PanelScope / StyleDecorator above.  Takes the
+// font pointer directly rather than reaching into ImGuiRuntime, keeping the
+// guard independent of the singleton.
 class ScopedHeadingFont final {
 public:
-    explicit ScopedHeadingFont(bool enabled) : active_(enabled) {
-        if (active_) ImGui::PushFont(ImGuiRuntime::instance().heading_font_);
+    explicit ScopedHeadingFont(ImFont* font) : font_(font) {
+        if (font_) ImGui::PushFont(font_);
     }
     ~ScopedHeadingFont() {
-        if (active_) ImGui::PopFont();
+        if (font_) ImGui::PopFont();
     }
     ScopedHeadingFont(const ScopedHeadingFont&) = delete;
     ScopedHeadingFont& operator=(const ScopedHeadingFont&) = delete;
 private:
-    bool active_;
+    ImFont* font_;
 };
 
 // Minimal zero-allocation scope guard that runs a pop/close callable on scope
@@ -235,26 +255,29 @@ private:
 };
 
 PanelScope Panel(const char* id, const ImVec2& size, bool border = true,
-                 ImGuiWindowFlags flags = 0, ImVec4 background = ImVec4(0.95f, 0.97f, 0.98f, 1.0f)) {
+                 ImGuiWindowFlags flags = 0,
+                 ImVec4 background = rgb(palette::kSurfaceDefault)) {
     return PanelScope(id, size, border, flags, background);
 }
 
 void Section(std::string_view title, std::string_view subtitle = {}, bool separator = true) {
-    ScopedHeadingFont heading(ImGuiRuntime::instance().heading_font_ != nullptr);
-    ImGui::TextColored(rgb(0x008080), "%.*s", static_cast<int>(title.size()), title.data());
-    if (!subtitle.empty() && ImGui::GetContentRegionAvail().x >=
+    ScopedHeadingFont heading(ImGuiRuntime::instance().heading_font_);
+    ImGui::TextColored(rgb(palette::kTextHeading), "%.*s", static_cast<int>(title.size()), title.data());
+    if (subtitle.empty()) {
+        // No subtitle: nothing to place beside or below the title.
+    } else if (ImGui::GetContentRegionAvail().x >=
         ImGui::CalcTextSize(title.data(), title.data() + title.size()).x +
         ImGui::CalcTextSize(subtitle.data(), subtitle.data() + subtitle.size()).x + 16.0f) {
         ImGui::SameLine();
         ImGui::TextDisabled("%.*s", static_cast<int>(subtitle.size()), subtitle.data());
-    } else if (!subtitle.empty()) {
+    } else {
         ImGui::TextDisabled("%.*s", static_cast<int>(subtitle.size()), subtitle.data());
     }
     if (separator) ImGui::Separator();
 }
 
 void Field(std::string_view label) {
-    ImGui::TextColored(rgb(0x5A6B7A), "%.*s", static_cast<int>(label.size()), label.data());
+    ImGui::TextColored(rgb(palette::kTextMuted), "%.*s", static_cast<int>(label.size()), label.data());
 }
 
 struct ComboSpec final {
@@ -275,8 +298,41 @@ bool Toggle(const char* label, int* value);
 bool PrimaryAction(const char* label, const ImVec2& size);
 void EmptyState(std::string_view title, std::string_view detail);
 
+enum class WindowButtonKind : std::uint8_t { Minimize, Maximize, Close };
+
+bool WindowButton(const char* id, WindowButtonKind kind, ImDrawList* draw_list) {
+    const ImVec2 size(30.0f, 28.0f);
+    const bool pressed = ImGui::InvisibleButton(id, size);
+    const ImVec2 min = ImGui::GetItemRectMin();
+    const ImVec2 max = ImGui::GetItemRectMax();
+    const bool hovered = ImGui::IsItemHovered();
+    const bool active = ImGui::IsItemActive();
+    const ImU32 background = ImGui::GetColorU32(
+        kind == WindowButtonKind::Close
+            ? (active ? rgb(0xA61B1B) : (hovered ? rgb(0xC93636) : rgb(palette::kHeaderDark)))
+            : (active ? rgb(palette::kHeaderChromeDown)
+                      : (hovered ? rgb(palette::kHeaderChrome) : rgb(palette::kHeaderDark))));
+    draw_list->AddRectFilled(min, max, background, 2.0f);
+    const ImU32 icon = ImGui::GetColorU32(rgb(palette::kTextInverse));
+    const float center_x = (min.x + max.x) * 0.5f;
+    const float center_y = (min.y + max.y) * 0.5f;
+    if (kind == WindowButtonKind::Minimize) {
+        draw_list->AddLine(ImVec2(center_x - 6.0f, center_y + 4.0f),
+                           ImVec2(center_x + 6.0f, center_y + 4.0f), icon, 1.5f);
+    } else if (kind == WindowButtonKind::Maximize) {
+        draw_list->AddRect(ImVec2(center_x - 6.0f, center_y - 6.0f),
+                           ImVec2(center_x + 6.0f, center_y + 6.0f), icon, 1.5f);
+    } else {
+        draw_list->AddLine(ImVec2(center_x - 6.0f, center_y - 6.0f),
+                           ImVec2(center_x + 6.0f, center_y + 6.0f), icon, 1.5f);
+        draw_list->AddLine(ImVec2(center_x + 6.0f, center_y - 6.0f),
+                           ImVec2(center_x - 6.0f, center_y + 6.0f), icon, 1.5f);
+    }
+    return pressed;
+}
+
 void Header(int& actions, const bool connected) {
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, rgb(0x1E1E1E));
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, rgb(palette::kHeaderDark));
     // RAII pops: declared push-order so destructors run the reverse (pop order),
     // keeping every ImGui stack balanced even on an early return/exception.
     ScopedAction pop_child_bg([] { ImGui::PopStyleColor(); });
@@ -287,41 +343,48 @@ void Header(int& actions, const bool connected) {
     ScopedAction end_child([] { ImGui::EndChild(); });
     const ImVec2 position = ImGui::GetWindowPos();
     ImDrawList* const draw_list = ImGui::GetWindowDrawList();
-    draw_list->AddRectFilled(ImVec2(position.x + 12.0f, position.y + 10.0f),
-                             ImVec2(position.x + 36.0f, position.y + 34.0f),
-                             ImGui::GetColorU32(rgb(0x009999)), 3.0f);
-    ImGui::SetCursorPos(ImVec2(19.0f, 11.0f));
-    ImGui::TextColored(rgb(0xFFFFFF), "X");
-    ImGui::SetCursorPos(ImVec2(44.0f, 9.0f));
-    {
-        ScopedHeadingFont heading(ImGuiRuntime::instance().heading_font_ != nullptr);
-        ImGui::TextColored(rgb(0xFFFFFF), "XCOM");
-    }
-    ImGui::SetCursorPos(ImVec2(44.0f, 26.0f));
-    ImGui::TextColored(rgb(0xCDEBFA), "SERIAL CONSOLE");
+    const float brand_center_y = position.y + layout.header_height * 0.5f;
+    draw_list->AddRectFilled(ImVec2(position.x + 12.0f, brand_center_y - 12.0f),
+                             ImVec2(position.x + 36.0f, brand_center_y + 12.0f),
+                             ImGui::GetColorU32(rgb(palette::kAccentTeal)), 3.0f);
+    const ImU32 inverse = ImGui::GetColorU32(rgb(palette::kTextInverse));
+    draw_list->AddLine(ImVec2(position.x + 18.0f, brand_center_y - 6.0f),
+                       ImVec2(position.x + 30.0f, brand_center_y + 6.0f), inverse, 1.8f);
+    draw_list->AddLine(ImVec2(position.x + 30.0f, brand_center_y - 6.0f),
+                       ImVec2(position.x + 18.0f, brand_center_y + 6.0f), inverse, 1.8f);
+    ImFont* const title_font = runtime.heading_font_ ? runtime.heading_font_ : ImGui::GetFont();
+    const float title_size = 17.0f;
+    const float title_y = brand_center_y - title_size * 0.5f - 1.0f;
+    const ImVec2 title_pos(position.x + 46.0f, title_y);
+    draw_list->AddText(title_font, title_size, title_pos, inverse, "XCOM");
+    const float title_width = title_font->CalcTextSizeA(
+        title_size, FLT_MAX, 0.0f, "XCOM").x;
+    const float divider_x = title_pos.x + title_width + 12.0f;
+    draw_list->AddLine(ImVec2(divider_x, brand_center_y - 8.0f),
+                       ImVec2(divider_x, brand_center_y + 8.0f),
+                       ImGui::GetColorU32(rgb(palette::kHeaderSubtitle, 0.45f)), 1.0f);
+    const float subtitle_size = 12.0f;
+    draw_list->AddText(ImGui::GetFont(), subtitle_size,
+                       ImVec2(divider_x + 12.0f, brand_center_y - subtitle_size * 0.5f - 1.0f),
+                       ImGui::GetColorU32(rgb(palette::kHeaderSubtitle)), "SERIAL CONSOLE");
     const char* const status = connected ? "ONLINE" : "OFFLINE";
+    const float button_group_start = ImGui::GetWindowWidth() - 108.0f;
     const float status_width = ImGui::CalcTextSize(status).x + 20.0f;
-    ImGui::SetCursorPos(ImVec2(ImGui::GetWindowWidth() - status_width - 12.0f, 15.0f));
-    ImGui::TextColored(connected ? rgb(0x7AD8D8) : rgb(0xFFD28A), "%s", status);
-    ImGui::SetCursorPos(ImVec2(ImGui::GetWindowWidth() - 108.0f, 8.0f));
-    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 2.0f);
-    ImGui::PushStyleColor(ImGuiCol_Button, rgb(0x1E1E1E));
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, rgb(0x106EBE));
-    ImGui::PushStyleColor(ImGuiCol_ButtonActive, rgb(0x005A9E));
-    ImGui::PushStyleColor(ImGuiCol_Text, rgb(0xFFFFFF));
-    ScopedAction pop_buttons([] { ImGui::PopStyleColor(4); ImGui::PopStyleVar(); });
+    ImGui::SetCursorPos(ImVec2(button_group_start - status_width - 12.0f, 15.0f));
+    ImGui::TextColored(connected ? rgb(palette::kStatusOnline) : rgb(palette::kStatusOffline), "%s", status);
+    ImGui::SetCursorPos(ImVec2(button_group_start, 8.0f));
     actions |= Command<Action::ActionMinimizeWindow>::Execute(
-        [] { return ImGui::Button("-", ImVec2(30.0f, 28.0f)); });
+        [draw_list] { return WindowButton("##window_minimize", WindowButtonKind::Minimize, draw_list); });
     ImGui::SameLine(0.0f, 2.0f);
     actions |= Command<Action::ActionMaximizeWindow>::Execute(
-        [] { return ImGui::Button("+", ImVec2(30.0f, 28.0f)); });
+        [draw_list] { return WindowButton("##window_maximize", WindowButtonKind::Maximize, draw_list); });
     ImGui::SameLine(0.0f, 2.0f);
     actions |= Command<Action::ActionCloseWindow>::Execute(
-        [] { return ImGui::Button("x", ImVec2(30.0f, 28.0f)); });
+        [draw_list] { return WindowButton("##window_close", WindowButtonKind::Close, draw_list); });
     const float width = ImGui::GetWindowWidth();
     draw_list->AddRectFilled(ImVec2(position.x, position.y + layout.header_height - 3.0f),
                              ImVec2(position.x + width, position.y + layout.header_height),
-                             ImGui::GetColorU32(rgb(0x009999)));
+                             ImGui::GetColorU32(rgb(palette::kAccentTeal)));
 }
 
 void ReceiveToolbar(int& actions, int rx_bytes, int tx_bytes, int* receive_hex,
@@ -377,18 +440,39 @@ void RenderToggles(int& actions, const std::array<ToggleSpec, Count>& specs) {
 
 int ReceiveContent(int rx_bytes, int tx_bytes, int* receive_hex, int* timestamp,
                    int* pause_display, int* auto_clear, int* auto_clear_bytes,
-                   int* auto_save, const char* receive_text, size_t receive_length) {
+                   int* auto_save) {
     int actions = 0;
     ReceiveToolbar(actions, rx_bytes, tx_bytes, receive_hex, timestamp, pause_display,
                    auto_clear, auto_clear_bytes, auto_save);
     const auto& layout = ImGuiRuntime::instance().layout_;
-    const auto receive = Panel("##receive", ImVec2(0, layout.receive_height == 0.0f ? -228.0f : layout.receive_height), true,
-                               ImGuiWindowFlags_HorizontalScrollbar, rgb(0xF7F9FB));
-    if (receive_text && receive_length) {
-        ImGui::TextUnformatted(receive_text, receive_text + receive_length);
-        if (ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_A)) ImGui::SetScrollHereY(1.0f);
-    } else {
+    const auto receive = Panel("##receive", ImVec2(0, layout.receive_height == 0.0f ? -kReceiveFallbackHeight : layout.receive_height), true,
+                               ImGuiWindowFlags_HorizontalScrollbar, rgb(palette::kSurfaceLight));
+    const std::string& receive_text = ImGuiRuntime::instance().receive_text_;
+    if (receive_text.empty()) {
         EmptyState("WAITING FOR SERIAL DATA", "Select a port, then open the connection to begin monitoring.");
+        return actions;
+    }
+    // Clipper path: only visible lines are measured and tessellated, so the
+    // per-frame cost is O(viewport) instead of O(whole 64 KiB buffer) —
+    // the dominant hot spot at high receive rates.  Line offsets are cached
+    // in the runtime and rescanned only when the buffer changes.
+    auto& runtime = ImGuiRuntime::instance();
+    const std::vector<std::size_t>& line_offsets = runtime.receive_line_offsets_;
+    ImGuiListClipper clipper;
+    clipper.Begin(static_cast<int>(line_offsets.size()));
+    while (clipper.Step()) {
+        for (int line_index = clipper.DisplayStart; line_index < clipper.DisplayEnd; ++line_index) {
+            const char* line_begin = receive_text.data() + line_offsets[static_cast<std::size_t>(line_index)];
+            const char* line_end = line_index + 1 < static_cast<int>(line_offsets.size())
+                ? receive_text.data() + line_offsets[static_cast<std::size_t>(line_index) + 1]
+                : receive_text.data() + receive_text.size();
+            ImGui::TextUnformatted(line_begin, line_end);
+        }
+    }
+    // Auto-follow: keep the view pinned to the newest data while the user
+    // stays at (or near) the bottom; a deliberate upward scroll detaches.
+    if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 1.0f) {
+        ImGui::SetScrollY(ImGui::GetScrollMaxY());
     }
     return actions;
 }
@@ -472,17 +556,17 @@ int ConnectionContent(char* port, size_t port_capacity, bool connected,
     Field("AVAILABLE PORTS");
     ImGui::SetNextItemWidth(-30.0f);
     if (ImGui::BeginCombo("##available_ports", port[0] ? port : "Select a port")) {
-            const auto& port_list = ImGuiRuntime::instance().ports_;
-            const Slice<std::string> ports(port_list.data(), port_list.size());
-            for (const std::string& candidate : ports) {
-                const bool selected = candidate == port;
-                if (ImGui::Selectable(candidate.c_str(), selected)) {
-                    strcpy_s(port, port_capacity, candidate.c_str());
-                    actions |= Action::ActionSyncSettings;
-                }
-                if (selected) ImGui::SetItemDefaultFocus();
+        const auto& port_list = ImGuiRuntime::instance().ports_;
+        const Slice<std::string> ports(port_list.data(), port_list.size());
+        for (const std::string& candidate : ports) {
+            const bool selected = candidate == port;
+            if (ImGui::Selectable(candidate.c_str(), selected)) {
+                strcpy_s(port, port_capacity, candidate.c_str());
+                actions |= Action::ActionSyncSettings;
             }
-            ImGui::EndCombo();
+            if (selected) ImGui::SetItemDefaultFocus();
+        }
+        ImGui::EndCombo();
     }
     ImGui::SameLine(0.0f, 6.0f);
     actions |= Command<Action::ActionRefreshPorts>::Execute(
@@ -512,10 +596,10 @@ bool Toggle(const char* label, int* value) {
     const float radius = (maximum.y - minimum.y) * 0.5f;
     ImDrawList* draw_list = ImGui::GetWindowDrawList();
     draw_list->AddRectFilled(minimum, maximum,
-        ImGui::GetColorU32(enabled ? rgb(0x009999) : rgb(0xD5DCE3)), radius);
+        ImGui::GetColorU32(enabled ? rgb(palette::kAccentTeal) : rgb(palette::kToggleOff)), radius);
     const float knob_x = enabled ? maximum.x - radius : minimum.x + radius;
     draw_list->AddCircleFilled(ImVec2(knob_x, minimum.y + radius), radius - 2.0f,
-                                ImGui::GetColorU32(rgb(0xFFFFFF)));
+                                ImGui::GetColorU32(rgb(palette::kTextInverse)));
     if (label[0] != '#') {
         ImGui::SameLine(0.0f, 6.0f);
         ImGui::TextUnformatted(label);
@@ -524,9 +608,9 @@ bool Toggle(const char* label, int* value) {
 }
 
 bool PrimaryAction(const char* label, const ImVec2& size = ImVec2(0, 0)) {
-    ImGui::PushStyleColor(ImGuiCol_Button, rgb(0x009999));
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, rgb(0x00B3B3));
-    ImGui::PushStyleColor(ImGuiCol_ButtonActive, rgb(0x007F80));
+    ImGui::PushStyleColor(ImGuiCol_Button, rgb(palette::kAccentTeal));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, rgb(palette::kAccentHover));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, rgb(palette::kAccentPress));
     const bool clicked = WithRounding(3.0f, [](const char* text, const ImVec2& button_size) {
         return ImGui::Button(text, button_size);
     })(label, size);
@@ -546,16 +630,58 @@ void EmptyState(std::string_view title, std::string_view detail) {
 }
 }
 
-std::string module_resource_path(std::string_view relative_name) {
+// Directory of this DLL (not the exe).  The runtime bundle keeps
+// xcom_imgui.dll in <app>/runtime/ while assets live in <app>/assets/, so
+// probe the DLL directory first and its parent second; fall back to the exe
+// directory when neither resolves.  This keeps fonts/layout.toml findable
+// regardless of which exe hosts the DLL.
+std::string module_directory() {
     char module_path[MAX_PATH]{};
-    const DWORD length = GetModuleFileNameA(nullptr, module_path, IM_ARRAYSIZE(module_path));
-    if (length == 0 || length >= IM_ARRAYSIZE(module_path)) return {};
-    std::string path(module_path, length);
+    HMODULE module = nullptr;
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCSTR>(&module_directory), &module) &&
+        module) {
+        GetModuleFileNameA(module, module_path, IM_ARRAYSIZE(module_path));
+    }
+    if (module_path[0] == '\0') {
+        const std::uint32_t length =
+            static_cast<std::uint32_t>(GetModuleFileNameA(nullptr, module_path, IM_ARRAYSIZE(module_path)));
+        if (length == 0 || length >= IM_ARRAYSIZE(module_path)) return {};
+    }
+    std::string path(module_path);
     const size_t slash = path.find_last_of("\\/");
     if (slash == std::string::npos) return {};
-    path.resize(slash + 1);
-    path.append(relative_name.data(), relative_name.size());
-    return path;
+    return path.substr(0, slash + 1);
+}
+
+std::string module_resource_path(std::string_view relative_name) {
+    static const std::string base = module_directory();
+    if (base.empty()) return {};
+    // Probe <dll-dir>/<relative>, then <dll-dir>/../<relative> (runtime
+    // bundle layout), then <exe-dir>/<relative>.
+    std::string candidate = base;
+    candidate.append(relative_name.data(), relative_name.size());
+    if (GetFileAttributesA(candidate.c_str()) != INVALID_FILE_ATTRIBUTES) return candidate;
+    const size_t cut = base.size() > 1 ? base.substr(0, base.size() - 1).find_last_of("\\/") : std::string::npos;
+    if (cut != std::string::npos) {
+        std::string parent = base.substr(0, cut + 1);
+        parent.append(relative_name.data(), relative_name.size());
+        if (GetFileAttributesA(parent.c_str()) != INVALID_FILE_ATTRIBUTES) return parent;
+    }
+    char exe_path[MAX_PATH]{};
+    const std::uint32_t length =
+        static_cast<std::uint32_t>(GetModuleFileNameA(nullptr, exe_path, IM_ARRAYSIZE(exe_path)));
+    if (length > 0 && length < IM_ARRAYSIZE(exe_path)) {
+        std::string exe(exe_path, length);
+        const size_t exe_slash = exe.find_last_of("\\/");
+        if (exe_slash != std::string::npos) {
+            exe.resize(exe_slash + 1);
+            exe.append(relative_name.data(), relative_name.size());
+            if (GetFileAttributesA(exe.c_str()) != INVALID_FILE_ATTRIBUTES) return exe;
+        }
+    }
+    return candidate;  // first candidate; caller's fallbacks handle the miss
 }
 
 std::string module_asset_path(std::string_view file_name) {
@@ -636,25 +762,125 @@ void load_layout_config() {
     }
 }
 
+[[nodiscard]] bool create_render_target(ImGuiRuntime& runtime) noexcept {
+    if (!runtime.swap_chain_ || !runtime.device_) return false;
+    ID3D11Texture2D* back_buffer = nullptr;
+    const HRESULT buffer_result = runtime.swap_chain_->GetBuffer(
+        0, IID_PPV_ARGS(&back_buffer));
+    if (FAILED(buffer_result)) return false;
+    const HRESULT view_result = runtime.device_->CreateRenderTargetView(
+        back_buffer, nullptr, &runtime.render_target_);
+    back_buffer->Release();
+    return SUCCEEDED(view_result);
+}
+
+void cleanup_render_target(ImGuiRuntime& runtime) noexcept {
+    if (runtime.render_target_) {
+        runtime.render_target_->Release();
+        runtime.render_target_ = nullptr;
+    }
+}
+
+// Release the DX11 resources acquired by xcom_imgui_init, resetting every
+// runtime field to its pre-init state. Shared by init failure paths and
+// shutdown_impl so cleanup can never drift between them.
+void release_dx_resources(ImGuiRuntime& runtime) noexcept {
+    cleanup_render_target(runtime);
+    if (runtime.swap_chain_) {
+        runtime.swap_chain_->Release();
+        runtime.swap_chain_ = nullptr;
+    }
+    if (runtime.context_) {
+        runtime.context_->ClearState();
+        runtime.context_->Release();
+        runtime.context_ = nullptr;
+    }
+    if (runtime.device_) {
+        runtime.device_->Release();
+        runtime.device_ = nullptr;
+    }
+    runtime.hwnd_ = nullptr;
+}
+
 void shutdown_impl() {
     auto& runtime = ImGuiRuntime::instance();
     if (!runtime.initialized_) return;
-    if (wglGetCurrentContext() != runtime.glrc_) wglMakeCurrent(runtime.hdc_, runtime.glrc_);
     if (runtime.frame_active_) ImGui::EndFrame();
-    ImGui_ImplOpenGL2_Shutdown();
+    ImGui_ImplDX11_Shutdown();
     ImGui_ImplWin32_Shutdown();
     ImGui::DestroyContext();
-    wglMakeCurrent(nullptr, nullptr);
-    if (HGLRC glrc = std::exchange(runtime.glrc_, nullptr)) wglDeleteContext(glrc);
-    HDC hdc = std::exchange(runtime.hdc_, nullptr);
-    HWND hwnd = std::exchange(runtime.hwnd_, nullptr);
-    if (hwnd && hdc) ReleaseDC(hwnd, hdc);
-    std::exchange(runtime.owner_thread_, 0UL);
-    std::exchange(runtime.initialized_, false);
-    std::exchange(runtime.frame_active_, false);
-    std::exchange(runtime.heading_font_, nullptr);
+    release_dx_resources(runtime);
+    runtime.owner_thread_ = 0;
+    runtime.initialized_ = false;
+    runtime.frame_active_ = false;
+    runtime.heading_font_ = nullptr;
+    runtime.receive_text_.clear();
 }
 }
+
+namespace {
+// One static style assignment: target colour slot plus palette value (with
+// optional alpha).  Table-driven so adding or re-tinting a colour is a data
+// edit, not another hand-written assignment line; applied by apply_style().
+struct StyleColorEntry final {
+    ImGuiCol slot;
+    unsigned int value;
+    float alpha;
+};
+constexpr std::array kStyleColors{
+    StyleColorEntry{ImGuiCol_Text, 0x1F2933, 1.0f},
+    StyleColorEntry{ImGuiCol_TextDisabled, 0x5A6B7A, 1.0f},
+    StyleColorEntry{ImGuiCol_WindowBg, 0xE8EEF2, 1.0f},
+    StyleColorEntry{ImGuiCol_ChildBg, 0xF4F7F9, 1.0f},
+    StyleColorEntry{ImGuiCol_PopupBg, 0xFFFFFF, 1.0f},
+    StyleColorEntry{ImGuiCol_Border, 0x8FAFC4, 0.38f},
+    StyleColorEntry{ImGuiCol_BorderShadow, 0xFFFFFF, 0.0f},
+    StyleColorEntry{ImGuiCol_FrameBg, 0xFFFFFF, 1.0f},
+    StyleColorEntry{ImGuiCol_FrameBgHovered, 0xE8F3F8, 1.0f},
+    StyleColorEntry{ImGuiCol_FrameBgActive, 0xD6EAF3, 1.0f},
+    StyleColorEntry{ImGuiCol_Button, 0xFFFFFF, 1.0f},
+    StyleColorEntry{ImGuiCol_ButtonHovered, 0xE3F0FB, 1.0f},
+    StyleColorEntry{ImGuiCol_ButtonActive, 0xD4E7F7, 1.0f},
+    StyleColorEntry{ImGuiCol_Header, 0xE3F0FB, 1.0f},
+    StyleColorEntry{ImGuiCol_HeaderHovered, 0xD4E7F7, 1.0f},
+    StyleColorEntry{ImGuiCol_HeaderActive, 0xD4E7F7, 1.0f},
+    StyleColorEntry{ImGuiCol_CheckMark, 0x009999, 1.0f},
+    StyleColorEntry{ImGuiCol_SliderGrab, 0x0078D7, 1.0f},
+    StyleColorEntry{ImGuiCol_SliderGrabActive, 0x005A9E, 1.0f},
+    StyleColorEntry{ImGuiCol_Tab, 0xEEF1F4, 1.0f},
+    StyleColorEntry{ImGuiCol_TabHovered, 0xE3F0FB, 1.0f},
+    StyleColorEntry{ImGuiCol_TabActive, 0x009999, 1.0f},
+    StyleColorEntry{ImGuiCol_TabUnfocused, 0xEEF1F4, 1.0f},
+    StyleColorEntry{ImGuiCol_TabUnfocusedActive, 0x009999, 1.0f},
+    StyleColorEntry{ImGuiCol_ScrollbarBg, 0xEEF1F4, 1.0f},
+    StyleColorEntry{ImGuiCol_ScrollbarGrab, 0xB4C0CC, 1.0f},
+    StyleColorEntry{ImGuiCol_ScrollbarGrabHovered, 0x93A5B6, 1.0f},
+    StyleColorEntry{ImGuiCol_ScrollbarGrabActive, 0x0078D7, 1.0f},
+};
+
+// Geometry knobs that live outside layout.toml (fixed look, not user-tunable).
+constexpr float kClearColor[4] = {0.91f, 0.94f, 0.96f, 1.0f};
+
+void apply_style(const LayoutConfig& layout) {
+    ImGuiStyle& style = ImGui::GetStyle();
+    style.WindowRounding = 0.0f;
+    style.ChildRounding = 6.0f;
+    style.FrameRounding = 5.0f;
+    style.PopupRounding = 6.0f;
+    style.ScrollbarRounding = 4.0f;
+    style.WindowBorderSize = 0.0f;
+    style.FrameBorderSize = 0.0f;
+    style.ChildBorderSize = 0.0f;
+    style.WindowPadding = ImVec2(0.0f, 0.0f);
+    style.FramePadding = ImVec2(8.0f, layout.frame_padding_y);
+    style.ItemSpacing = ImVec2(layout.item_spacing, layout.section_gap);
+    style.ItemInnerSpacing = ImVec2(6.0f, 4.0f);
+    style.ScrollbarSize = 12.0f;
+    for (const StyleColorEntry& entry : kStyleColors) {
+        style.Colors[entry.slot] = rgb(entry.value, entry.alpha);
+    }
+}
+}  // namespace
 
 extern "C" __declspec(dllexport) void xcom_imgui_set_ports(const char* const* names, int count) {
     auto& runtime = ImGuiRuntime::instance();
@@ -670,24 +896,39 @@ extern "C" __declspec(dllexport) void xcom_imgui_set_ports(const char* const* na
 extern "C" __declspec(dllexport) int xcom_imgui_init(HWND hwnd) {
     auto& runtime = ImGuiRuntime::instance();
     if (!hwnd || runtime.initialized_ || !IsWindow(hwnd)) return 0;
+    runtime.receive_text_.clear();
+    runtime.receive_text_.reserve(64U * 1024U - 1U);
     runtime.hwnd_ = hwnd;
-    ImGuiRuntime::instance().reset();
     runtime.owner_thread_ = GetCurrentThreadId();
-    runtime.hdc_ = GetDC(hwnd);
-    if (!runtime.hdc_) { runtime.hwnd_ = nullptr; return 0; }
 
-    PIXELFORMATDESCRIPTOR pfd{};
-    pfd.nSize = sizeof(pfd);
-    pfd.nVersion = 1;
-    pfd.dwFlags = PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL | PFD_DOUBLEBUFFER;
-    pfd.iPixelType = PFD_TYPE_RGBA;
-    pfd.cColorBits = 32;
-    pfd.cDepthBits = 24;
-    pfd.cStencilBits = 8;
-    const int format = ChoosePixelFormat(runtime.hdc_, &pfd);
-    if (!format || !SetPixelFormat(runtime.hdc_, format, &pfd)) { ReleaseDC(runtime.hwnd_, runtime.hdc_); runtime.hdc_ = nullptr; runtime.hwnd_ = nullptr; return 0; }
-    runtime.glrc_ = wglCreateContext(runtime.hdc_);
-    if (!runtime.glrc_ || !wglMakeCurrent(runtime.hdc_, runtime.glrc_)) { if (runtime.glrc_) wglDeleteContext(runtime.glrc_); ReleaseDC(runtime.hwnd_, runtime.hdc_); runtime.glrc_ = nullptr; runtime.hdc_ = nullptr; runtime.hwnd_ = nullptr; return 0; }
+    RECT client_rect{};
+    GetClientRect(hwnd, &client_rect);
+    const UINT width = static_cast<UINT>(std::max<LONG>(1, client_rect.right - client_rect.left));
+    const UINT height = static_cast<UINT>(std::max<LONG>(1, client_rect.bottom - client_rect.top));
+    DXGI_SWAP_CHAIN_DESC swap_desc{};
+    swap_desc.BufferCount = 2;
+    swap_desc.BufferDesc.Width = width;
+    swap_desc.BufferDesc.Height = height;
+    swap_desc.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    swap_desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    swap_desc.OutputWindow = hwnd;
+    swap_desc.SampleDesc.Count = 1;
+    swap_desc.Windowed = TRUE;
+    swap_desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    constexpr D3D_FEATURE_LEVEL feature_levels[] = {
+        D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_0,
+    };
+    D3D_FEATURE_LEVEL feature_level{};
+    const HRESULT device_result = D3D11CreateDeviceAndSwapChain(
+        nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, D3D11_CREATE_DEVICE_SINGLETHREADED, feature_levels,
+        static_cast<UINT>(IM_ARRAYSIZE(feature_levels)), D3D11_SDK_VERSION,
+        &swap_desc, &runtime.swap_chain_, &runtime.device_, &feature_level,
+        &runtime.context_);
+    if (FAILED(device_result) || !create_render_target(runtime)) {
+        release_dx_resources(runtime);
+        runtime.owner_thread_ = 0;
+        return 0;
+    }
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
@@ -695,64 +936,34 @@ extern "C" __declspec(dllexport) int xcom_imgui_init(HWND hwnd) {
     ImGui::StyleColorsLight();
     ImGuiIO& io = ImGui::GetIO();
     ImFontConfig font_config;
-    font_config.OversampleH = 3;
-    font_config.OversampleV = 2;
+    font_config.OversampleH = 2;
+    font_config.OversampleV = 1;
     font_config.PixelSnapH = true;
+    font_config.GlyphRanges = io.Fonts->GetGlyphRangesDefault();
     const std::string body_font = module_asset_path("SiemensSlabRoman.ttf");
-    if (ImFont* font = io.Fonts->AddFontFromFileTTF(body_font.c_str(), 16.0f, &font_config)) {
+    if (ImFont* font = io.Fonts->AddFontFromFileTTF(body_font.c_str(), 17.0f, &font_config)) {
         io.FontDefault = font;
-    } else if (ImFont* font = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segoeui.ttf", 16.0f, &font_config)) {
+    } else if (ImFont* font = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segoeui.ttf", 17.0f, &font_config)) {
         io.FontDefault = font;
     }
     ImFontConfig heading_config = font_config;
     const std::string heading_font = module_asset_path("SiemensSlabBold.TTF");
-    runtime.heading_font_ = io.Fonts->AddFontFromFileTTF(heading_font.c_str(), 17.0f, &heading_config);
-    if (!runtime.heading_font_) runtime.heading_font_ = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segoeuib.ttf", 17.0f, &heading_config);
-    const auto& layout = runtime.layout_;
-    ImGuiStyle& style = ImGui::GetStyle();
-    style.WindowRounding = 0.0f;
-    style.ChildRounding = 6.0f;
-    style.FrameRounding = 5.0f;
-    style.PopupRounding = 6.0f;
-    style.ScrollbarRounding = 4.0f;
-    style.WindowBorderSize = 0.0f;
-    style.FrameBorderSize = 0.0f;
-    style.ChildBorderSize = 0.0f;
-    style.WindowPadding = ImVec2(0.0f, 0.0f);
-    style.FramePadding = ImVec2(8.0f, layout.frame_padding_y);
-    style.ItemSpacing = ImVec2(layout.item_spacing, layout.section_gap);
-    style.ItemInnerSpacing = ImVec2(6.0f, 4.0f);
-    style.ScrollbarSize = 12.0f;
-    style.Colors[ImGuiCol_Text] = rgb(0x1F2933);
-    style.Colors[ImGuiCol_TextDisabled] = rgb(0x5A6B7A);
-    style.Colors[ImGuiCol_WindowBg] = rgb(0xE8EEF2);
-    style.Colors[ImGuiCol_ChildBg] = rgb(0xF4F7F9);
-    style.Colors[ImGuiCol_PopupBg] = rgb(0xFFFFFF);
-    style.Colors[ImGuiCol_Border] = rgb(0x8FAFC4, 0.38f);
-    style.Colors[ImGuiCol_BorderShadow] = rgb(0xFFFFFF, 0.0f);
-    style.Colors[ImGuiCol_FrameBg] = rgb(0xFFFFFF);
-    style.Colors[ImGuiCol_FrameBgHovered] = rgb(0xE8F3F8);
-    style.Colors[ImGuiCol_FrameBgActive] = rgb(0xD6EAF3);
-    style.Colors[ImGuiCol_Button] = rgb(0xFFFFFF);
-    style.Colors[ImGuiCol_ButtonHovered] = rgb(0xE3F0FB);
-    style.Colors[ImGuiCol_ButtonActive] = rgb(0xD4E7F7);
-    style.Colors[ImGuiCol_Header] = rgb(0xE3F0FB);
-    style.Colors[ImGuiCol_HeaderHovered] = rgb(0xD4E7F7);
-    style.Colors[ImGuiCol_HeaderActive] = rgb(0xD4E7F7);
-    style.Colors[ImGuiCol_CheckMark] = rgb(0x009999);
-    style.Colors[ImGuiCol_SliderGrab] = rgb(0x0078D7);
-    style.Colors[ImGuiCol_SliderGrabActive] = rgb(0x005A9E);
-    style.Colors[ImGuiCol_Tab] = rgb(0xEEF1F4);
-    style.Colors[ImGuiCol_TabHovered] = rgb(0xE3F0FB);
-    style.Colors[ImGuiCol_TabActive] = rgb(0x009999);
-    style.Colors[ImGuiCol_TabUnfocused] = rgb(0xEEF1F4);
-    style.Colors[ImGuiCol_TabUnfocusedActive] = rgb(0x009999);
-    style.Colors[ImGuiCol_ScrollbarBg] = rgb(0xEEF1F4);
-    style.Colors[ImGuiCol_ScrollbarGrab] = rgb(0xB4C0CC);
-    style.Colors[ImGuiCol_ScrollbarGrabHovered] = rgb(0x93A5B6);
-    style.Colors[ImGuiCol_ScrollbarGrabActive] = rgb(0x0078D7);
-    if (!ImGui_ImplWin32_InitForOpenGL(hwnd)) { ImGui::DestroyContext(); wglMakeCurrent(nullptr, nullptr); wglDeleteContext(runtime.glrc_); ReleaseDC(runtime.hwnd_, runtime.hdc_); runtime.glrc_ = nullptr; runtime.hdc_ = nullptr; runtime.hwnd_ = nullptr; return 0; }
-    if (!ImGui_ImplOpenGL2_Init()) { ImGui_ImplWin32_Shutdown(); ImGui::DestroyContext(); wglMakeCurrent(nullptr, nullptr); wglDeleteContext(runtime.glrc_); ReleaseDC(runtime.hwnd_, runtime.hdc_); runtime.glrc_ = nullptr; runtime.hdc_ = nullptr; runtime.hwnd_ = nullptr; return 0; }
+    runtime.heading_font_ = io.Fonts->AddFontFromFileTTF(heading_font.c_str(), 18.0f, &heading_config);
+    if (!runtime.heading_font_) runtime.heading_font_ = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segoeuib.ttf", 18.0f, &heading_config);
+    apply_style(runtime.layout_);
+    if (!ImGui_ImplWin32_Init(hwnd)) {
+        ImGui::DestroyContext();
+        release_dx_resources(runtime);
+        runtime.owner_thread_ = 0;
+        return 0;
+    }
+    if (!ImGui_ImplDX11_Init(runtime.device_, runtime.context_)) {
+        ImGui_ImplWin32_Shutdown();
+        ImGui::DestroyContext();
+        release_dx_resources(runtime);
+        runtime.owner_thread_ = 0;
+        return 0;
+    }
     runtime.initialized_ = true;
     return 1;
 }
@@ -767,6 +978,8 @@ extern "C" __declspec(dllexport) int xcom_imgui_draw_console(
     const char* receive_text, size_t receive_length) {
     auto& runtime = ImGuiRuntime::instance();
     if (!runtime.initialized_ || !runtime.frame_active_ || GetCurrentThreadId() != runtime.owner_thread_) return 0;
+    (void)receive_text;
+    (void)receive_length;
     int actions = 0;
     ImGuiIO& io = ImGui::GetIO();
     ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_Always);
@@ -777,54 +990,75 @@ extern "C" __declspec(dllexport) int xcom_imgui_draw_console(
         ui::Header(actions, connected != 0);
         ImGui::Dummy(ImVec2(0.0f, 8.0f));
         ImGui::SetCursorPosX(8.0f);
-        static const char* baud_items[] = { "1200", "2400", "4800", "9600", "19200", "38400", "57600", "115200", "230400", "460800", "921600", "1M", "2M", "3M" };
-        static const char* data_items[] = { "5", "6", "7", "8" };
-        static const char* stop_items[] = { "1", "1.5", "2" };
-        static const char* parity_items[] = { "None", "Odd", "Even", "Mark", "Space" };
-        static const char* flow_items[] = { "None", "RTS / CTS", "XON / XOFF" };
         const std::array<ui::ComboSpec, 5> serial_fields{{
-            {"##baud", "BAUD RATE", baud, baud_items, IM_ARRAYSIZE(baud_items)},
-            {"##data_bits", "DATA BITS", data_bits, data_items, IM_ARRAYSIZE(data_items)},
-            {"##stop_bits", "STOP BITS", stop_bits, stop_items, IM_ARRAYSIZE(stop_items)},
-            {"##parity", "PARITY", parity, parity_items, IM_ARRAYSIZE(parity_items)},
-            {"##flow", "FLOW CONTROL", flow, flow_items, IM_ARRAYSIZE(flow_items)},
+            {"##baud", "BAUD RATE", baud, kBaudItems, static_cast<int>(std::size(kBaudItems))},
+            {"##data_bits", "DATA BITS", data_bits, kDataItems, static_cast<int>(std::size(kDataItems))},
+            {"##stop_bits", "STOP BITS", stop_bits, kStopItems, static_cast<int>(std::size(kStopItems))},
+            {"##parity", "PARITY", parity, kParityItems, static_cast<int>(std::size(kParityItems))},
+            {"##flow", "FLOW CONTROL", flow, kFlowItems, static_cast<int>(std::size(kFlowItems))},
         }};
         const float content_width = ImGui::GetContentRegionAvail().x - 8.0f;
         const auto& layout = runtime.layout_;
         const float compact_sidebar = layout.sidebar_width - 28.0f;
         const float sidebar_width = content_width < layout.compact_threshold
-            ? (compact_sidebar > 180.0f ? compact_sidebar : 180.0f)
+            ? (compact_sidebar > 160.0f ? compact_sidebar : 160.0f)
             : layout.sidebar_width;
         if (const auto monitor = ui::Panel("##monitor_column", ImVec2(-sidebar_width - 6.0f, 0)); monitor) {
-        ui::Section("RECEIVE", "MONITOR · LIVE SERIAL STREAM", false);
-        actions |= ui::ReceiveContent(rx_bytes, tx_bytes, receive_hex, timestamp,
-                                      pause_display, auto_clear, auto_clear_bytes,
-                                      auto_save, receive_text, receive_length);
-        const auto send_workspace = ui::Panel("##send_workspace", ImVec2(0, layout.send_height));
-        ui::Section("TRANSMIT", "SEND A COMMAND OR BUILD A REUSABLE QUEUE", false);
-        actions |= ui::TransmitContent(send_hex, send_crlf, send_auto, send_period,
-                                       send_text, send_capacity, multi_text,
-                                       multi_slot_capacity, multi_enabled, multi_hex,
-                                       multi_crlf, multi_page, multi_page_count,
-                                       multi_auto, multi_period);
+            ui::Section("RECEIVE", "MONITOR · LIVE SERIAL STREAM", false);
+            actions |= ui::ReceiveContent(rx_bytes, tx_bytes, receive_hex, timestamp,
+                                          pause_display, auto_clear, auto_clear_bytes,
+                                          auto_save);
+            // Binding (not a bare temporary) keeps the panel's EndChild in this
+            // scope, so the workspace stays open across the section below.
+            const auto send_workspace = ui::Panel("##send_workspace", ImVec2(0, layout.send_height));
+            ui::Section("TRANSMIT", "SEND A COMMAND OR BUILD A REUSABLE QUEUE", false);
+            actions |= ui::TransmitContent(send_hex, send_crlf, send_auto, send_period,
+                                           send_text, send_capacity, multi_text,
+                                           multi_slot_capacity, multi_enabled, multi_hex,
+                                           multi_crlf, multi_page, multi_page_count,
+                                           multi_auto, multi_period);
         }
         ImGui::SameLine(0.0f, layout.panel_gap);
         {
-        const auto serial_column = ui::Panel("##serial_column", ImVec2(0, 0));
-        actions |= ui::ConnectionContent(port, port_capacity, connected != 0,
-                                          baud, data_bits, stop_bits, parity, flow,
-                                          dtr, rts, serial_fields);
+            const auto serial_column = ui::Panel("##serial_column", ImVec2(0, 0));
+            actions |= ui::ConnectionContent(port, port_capacity, connected != 0,
+                                              baud, data_bits, stop_bits, parity, flow,
+                                              dtr, rts, serial_fields);
         }
     }
     ImGui::End();
-    return ImGuiRuntime::instance().dispatch(actions);
+    // The accumulated action mask is the C ABI return value — returned to the
+    // Lua caller verbatim (single consumer; no observer indirection needed).
+    return actions;
+}
+
+extern "C" __declspec(dllexport) void xcom_imgui_set_receive_text(
+    const char* text, size_t length) {
+    auto& runtime = ImGuiRuntime::instance();
+    if (!runtime.initialized_ || GetCurrentThreadId() != runtime.owner_thread_) return;
+    constexpr size_t kReceiveLimit = 64U * 1024U - 1U;
+    if (!text || length == 0) {
+        runtime.receive_text_.clear();
+        runtime.receive_line_offsets_.assign(1, 0);
+        return;
+    }
+    const size_t bounded_length = (std::min)(length, kReceiveLimit);
+    runtime.receive_text_.assign(text, bounded_length);
+    // Rescan line starts once per text change (O(n) over the 64 KiB tail) so
+    // the per-frame clipper render indexes lines without re-walking the text.
+    std::vector<std::size_t>& offsets = runtime.receive_line_offsets_;
+    offsets.clear();
+    offsets.push_back(0);
+    for (std::size_t index = 0; index < bounded_length; ++index) {
+        if (runtime.receive_text_[index] == '\n') offsets.push_back(index + 1);
+    }
 }
 
 extern "C" __declspec(dllexport) int xcom_imgui_new_frame() {
     auto& runtime = ImGuiRuntime::instance();
     if (!runtime.initialized_ || runtime.frame_active_ || GetCurrentThreadId() != runtime.owner_thread_ ||
-        !IsWindow(runtime.hwnd_) || !wglMakeCurrent(runtime.hdc_, runtime.glrc_)) return 0;
-    ImGui_ImplOpenGL2_NewFrame();
+        !IsWindow(runtime.hwnd_) || !runtime.device_ || !runtime.context_) return 0;
+    ImGui_ImplDX11_NewFrame();
     ImGui_ImplWin32_NewFrame();
     ImGui::NewFrame();
     runtime.frame_active_ = true;
@@ -834,10 +1068,12 @@ extern "C" __declspec(dllexport) int xcom_imgui_new_frame() {
 extern "C" __declspec(dllexport) int xcom_imgui_render() {
     auto& runtime = ImGuiRuntime::instance();
     if (!runtime.initialized_ || !runtime.frame_active_ || GetCurrentThreadId() != runtime.owner_thread_ ||
-        !wglMakeCurrent(runtime.hdc_, runtime.glrc_)) return 0;
+        !runtime.swap_chain_ || !runtime.render_target_ || !runtime.context_) return 0;
     ImGui::Render();
-    ImGui_ImplOpenGL2_RenderDrawData(ImGui::GetDrawData());
-    SwapBuffers(runtime.hdc_);
+    runtime.context_->OMSetRenderTargets(1, &runtime.render_target_, nullptr);
+    runtime.context_->ClearRenderTargetView(runtime.render_target_, kClearColor);
+    ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+    runtime.swap_chain_->Present(1, 0);
     runtime.frame_active_ = false;
     return 1;
 }
@@ -846,6 +1082,19 @@ extern "C" __declspec(dllexport) int xcom_imgui_wndproc(
     HWND hwnd, UINT msg, uintptr_t wparam, intptr_t lparam) {
     auto& runtime = ImGuiRuntime::instance();
     if (!runtime.initialized_ || hwnd != runtime.hwnd_ || GetCurrentThreadId() != runtime.owner_thread_) return 0;
+    if (msg == WM_SIZE && wparam != SIZE_MINIMIZED && runtime.swap_chain_) {
+        const UINT width = LOWORD(static_cast<LPARAM>(lparam));
+        const UINT height = HIWORD(static_cast<LPARAM>(lparam));
+        if (width > 0 && height > 0) {
+            cleanup_render_target(runtime);
+            if (SUCCEEDED(runtime.swap_chain_->ResizeBuffers(0, width, height,
+                                                              DXGI_FORMAT_UNKNOWN, 0))) {
+                // Best-effort: a resize that cannot recreate the RTV leaves a
+                // null target, which xcom_imgui_render() then guards against.
+                (void)create_render_target(runtime);
+            }
+        }
+    }
     // ImGui's handler returns an LRESULT; the C ABI collapses it to a handled
     // boolean so the caller never sees a pointer-sized value for a true/false.
     return ImGui_ImplWin32_WndProcHandler(hwnd, msg, wparam, lparam) ? 1 : 0;
