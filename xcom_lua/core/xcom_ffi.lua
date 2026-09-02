@@ -173,6 +173,12 @@ local function find_dll()
     end
     if script_dir then
         local candidate = script_dir .. "/../build/native-release/bin/xcom_core.dll"
+        local runtime_candidate = script_dir .. "/../runtime/xcom_core.dll"
+        local file = io.open(runtime_candidate, "rb")
+        if file then
+            file:close()
+            return runtime_candidate
+        end
         return candidate
     end
     return "xcom_core.dll"
