@@ -17,7 +17,6 @@ On Linux this module is syntax-checked only; the Win32 host resolves the DLLs.
 ------------------------------------------------------------------------]]--
 
 local ffi = require("ffi")
-local uv = require("luv")
 local bit = require("bit")
 
 local w = require("win32")
@@ -311,7 +310,7 @@ Window._create_class = create_class
 -- ---------------------------------------------------------------------------
 function Window:build_ui(tw, th)
     local body_h = th - HEADER_H - STATUS_H
-    local send_h = 180
+    local send_h = 196
     local content_y = HEADER_H
     local send_y = th - STATUS_H - send_h
     local conn_x = tw - PAGE_MARGIN - CONN_W
@@ -454,6 +453,10 @@ function Window:dispatch(hwnd, msg, wparam, lparam)
         if self:_on_alt_digit(tonumber(wparam) or 0) then
             return 0
         end
+    end
+    if m == w.wm.WM_TIMER then
+        self:on_timer(tonumber(wparam) or 0)
+        return 0
     end
     if m == w.wm.WM_DESTROY then
         w.user32.PostQuitMessage(0)
@@ -647,9 +650,9 @@ function Window:on_close()
     -- timers (no new data while we drain), drain accepted bytes to the
     -- display, flush the log, then close the port and destroy the window.
     self:_set_autosend_enabled(false)
-    if self._multi_timer then self._multi_timer:stop() end
-    if self._display_timer then self._display_timer:stop() end
-    if self._status_timer then self._status_timer:stop() end
+    w.user32.KillTimer(self.hwnd, w.timer.MULTI)
+    w.user32.KillTimer(self.hwnd, w.timer.DISPLAY)
+    w.user32.KillTimer(self.hwnd, w.timer.STATUS)
     self:_final_drain()
     self:_save_config()
     if self.core then
@@ -916,11 +919,35 @@ function Window:on_chk_autosave_toggled()
     end
 end
 
+-- WM_TIMER dispatch: route a timer id to the matching poller.  Each pcall
+-- wrapper keeps a Lua error inside a handler from escaping the FFI callback
+-- boundary.  Now that timers are Win32 WM_TIMER (not libuv callbacks), the
+-- dispatch happens on the message-pump thread inside DispatchMessageW, so the
+-- jit.off requirement on the individual handlers still applies.
+function Window:on_timer(timer_id)
+    if timer_id == w.timer.DISPLAY then
+        local ok, err = pcall(self.poll_display, self)
+        if not ok then io.stderr:write("[timer display] " .. tostring(err) .. "\n") end
+    elseif timer_id == w.timer.STATUS then
+        local ok, err = pcall(self.poll_status, self)
+        if not ok then io.stderr:write("[timer status] " .. tostring(err) .. "\n") end
+    elseif timer_id == w.timer.MULTI then
+        -- Multi-send auto-cycle runs in two modes: the ImGui dashboard (send
+        -- enabled entries via the bridge) or the native panel (same, via the
+        -- native send panel controls).  Dispatch to whichever is active.
+        if self.imgui then
+            local ok, err = pcall(self._send_imgui_multi, self)
+            if not ok then io.stderr:write("[timer multi] " .. tostring(err) .. "\n") end
+        else
+            local ok, err = pcall(self.on_btn_send_enabled, self)
+            if not ok then io.stderr:write("[timer multi] " .. tostring(err) .. "\n") end
+        end
+    end
+end
+jit.off(Window.on_timer)
+
 -- Timer poll 1: 10 ms display drain.
--- jit.off: invoked from a libuv timer callback (C re-entry into Lua).
--- LuaJIT forbids FFI callbacks being entered from JIT-compiled traces; when
--- the timer chain was traced the process died with PANIC "bad callback"
--- within seconds of startup (see run_message_loop note below).
+-- jit.off: entered from the WM_TIMER dispatch inside WndProc (C re-entry).
 function Window:poll_display()
     if not self.core or not self.connected then
         return
@@ -977,7 +1004,7 @@ end
 -- Traced frames were the second source of the "bad callback" PANIC.
 function Window:render_imgui()
     if not self.imgui then return end
-    local now = uv.now()
+    local now = tonumber(w.kernel32.GetTickCount64()) or 0
     if self._imgui_next_frame and now < self._imgui_next_frame then return end
     self._imgui_next_frame = now + 16
     if not self.imgui:frame() then return end
@@ -1092,23 +1119,21 @@ function Window:_send_imgui_multi()
     if not self.imgui then return end
     self:_imgui_send_enabled()
 end
-jit.off(Window._send_imgui_multi)  -- entered from a libuv timer callback
+jit.off(Window._send_imgui_multi)  -- entered from a WM_TIMER callback
 
 function Window:_sync_imgui_multi_auto()
     if not self.imgui then return end
     if self.imgui.multi_auto[0] == 0 then
-        if self._multi_timer then self._multi_timer:stop() end
+        w.user32.KillTimer(self.hwnd, w.timer.MULTI)
+        self._multi_auto_on = false
         return
     end
     local period = math.max(10, self.imgui.multi_period[0])
-    if not self._multi_timer then self._multi_timer = uv.new_timer() else self._multi_timer:stop() end
-    local timer_callback = function()
-        local ok, err = pcall(self._send_imgui_multi, self)
-        if not ok then io.stderr:write("[uv multi] " .. tostring(err) .. "\n") end
-    end
-    jit.off(timer_callback, true)
-    self._multi_timer_callback = timer_callback
-    self._multi_timer:start(period, period, timer_callback)
+    self._multi_auto_on = true
+    -- Re-arm the multi-send timer at the current period.  KillTimer clears any
+    -- prior period; SetTimer re-establishes it.
+    w.user32.KillTimer(self.hwnd, w.timer.MULTI)
+    w.user32.SetTimer(self.hwnd, w.timer.MULTI, period, nil)
 end
 
 function Window:_sync_imgui_autosave()
@@ -1463,26 +1488,13 @@ function Window:start()
     self:bind_handler(self.recv.auto_clear_cb.id, "on_chk_display_opt_toggled")
     self:bind_handler(self.recv.auto_save_cb.id, "on_chk_autosave_toggled")
 
-    -- Start the two pollers as libuv timers: 10 ms display drain, 250 ms
-    -- status snapshot.  luv event loop is driven by run_message_loop() via
-    -- uv.run("nowait") right after the Win32 message pump, so the two loops
-    -- coexist on this single thread.
-    self._display_timer = uv.new_timer()
-    local display_timer_callback = function()
-        local ok, err = pcall(self.poll_display, self)
-        if not ok then io.stderr:write("[uv display] " .. tostring(err) .. "\n") end
-    end
-    jit.off(display_timer_callback, true)
-    self._display_timer_callback = display_timer_callback
-    self._display_timer:start(10, 10, display_timer_callback)
-    self._status_timer = uv.new_timer()
-    local status_timer_callback = function()
-        local ok, err = pcall(self.poll_status, self)
-        if not ok then io.stderr:write("[uv status] " .. tostring(err) .. "\n") end
-    end
-    jit.off(status_timer_callback, true)
-    self._status_timer_callback = status_timer_callback
-    self._status_timer:start(250, 250, status_timer_callback)
+    -- Start the two pollers as Win32 timers (WM_TIMER dispatch): 10 ms display
+    -- drain, 250 ms status snapshot.  Both are driven by the native message
+    -- pump in run_message_loop(), so a single thread advances UI + polling.
+    w.user32.SetTimer(self.hwnd, w.timer.DISPLAY, 10, nil)
+    w.user32.SetTimer(self.hwnd, w.timer.STATUS, 250, nil)
+    self._display_timer_id = w.timer.DISPLAY
+    self._status_timer_id = w.timer.STATUS
 
     self:poll_status()
     collectgarbage("collect")
@@ -1490,11 +1502,11 @@ end
 
 -- Message loop; blocks until WM_QUIT.  Returns when the window closes.
 --
--- Two loops coexist here on one thread: the Win32 message pump (PeekMessageW,
--- non-blocking) and the libuv event loop (uv.run("nowait")).  The luv timers
--- that replace SetTimer (poll_display/poll_status) only advance when
--- uv.run("nowait") is called, so the loop pumps Win32 messages, then runs the
--- due libuv timers, then yields ~1ms so neither loop busy-spins.
+-- A single thread pumps Win32 messages (PeekMessageW, non-blocking) and renders
+-- ImGui between pumps.  WM_TIMER messages carry the display/status/multi
+-- pollers, so the polling cadence is bound to the native message pump — no
+-- libuv event loop is needed.  The loop yields ~1ms between pumps so it never
+-- busy-spins while idle.
 --
 -- jit.off on this function only: it calls into DispatchMessageW, which in
 -- turn re-enters the WndProc callback (an FFI closure created via
@@ -1505,7 +1517,8 @@ end
 local run_message_loop = function(self)
     local msg = ffi.new("MSG")
     while true do
-        -- Pump all pending Win32 messages (non-blocking).
+        -- Pump all pending Win32 messages (non-blocking).  WM_TIMER arrives
+        -- here and drives the display/status/multi pollers via dispatch.
         while w.user32.PeekMessageW(msg, nil, 0, 0, 1) ~= 0 do  -- 1 = PM_REMOVE
             if msg.message == w.wm.WM_QUIT then
                 return
@@ -1513,25 +1526,22 @@ local run_message_loop = function(self)
             w.user32.TranslateMessage(msg)
             w.user32.DispatchMessageW(msg)
         end
-        -- Run due libuv timers (replaces the SetTimer WM_TIMER dispatch).
-        uv.run("nowait")
         self:render_imgui()
-        -- Yield ~1 ms so the 10 ms poll and 250 ms status timers settle and
-        -- the loop does not busy-spin at 100% CPU.
-        uv.sleep(1)
+        -- Yield ~1 ms so the pollers settle and the loop does not busy-spin at
+        -- 100% CPU while there are no pending messages (render still advances).
+        w.kernel32.Sleep(1)
     end
 end
 jit.off(run_message_loop)
 
 function Window:run()
     run_message_loop(self)
-    -- Close the libuv timer handles (they are no longer advanced once the
-    -- message loop has returned; libuv requires explicit close to release).
-    for _, t in ipairs({ self._display_timer, self._status_timer, self._multi_timer }) do
-        if t then
-            t:stop()
-            t:close()
-        end
+    -- Kill the Win32 timers (idempotent; harmless if already destroyed by the
+    -- window teardown in on_close).
+    if self.hwnd then
+        w.user32.KillTimer(self.hwnd, w.timer.DISPLAY)
+        w.user32.KillTimer(self.hwnd, w.timer.STATUS)
+        w.user32.KillTimer(self.hwnd, w.timer.MULTI)
     end
     if self.imgui then
         self.imgui:close()
@@ -1684,30 +1694,17 @@ end
 
 -- Multi-send page "Auto cycle": mirrors Python's _on_multi_auto_toggled /
 -- _multi_timer, a GUI-side timer distinct from the core auto-template (which
--- only holds one payload and is used by the single-send tab).  The Win32
--- SetTimer is replaced by a libuv timer so all polling is driven by the same
--- luv event loop.
+-- only holds one payload and is used by the single-send tab).  Driven by the
+-- shared WM_TIMER MULTI id in on_timer().
 function Window:on_chk_multi_auto_toggled()
     local enabled = c.checkbox_checked(self.send.multi.auto)
     self._multi_auto_on = enabled
     if enabled then
         local period = tonumber(c.get_text(self.send.multi.period)) or 1000
-        if not self._multi_timer then
-            self._multi_timer = uv.new_timer()
-        else
-            self._multi_timer:stop()
-        end
-        local timer_callback = function()
-            local ok, err = pcall(self.on_btn_send_enabled, self)
-            if not ok then io.stderr:write("[uv multi] " .. tostring(err) .. "\n") end
-        end
-        jit.off(timer_callback, true)
-        self._multi_timer_callback = timer_callback
-        self._multi_timer:start(period, period, timer_callback)
+        w.user32.KillTimer(self.hwnd, w.timer.MULTI)
+        w.user32.SetTimer(self.hwnd, w.timer.MULTI, period, nil)
     else
-        if self._multi_timer then
-            self._multi_timer:stop()
-        end
+        w.user32.KillTimer(self.hwnd, w.timer.MULTI)
     end
 end
 
@@ -1716,10 +1713,8 @@ end
 function Window:on_edit_multi_period_changed()
     if self._multi_auto_on then
         local period = tonumber(c.get_text(self.send.multi.period)) or 1000
-        if self._multi_timer then
-            self._multi_timer:set_repeat(period)
-            self._multi_timer:again()
-        end
+        w.user32.KillTimer(self.hwnd, w.timer.MULTI)
+        w.user32.SetTimer(self.hwnd, w.timer.MULTI, period, nil)
     end
 end
 

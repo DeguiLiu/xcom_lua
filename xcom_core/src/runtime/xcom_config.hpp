@@ -26,13 +26,19 @@ struct XcomCoactConfig : coact::DefaultConfig {
 };
 
 // Resource budgets (design §4). These are quantities, not enum variants.
-inline constexpr std::uint32_t kRxBlockCount = 256U;
+//
+// Ring capacities MUST remain powers of two (SpscRing uses a mask).  The RX
+// pool and display lane are sized for the peak supported baud (921600 ≈ 90
+// KiB/s) with several seconds of headroom, so a smaller pool never drops data
+// for the 10 ms drain cadence; it only bounds the transient backlog that can
+// accumulate while the consumer thread is briefly descheduled.
+inline constexpr std::uint32_t kRxBlockCount = 128U;  // 128 × 4 KiB = 512 KiB
 inline constexpr std::uint32_t kRxBlockBytes = 4096U;
 inline constexpr std::uint32_t kSerialReadBufferBytes =
     kRxBlockCount * kRxBlockBytes;
 inline constexpr std::uint32_t kTxBlockCount = 32U;
 inline constexpr std::uint32_t kTxBlockBytes = 4096U;
-inline constexpr std::uint32_t kDisplayBatchCount = 64U;
+inline constexpr std::uint32_t kDisplayBatchCount = 32U;  // 32 × 16 KiB = 512 KiB
 inline constexpr std::uint32_t kDisplayBatchBytes = 16384U;
 inline constexpr std::uint32_t kErrorRingCount = 128U;
 
