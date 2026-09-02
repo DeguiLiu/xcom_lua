@@ -16,6 +16,20 @@ Launch `xcom.exe` for the packaged client. It starts `luvjit.exe` from the
 same directory with the parent `main.lua`, preserving the existing runtime
 layout while giving Explorer and shortcuts a real application icon.
 
+Run the Windows integration check from `xcom_lua` with:
+`runtime\\luajit.exe tests\\integration_test.lua`
+
+For a real serial loop, pass an available port (the test injects a receive
+frame through the production receive path and then closes the port):
+`runtime\\luajit.exe tests\\serial_integration_test.lua COM4`
+
+To verify bytes from another process or a physical peer, use the external
+receive check (it does not call the injection seam):
+`runtime\\luajit.exe tests\\serial_external_receive_test.lua COM3 5000`
+
+The `help` smoke command includes an LF terminator:
+`runtime\\luajit.exe tests\\send_help_test.lua COM3`
+
 The bundle is intentionally isolated from source and build caches. The
 launcher prefers a locally built `build/native-release/bin/xcom_core.dll` and
 falls back to this directory when no local build is available. `luvjit.exe`

@@ -47,3 +47,6 @@ third_party/xcom_imgui/*
 !third_party/xcom_imgui/imgui/
 !third_party/xcom_imgui/imgui/**
 !third_party/xcom_imgui/LICENSE.txt
+
+# Root-level runtime diagnostics
+xcom_diag.log

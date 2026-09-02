@@ -398,6 +398,11 @@ function M.send(h, data_bytes, flags)
     return M.send_c(h, ffi.cast("const uint8_t*", ""), 0, flags or 0)
 end
 
+-- close(h, timeout_ms) -> status
+function M.close(h, timeout_ms)
+    return M.close_c(h, timeout_ms or 2000)
+end
+
 --[[-------------------------------------------------------------------------
 set_auto_template(h, data_bytes, interval_ms, flags) -> status
 interval_ms == 0 disables auto-send.

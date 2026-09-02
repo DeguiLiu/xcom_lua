@@ -25,7 +25,10 @@ target_include_directories(xcom_imgui PRIVATE
 )
 target_compile_definitions(xcom_imgui PRIVATE WIN32_LEAN_AND_MEAN)
 if(MSVC)
-    target_compile_options(xcom_imgui PRIVATE /EHsc)
+    # /utf-8: the bridge sources contain UTF-8 comments (em-dash, middle dot).
+    # Without it MSVC decodes them as CP936 and emits C4819, which can
+    # misparse a trailing byte as a line-continuation backslash.
+    target_compile_options(xcom_imgui PRIVATE /EHsc /utf-8)
 endif()
 target_link_libraries(xcom_imgui PRIVATE d3d11 dxgi gdi32 user32 imm32)
 set_target_properties(xcom_imgui PROPERTIES PREFIX "")
