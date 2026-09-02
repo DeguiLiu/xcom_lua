@@ -52,7 +52,7 @@ static_assert(LayoutConfig::kSidebarWidth > 0.0f);
 static_assert(LayoutConfig::kSendHeight >= 100.0f);
 constexpr float kFooterHeight = 22.0f;
 constexpr float kControlHeight = 26.0f;
-constexpr float kToggleHeight = 22.0f;
+constexpr float kToggleHeight = 20.0f;
 constexpr float kSidebarInset = 1.2f;
 constexpr unsigned int kPanelBorder = 0x4B5A63;
 
@@ -428,10 +428,23 @@ void Header(int& actions, const bool connected) {
                              ImVec2(position.x + kBrandInset + 24.0f, brand_center_y + 12.0f),
                              ImGui::GetColorU32(rgb(palette::kAccentTeal)), 3.0f);
     const ImU32 inverse = ImGui::GetColorU32(rgb(palette::kTextInverse));
-    draw_list->AddLine(ImVec2(position.x + kBrandInset + 6.0f, brand_center_y - 6.0f),
-                       ImVec2(position.x + kBrandInset + 18.0f, brand_center_y + 6.0f), inverse, 1.8f);
-    draw_list->AddLine(ImVec2(position.x + kBrandInset + 18.0f, brand_center_y - 6.0f),
-                       ImVec2(position.x + kBrandInset + 6.0f, brand_center_y + 6.0f), inverse, 1.8f);
+    const ImU32 icon_surface = ImGui::GetColorU32(rgb(0xEAF4F8));
+    const ImU32 icon_trace = ImGui::GetColorU32(rgb(palette::kHeaderDark));
+    draw_list->AddRectFilled(ImVec2(position.x + kBrandInset + 5.0f, brand_center_y - 7.0f),
+                             ImVec2(position.x + kBrandInset + 19.0f, brand_center_y + 6.0f),
+                             icon_surface, 2.0f);
+    draw_list->AddLine(ImVec2(position.x + kBrandInset + 6.5f, brand_center_y),
+                       ImVec2(position.x + kBrandInset + 9.0f, brand_center_y), icon_trace, 1.4f);
+    draw_list->AddLine(ImVec2(position.x + kBrandInset + 9.0f, brand_center_y),
+                       ImVec2(position.x + kBrandInset + 10.5f, brand_center_y - 2.5f), icon_trace, 1.4f);
+    draw_list->AddLine(ImVec2(position.x + kBrandInset + 10.5f, brand_center_y - 2.5f),
+                       ImVec2(position.x + kBrandInset + 12.5f, brand_center_y + 2.5f), icon_trace, 1.4f);
+    draw_list->AddLine(ImVec2(position.x + kBrandInset + 12.5f, brand_center_y + 2.5f),
+                       ImVec2(position.x + kBrandInset + 17.5f, brand_center_y + 2.5f), icon_trace, 1.4f);
+    draw_list->AddLine(ImVec2(position.x + kBrandInset + 12.0f, brand_center_y + 6.0f),
+                       ImVec2(position.x + kBrandInset + 12.0f, brand_center_y + 10.0f), inverse, 1.4f);
+    draw_list->AddLine(ImVec2(position.x + kBrandInset + 8.0f, brand_center_y + 10.0f),
+                       ImVec2(position.x + kBrandInset + 16.0f, brand_center_y + 10.0f), inverse, 1.4f);
     ImFont* const title_font = runtime.heading_font_ ? runtime.heading_font_ : ImGui::GetFont();
     const float title_size = 17.0f;
     const float title_y = brand_center_y - title_size * 0.5f + 3.0f;

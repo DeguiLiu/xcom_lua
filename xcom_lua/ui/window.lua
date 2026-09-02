@@ -307,6 +307,9 @@ create_class = function(hinst)
     -- un-painted (transparent) and makes WM_ERASEBKGND pointless.
     wc.style = 0x0020  -- CS_OWNDC keeps the DX11 swap-chain target stable.
     wc.hbrBackground = ffi.cast("HBRUSH", 6)  -- COLOR_WINDOW + 1 = 6
+    wc.hIcon = ffi.cast("HICON", w.user32.LoadImageA(
+        nil, "runtime\\xcom.ico", w.image.ICON, 0, 0,
+        w.image.LOAD_FROM_FILE + w.image.DEFAULT_SIZE))
     return wc
 end
 Window._create_class = create_class

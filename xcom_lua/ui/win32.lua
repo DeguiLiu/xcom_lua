@@ -93,6 +93,12 @@ M.wait = {
     WAIT_OBJECT_0 = 0x00000000,
 }
 
+M.image = {
+    ICON = 1,
+    LOAD_FROM_FILE = 0x00000010,
+    DEFAULT_SIZE = 0x00000040,
+}
+
 M.ctrl = {
     Button = "Button",
     Edit = "Edit",
@@ -462,6 +468,8 @@ int GetWindowTextA(HWND hWnd, char* lpString, int nMaxCount);
 intptr_t SendMessageA(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 intptr_t DefWindowProcA(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 ATOM RegisterClassA(WNDCLASSA* pWndClass);
+void* LoadImageA(HINSTANCE hInst, const char* name, UINT type,
+                 int cx, int cy, UINT fuLoad);
 BOOL UnregisterClassA(LPCSTR lpClassName, HINSTANCE hInstance);
 void PostQuitMessage(int nExitCode);
 BOOL TranslateMessage(const MSG* lpMsg);
