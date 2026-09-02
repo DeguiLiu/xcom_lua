@@ -18,7 +18,8 @@ if arg and arg[0] and arg[0]:sub(1, 1) ~= "@" then
     if not dir then
         dir = "."  -- bare script name like "main.lua": use the cwd
     end
-    package.path = dir .. "/core/?.lua;" .. dir .. "/ui/?.lua;" .. package.path
+    package.path = dir .. "/core/?.ljbc;" .. dir .. "/ui/?.ljbc;" ..
+                   dir .. "/core/?.lua;" .. dir .. "/ui/?.lua;" .. package.path
 end
 
 local config = require("config")

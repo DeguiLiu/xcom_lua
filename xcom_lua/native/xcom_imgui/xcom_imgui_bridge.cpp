@@ -52,6 +52,7 @@ static_assert(LayoutConfig::kSidebarWidth > 0.0f);
 static_assert(LayoutConfig::kSendHeight >= 100.0f);
 constexpr float kFooterHeight = 22.0f;
 constexpr float kControlHeight = 26.0f;
+constexpr float kToggleHeight = 22.0f;
 constexpr float kSidebarInset = 1.2f;
 constexpr unsigned int kPanelBorder = 0x4B5A63;
 
@@ -448,8 +449,13 @@ void Header(int& actions, const bool connected) {
                        ImGui::GetColorU32(rgb(palette::kHeaderSubtitle)), "SERIAL CONSOLE");
     const char* const status = connected ? "ONLINE" : "OFFLINE";
     const float button_group_start = ImGui::GetWindowWidth() - 108.0f;
-    const float status_width = ImGui::CalcTextSize(status).x + 20.0f;
+    const float status_width = ImGui::CalcTextSize(status).x + 32.0f;
     ImGui::SetCursorPos(ImVec2(button_group_start - status_width - 12.0f, 15.0f));
+    const ImVec2 status_origin = ImGui::GetCursorScreenPos();
+    ImGui::GetWindowDrawList()->AddCircleFilled(
+        ImVec2(status_origin.x + 5.0f, status_origin.y + ImGui::GetFontSize() * 0.5f),
+        3.0f, ImGui::GetColorU32(connected ? rgb(palette::kStatusOnline) : rgb(palette::kStatusOffline)));
+    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 12.0f);
     ImGui::TextColored(connected ? rgb(palette::kStatusOnline) : rgb(palette::kStatusOffline), "%s", status);
     ImGui::SetCursorPos(ImVec2(button_group_start, 8.0f));
     actions |= Command<Action::ActionMinimizeWindow>::Execute(
@@ -839,7 +845,7 @@ void TextContextMenu(const char* popup_id, char* buffer, const size_t capacity) 
 }
 
 [[nodiscard]] bool Toggle(const char* label, int* value) {
-    const ImVec2 size(28.0f, kControlHeight);
+    const ImVec2 size(28.0f, kToggleHeight);
     const bool changed = ImGui::InvisibleButton(label, size);
     if (changed) *value = *value == 0 ? 1 : 0;
     const bool enabled = *value != 0;
@@ -921,10 +927,12 @@ void Footer(const bool connected, const int rx_bytes, const int tx_bytes) {
     const float state_width = ImGui::CalcTextSize(state_label.data(),
                                                    state_label.data() + state_label.size()).x;
     const ImVec2 state_min(origin.x + 10.0f, origin.y + 3.0f);
-    const ImVec2 state_max(state_min.x + state_width + 12.0f, origin.y + kFooterHeight - 3.0f);
+    const ImVec2 state_max(state_min.x + state_width + 24.0f, origin.y + kFooterHeight - 3.0f);
     draw_list->AddRectFilled(state_min, state_max,
                              ImGui::GetColorU32(connected ? rgb(0xC6ECE8) : rgb(0xE9E0CF)), 3.0f);
-    draw_list->AddText(ImVec2(state_min.x + 6.0f, baseline), state_color,
+    draw_list->AddCircleFilled(ImVec2(state_min.x + 8.0f, baseline + ImGui::GetFontSize() * 0.5f),
+                               3.0f, state_color);
+    draw_list->AddText(ImVec2(state_min.x + 16.0f, baseline), state_color,
                        state_label.data(), state_label.data() + state_label.size());
     char counters[48]{};
     if (connected) sprintf_s(counters, "RX %d   TX %d", rx_bytes, tx_bytes);

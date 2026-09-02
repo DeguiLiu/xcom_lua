@@ -200,6 +200,11 @@ function M.new(cfg, cfg_data, config_path)
     self._imgui_receive_chunks = {}
     self._imgui_receive_chunk_bytes = 0
     self._imgui_receive_dirty = false
+    -- P2 layer of run_message_loop: high-priority deferred jobs.  Handlers
+    -- that must not run inside a WndProc/timer callback (re-entrancy or
+    -- ordering) push closures here; the loop drains the whole queue between
+    -- uv callbacks and rendering.  See schedule_defer.
+    self._defer_queue = {}
     -- HSM mirror of the native port state (design: interlock parity with the
     -- Python client's ViewModel — see core/view_model.lua).
     self.vm = view_model.new()
@@ -931,29 +936,44 @@ function Window:on_chk_autosave_toggled()
     end
 end
 
--- Timer poll 1: 10 ms display drain.
--- jit.off: entered from the WM_TIMER dispatch inside WndProc (C re-entry).
+-- Timer poll 1 (P1 DATA priority): display drain.
+-- jit.off: entered from a luv timer callback (C re-entry into Lua).
+--
+-- Data-loss contract: every drained batch reaches the Lua side exactly once
+-- and is appended to the auto-save log BEFORE any display-side trimming, so
+-- the 64 KiB receive-tail window only ever drops *visible* history, never
+-- data.  The drain runs until the core lane is empty (not a single 64 KiB
+-- budget) so a brief UI stall cannot let the 512 KiB core pool fill up and
+-- count rx_pool_exhausted_bytes — a full pool is the only true data-loss
+-- path.  A hard round cap bounds the loop against a pathological producer.
 function Window:poll_display()
     if not self.core or not self.connected then
         return
     end
-    -- bounded drain budget 64 KiB per round like the Python worker.
-    local rc, text = xcom.drain_display(self.core, 64 * 1024)
-    if rc ~= xcom.ok or not text or #text == 0 then
-        return
+    local drained_any = false
+    local max_rounds = 8  -- 8 × 64 KiB = 512 KiB, one full core pool per poll
+    for _ = 1, max_rounds do
+        local rc, text = xcom.drain_display(self.core, 64 * 1024)
+        if rc ~= xcom.ok or not text or #text == 0 then
+            break
+        end
+        drained_any = true
+        -- Log first (persistence), then the display tail (trimmable).
+        if self._log_active then
+            xcom.log_append(self.core, text, #text)
+        end
+        self:_append_imgui_receive(text)
+        -- The native RICHEDIT is hidden while the ImGui dashboard is active;
+        -- feeding it is invisible work that still walks the whole batch
+        -- through EM_REPLACESEL + colouring.  Only feed when visible.
+        if not self.imgui and self.recv and self.recv.feed then
+            self.recv.feed(text)
+        end
     end
-    self:_append_imgui_receive(text)
-    -- New receive data changed the log tail; pull the next frame at the data
-    -- cadence instead of waiting for the idle heartbeat.
-    self:request_frame(FRAME_INTERVAL_DATA_MS)
-    if self._log_active then
-        xcom.log_append(self.core, text, #text)
-    end
-    -- The native RICHEDIT is hidden while the ImGui dashboard is active;
-    -- feeding it is invisible work that still walks the whole batch through
-    -- EM_REPLACESEL + colouring.  Only feed when the panel is on screen.
-    if not self.imgui and self.recv and self.recv.feed then
-        self.recv.feed(text)
+    if drained_any then
+        -- New receive data changed the log tail; pull the next frame at the
+        -- data cadence instead of waiting for the idle heartbeat.
+        self:request_frame(FRAME_INTERVAL_DATA_MS)
     end
 end
 jit.off(Window.poll_display)
@@ -1011,6 +1031,27 @@ function Window:request_frame(interval_ms)
     end
 end
 
+-- Queue a closure for the P2 layer of run_message_loop.  Use this instead of
+-- running work directly inside a WndProc dispatch or a luv timer callback when
+-- either (a) the work may re-enter those callbacks, or (b) ordering relative
+-- to other queued work matters.  Jobs run once per loop iteration, after the
+-- due luv timers and before rendering; the queue is drained fully.
+function Window:schedule_defer(job)
+    local queue = self._defer_queue
+    queue[#queue + 1] = job
+    -- A queued job may need a frame (e.g. it updates status text); the idle
+    -- heartbeat guarantees it renders even without an explicit request.
+end
+
+-- P3 UI-priority status update: cache the newest status string and let the
+-- next rendered frame commit it via one FFI call.  An error-ring storm (one
+-- take_error hit per 250 ms poll) then costs one set_status per frame at
+-- most instead of one per producer; intermediate strings simply coalesce.
+function Window:set_status_deferred(text)
+    self._status_dirty = text or ""
+    self:request_frame()
+end
+
 function Window:render_imgui()
     if not self.imgui then return end
     local now = uv.now()
@@ -1023,6 +1064,12 @@ function Window:render_imgui()
     end
     self._imgui_next_frame = now + FRAME_INTERVAL_IDLE_MS
     if not self.imgui:frame() then return end
+    -- P3 commit: the deferred status text (set_status_deferred) lands in this
+    -- frame — one FFI call, newest value wins.
+    if self._status_dirty ~= nil then
+        self.imgui:set_status(self._status_dirty)
+        self._status_dirty = nil
+    end
     local receive_changed = self:_flush_imgui_receive()
     local rx = self._imgui_receive or ""
     if receive_changed then
@@ -1217,7 +1264,8 @@ function Window:_poll_errors()
     local err = xcom.take_error(self.core)
     if err then
         if self.imgui then
-            self.imgui:set_status(string.format("E%d: %s", err.code, err.message))
+            -- P3 deferred: coalesced into the next rendered frame.
+            self:set_status_deferred(string.format("E%d: %s", err.code, err.message))
         end
         c.set_text(self.status.labels[4],
                    string.format("E%d: %s", err.code, err.message))
@@ -1291,8 +1339,22 @@ function Window:poll_status()
         local paused = snap.display_paused_bytes
         if drops ~= self._last_drops or trim ~= self._last_trim or paused ~= self._last_paused then
             self._last_drops, self._last_trim, self._last_paused = drops, trim, paused
-            c.set_text(self.status.labels[3],
-                       string.format("drops: %d  trim: %d  pause: %d", drops, trim, paused))
+            -- Backpressure escalation: a growing rx_pool_exhausted_bytes means
+            -- the 512 KiB core pool filled and bytes were dropped at the source
+            -- — the one true data-loss path.  React immediately instead of at
+            -- the next 10 ms tick: drain right now and surface the overflow.
+            local prev_exhausted = self._last_pool_exhausted or 0
+            if snap.rx_pool_exhausted_bytes > prev_exhausted then
+                self._last_pool_exhausted = snap.rx_pool_exhausted_bytes
+                c.set_text(self.status.labels[3],
+                           string.format("DATA LOSS: rx pool overflow (total %d) - draining",
+                                         snap.rx_pool_exhausted_bytes))
+                self:poll_display()
+                self:request_frame(FRAME_INTERVAL_ACTIVE_MS)
+            else
+                c.set_text(self.status.labels[3],
+                           string.format("drops: %d  trim: %d  pause: %d", drops, trim, paused))
+            end
         end
     end
     self:_poll_errors()
@@ -1335,6 +1397,19 @@ function Window:_render_ui_state()
     -- retain a prior template across sessions.
     local was_connected = self.connected
     self.connected = state.connected
+    -- Demand-driven display drain: arm the 10 ms poller only while data can
+    -- actually arrive, and stop it on disconnect so the event loop's shortest
+    -- deadline returns to the 250 ms status poll (the message loop then blocks
+    -- properly in MsgWait when idle).
+    if self._display_timer then
+        if state.connected and not self._display_timer_armed then
+            self._display_timer:start(10, 10, self._display_timer_callback)
+            self._display_timer_armed = true
+        elseif not state.connected and self._display_timer_armed then
+            self._display_timer:stop()
+            self._display_timer_armed = false
+        end
+    end
     if state.connected and not was_connected then
         self:_push_display_options()
         if self.imgui then
@@ -1518,10 +1593,11 @@ function Window:start()
     self:bind_handler(self.recv.auto_clear_cb.id, "on_chk_display_opt_toggled")
     self:bind_handler(self.recv.auto_save_cb.id, "on_chk_autosave_toggled")
 
-    -- Start the two pollers as libuv timers: 10 ms display drain, 250 ms
-    -- status snapshot.  luv event loop is driven by run_message_loop() via
-    -- uv.run("nowait") right after the Win32 message pump, so the two loops
-    -- coexist on this single thread.
+    -- Two pollers as libuv timers.  The 10 ms display drain is DEMAND-DRIVEN:
+    -- it only runs while a port is connected (see _render_ui_state), so an
+    -- idle session's shortest luv deadline is the 250 ms status poll and the
+    -- event-driven loop can actually block in MsgWait instead of waking every
+    -- 10 ms for a no-op drain check.
     self._display_timer = uv.new_timer()
     local display_timer_callback = function()
         local ok, err = pcall(self.poll_display, self)
@@ -1529,7 +1605,6 @@ function Window:start()
     end
     jit.off(display_timer_callback, true)
     self._display_timer_callback = display_timer_callback
-    self._display_timer:start(10, 10, display_timer_callback)
     self._status_timer = uv.new_timer()
     local status_timer_callback = function()
         local ok, err = pcall(self.poll_status, self)
@@ -1545,11 +1620,24 @@ end
 
 -- Message loop; blocks until WM_QUIT.  Returns when the window closes.
 --
--- Two loops coexist here on one thread: the Win32 message pump (PeekMessageW,
--- non-blocking) and the libuv event loop (uv.run("nowait")).  The luv timers
--- that replace SetTimer (poll_display/poll_status) only advance when
--- uv.run("nowait") is called, so the loop pumps Win32 messages, then runs the
--- due libuv timers, then yields ~1ms so neither loop busy-spins.
+-- Event-driven, priority-layered loop (design: "luv 充分使用 + 消息/任务分
+-- 优先级").  Each iteration runs layers strictly in order:
+--
+--   P0 Win32 input   — pump every pending message (user input always first;
+--                      input-class messages request an interactive frame).
+--   P1 luv timers    — uv.run("nowait") fires the 10 ms display drain, the
+--                      250 ms status snapshot and the multi-send cycle when
+--                      they are due — never late because the loop slept.
+--   P2 deferred jobs — high-priority task queue drained fully (schedule_defer).
+--   P3 idle GC       — only when this iteration saw no input: one bounded
+--                      collectgarbage("step"), so a sustained serial stream
+--                      (which never yields to a full GC) still compacts.
+--
+-- Then render (paced by cause inside render_imgui) and SLEEP until the next
+-- event: MsgWaitForMultipleObjectsEx wakes on any queued message or at the
+-- earlier of the luv timer deadline (uv.backend_timeout) and the next frame
+-- deadline.  This replaces the old uv.sleep(1) poll — the process wakes a
+-- handful of times per idle second instead of ~64.
 --
 -- jit.off on this function only: it calls into DispatchMessageW, which in
 -- turn re-enters the WndProc callback (an FFI closure created via
@@ -1560,20 +1648,54 @@ end
 local run_message_loop = function(self)
     local msg = ffi.new("MSG")
     while true do
-        -- Pump all pending Win32 messages (non-blocking).
+        -- P0: pump ALL pending Win32 messages (non-blocking).
+        local saw_input = false
         while w.user32.PeekMessageW(msg, nil, 0, 0, 1) ~= 0 do  -- 1 = PM_REMOVE
             if msg.message == w.wm.WM_QUIT then
                 return
             end
+            saw_input = true
             w.user32.TranslateMessage(msg)
             w.user32.DispatchMessageW(msg)
         end
-        -- Run due libuv timers (replaces the SetTimer WM_TIMER dispatch).
+
+        -- P1: run due luv timers (display drain / status snapshot / multi).
         uv.run("nowait")
+
+        -- P2: drain the deferred high-priority task queue fully.
+        local queue = self._defer_queue
+        if queue and #queue > 0 then
+            self._defer_queue = {}
+            for _, job in ipairs(queue) do
+                local ok, err = pcall(job)
+                if not ok then
+                    io.stderr:write("[defer] " .. tostring(err) .. "\n")
+                end
+            end
+        end
+
+        -- P3: idle-only bounded GC step.  A steady receive stream produces a
+        -- constant supply of dead chunk strings; without this the collector
+        -- only ever runs on explicit collectgarbage() calls.
+        if not saw_input then
+            collectgarbage("step", 8)
+        end
+
         self:render_imgui()
-        -- Yield ~1 ms so the 10 ms poll and 250 ms status timers settle and
-        -- the loop does not busy-spin at 100% CPU.
-        uv.sleep(1)
+
+        -- Sleep until the next event.  The timeout is the earlier of the
+        -- next luv timer deadline and the next frame deadline; MsgWait wakes
+        -- immediately on any newly queued message.
+        local timeout_ms = uv.backend_timeout()
+        if not timeout_ms or timeout_ms < 0 then timeout_ms = 100 end
+        local frame_wait = self._imgui_next_frame and
+            (self._imgui_next_frame - uv.now()) or 0
+        if frame_wait > 0 and frame_wait < timeout_ms then
+            timeout_ms = frame_wait
+        end
+        w.user32.MsgWaitForMultipleObjectsEx(
+            0, nil, math.floor(timeout_ms), w.wait.QS_ALLINPUT,
+            w.wait.MWMO_INPUTAVAILABLE)
     end
 end
 jit.off(run_message_loop)

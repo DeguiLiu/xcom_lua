@@ -35,3 +35,8 @@ launcher prefers a locally built `build/native-release/bin/xcom_core.dll` and
 falls back to this directory when no local build is available. `luvjit.exe`
 is the launcher runtime; `luajit.exe` is retained as a standalone compatibility
 runtime for scripts that expect the standard executable name.
+
+For a release package, generate optional LuaJIT bytecode with:
+`powershell -ExecutionPolicy Bypass -File ..\build_bytecode.ps1 -OutputRoot .\bytecode`
+The entry point searches `.ljbc` before `.lua`, so development checkouts and
+partially packaged bundles continue to work without bytecode files.

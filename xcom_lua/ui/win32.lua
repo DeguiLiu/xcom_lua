@@ -82,6 +82,17 @@ M.style = {
     HWND_NOTOPMOST = -2,
 }
 
+M.wait = {
+    -- Queue-status wake mask for MsgWaitForMultipleObjectsEx: any input
+    -- (mouse/keyboard/posted messages, paint, timer, posted-quit).
+    QS_ALLINPUT = 0x04FF,
+    -- MWMO_INPUTAVAILABLE: return immediately if messages are ALREADY queued
+    -- (without it a stale peeked-empty queue could block a full timeout).
+    MWMO_INPUTAVAILABLE = 0x0002,
+    WAIT_TIMEOUT = 0x00000102,
+    WAIT_OBJECT_0 = 0x00000000,
+}
+
 M.ctrl = {
     Button = "Button",
     Edit = "Edit",
@@ -403,6 +414,12 @@ BOOL ScreenToClient(HWND hWnd, POINT* lpPoint);
 BOOL ClientToScreen(HWND hWnd, POINT* lpPoint);
 void SetTimer(HWND hWnd, uintptr_t nIDEvent, UINT uElapse, void* lpTimerFunc);
 BOOL KillTimer(HWND hWnd, uintptr_t uIDEvent);
+/* Event-driven wait: blocks until a Win32 message of the wake mask arrives or
+ * the timeout elapses, whichever is first.  Replaces sleep-polling in the
+ * message loop. */
+DWORD MsgWaitForMultipleObjectsEx(DWORD nCount, const HANDLE* pHandles,
+                                  DWORD dwMilliseconds, DWORD dwWakeMask,
+                                  DWORD dwFlags);
 HWND GetDesktopWindow(void);
 UINT GetDlgCtrlID(HWND hWnd);
 HWND GetDlgItem(HWND hWnd, int nIDDlgItem);
