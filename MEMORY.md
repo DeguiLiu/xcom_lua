@@ -58,11 +58,11 @@
 | 纯 LuaJIT + ffi spin 基线 | ~7 MB | `luvjit.exe -e "while true do end"` |
 | `require("luv")` + 事件循环主动运行 | +~54 MB | libuv 线程池/堆；主程序从未主动进入，实际不占 |
 | Intel HARDWARE DX11 UMD | +~65 MB | 用户态驱动管线 + 着色器缓存，本机实测 |
-| **WARP + 单缓冲后全栈稳定值** | **~23 MB private / ~43 MB WS** | `c90cc28` 之后 |
+| **WARP + 单缓冲后全栈稳定值** | **~50 MB private / ~75 MB WS** | 2026-09-03 稳定采样 |
 
 ### 已验证的削减手段（按性价比排序）
 
-1. **DX11 HARDWARE → WARP**（`D3D_DRIVER_TYPE_WARP` + `D3D11_CREATE_DEVICE_PREVENT_INTERNAL_THREADING_OPTIMIZATIONS`）：一个改动省 ~65 MB，代价是每帧 45-60 ms CPU。串口控制台的 UI 复杂度完全够用。
+1. **DX11 HARDWARE → WARP**（`D3D_DRIVER_TYPE_WARP` + `D3D11_CREATE_DEVICE_PREVENT_INTERNAL_THREADING_OPTIMIZATIONS`）：稳定私有内存约 50 MB，代价是每帧 45-60 ms CPU。串口控制台的 UI 复杂度完全够用。
 2. **交换链 2 缓冲 FLIP_DISCARD → 1 缓冲 DISCARD**：flip 模型强制一个全尺寸 staging buffer，本 UI 不需要。
 3. **帧率按因分级**（`window.lua`）：WARP 帧是纯 CPU 开销。交互 16 ms / 数据到达 100 ms / 空闲心跳 500 ms / 最小化跳帧；空闲 CPU 73% → 10%。`request_frame(interval)` 由"改了屏幕内容的代码"调用拉早下一帧，高频系统消息（NCHITTEST/PAINT/TIMER）不得触发，否则节流失效。
 4. **核心固定池按波特率定容**（`xcom_config.hpp`）：`kRxBlockCount=128`（512 KiB）、`kDisplayBatchCount=32`（512 KiB）。921600 波特 ≈ 90 KiB/s，10 ms drain 节奏下余量为秒级。容量必须是 2 的幂（SpscRing 掩码）。

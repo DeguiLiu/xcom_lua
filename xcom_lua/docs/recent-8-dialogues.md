@@ -76,9 +76,9 @@
 - `.gitignore` 补根目录运行时垃圾（`xcom_diag.log`、`ui_current.png`）。
 - 全部工作已提交并推送 Gitee：`51505f1`（DX11+崩溃修复+性能）、`ac6bc2a`（发送失败反馈）、`0ee4377`（DLL 查找顺序）、`c0dbf23`（C4819+集成测试）、`5fb4dc0`（清理误提交截图）。
 
-## 8. 内存优化专项（90 MB → 23 MB）与按需帧率
+## 8. 内存优化专项（90 MB → ~50 MB）与按需帧率
 
-目标：常驻内存 ≤55 MB（远期 30 MB）。实测从 ~90 MB 降到 **23.3 MB private / 43 MB Working Set**，空闲 CPU 从 73% 降到 10%。核心手段与验证详见 `MEMORY.md`"性能原则"一节，此处记决策过程：
+目标：常驻内存 ≤55 MB（远期 30 MB）。稳定复测约 **50 MB private / 75 MB Working Set**，空闲 CPU 从 73% 降到 10%；此前 23 MB 是初始化中途值。核心手段与验证详见 `MEMORY.md`"性能原则"一节，此处记决策过程：
 
 - **测量驱动**：分层基线测量定位大头——纯 LuaJIT spin 7 MB；`require("luv")` 主动运行 +54 MB（但主程序从不进入，实为误报）；Intel HARDWARE DX11 UMD ~65 MB（真正大头）；固定池仅 2.3 MB。
 - **核心池预算按波特率定容**（`xcom_config.hpp`）：`kRxBlockCount` 256→128、`kDisplayBatchCount` 64→32（各 1 MiB→512 KiB），921600 波特下余量仍为秒级；容量必须 2 的幂（SpscRing 掩码）。
@@ -86,7 +86,7 @@
 - **DX11 → WARP + 单缓冲**（`xcom_imgui_bridge.cpp`）：`D3D_DRIVER_TYPE_HARDWARE→WARP`、`BufferCount 2→1`、`FLIP_DISCARD→DISCARD`、`PREVENT_INTERNAL_THREADING_OPTIMIZATIONS`。一个改动省 ~65 MB；代价是每帧 45-60 ms CPU，故配合下一条。
 - **按需分级帧率**（`window.lua`）：交互 16 ms / 数据到达 100 ms / 空闲心跳 500 ms / 最小化跳帧 + 跳过 0x0 布局更新；`request_frame(interval)` 拉早下一帧；高频系统消息（NCHITTEST/PAINT/TIMER）不触发否则节流失效；`poll_display`/`poll_status` 仅在数据实际变化时请帧。
 - **字体 atlas 裁剪实验回退**：OversampleH=1 + Latin/ASCII 字符集 + 缩字号实测只省 <1 MB，视觉损失明显，已回退原版并清理实验残留死代码。
-- **测量陷阱**（记入 MEMORY.md）：初始化中途数据（8.6 MB 假象）不可信，稳定值需多次间隔测量；WARP 下 BitBlt 跨进程截屏全黑，用 `PrintWindow(hwnd, hdc, 2)`；空闲 CPU 用 GetProcessTimes 3 s 差分。
+- **测量陷阱**（记入 MEMORY.md）：初始化中途数据（8.6/23 MB 假象）不可信，稳定值需多次间隔测量；WARP 下 BitBlt 跨进程截屏全黑，用 `PrintWindow(hwnd, hdc, 2)`；空闲 CPU 用 GetProcessTimes 3 s 差分。
 - 验证：集成测试 11 过 0 挂；单元测试 143 过 0 挂（config 32/ansi 30/view_model 44/xcom_ffi 37）；PrintWindow 截图像素验证 UI 完整（0% 黑屏）；鼠标交互模拟确认交互期自动回满帧率。
 - 提交推送 Gitee：`585e912`（池+去luv+字体实验）、`bbf9bf6`（恢复luv）、`c90cc28`（WARP+帧率，核心成果）、`9106045`（字体资产/preview_rx/layout）。
 
@@ -96,4 +96,4 @@
 - 串口功能对齐度：核心能力 100%，错误反馈/关闭完整性已补齐，UI 完整度约 70%（缺设置菜单类）。
 - 本机无 COM 口环境，串口测试经 COM3 实测（`serial_integration_test` 状态码全 0）；无硬件的收发回归依赖注入路径。
 - WARP 渲染为软件光栅：满带宽持续接收 + 交互同时发生时帧预算可能吃紧（交互 16 ms 目标 vs 45-60 ms/帧），真机高负载场景需压测；如不达标可回退 HARDWARE（改一行 `D3D_DRIVER_TYPE_`）或降交互帧率档。
-- 内存现状 23.3 MB private 已远低于 55 MB 目标；进一步压缩空间在 LuaJIT 基线（7 MB）与 xcom_core 固定池（~1 MB），边际收益小。
+- 内存现状约 50 MB private / 75 MB working set，已接近 55 MB 目标；进一步压缩空间主要在 WARP/D3D11 设备层。
