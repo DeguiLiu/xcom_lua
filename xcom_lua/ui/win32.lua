@@ -166,14 +166,6 @@ M.ht = {
     HTTRANSPARENT = -1,
 }
 
--- Timer IDs for SetTimer/KillTimer (WM_TIMER dispatch).  Arbitrary non-zero
--- id values owned by the window; keep them distinct from control ids.
-M.timer = {
-    DISPLAY = 1,   -- 10 ms display-drain poller
-    STATUS = 2,    -- 250 ms status snapshot poller
-    MULTI = 3,     -- multi-send auto-cycle period
-}
-
 M.sc = {
     SC_SIZE = 0xF000,
     SC_MAXIMIZE = 0xF030,
@@ -409,10 +401,8 @@ BOOL GetWindowRect(HWND hWnd, RECT* lpRect);
 BOOL MoveWindow(HWND hWnd, int X, int Y, int nWidth, int nHeight, BOOL bRepaint);
 BOOL ScreenToClient(HWND hWnd, POINT* lpPoint);
 BOOL ClientToScreen(HWND hWnd, POINT* lpPoint);
-uintptr_t SetTimer(HWND hWnd, uintptr_t nIDEvent, UINT uElapse, void* lpTimerFunc);
+void SetTimer(HWND hWnd, uintptr_t nIDEvent, UINT uElapse, void* lpTimerFunc);
 BOOL KillTimer(HWND hWnd, uintptr_t uIDEvent);
-uint64_t GetTickCount64(void);
-void Sleep(DWORD dwMilliseconds);
 HWND GetDesktopWindow(void);
 UINT GetDlgCtrlID(HWND hWnd);
 HWND GetDlgItem(HWND hWnd, int nIDDlgItem);

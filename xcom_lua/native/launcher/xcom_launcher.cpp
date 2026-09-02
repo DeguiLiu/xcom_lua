@@ -17,14 +17,14 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     if (parent_slash == std::wstring::npos) return ERROR_PATH_NOT_FOUND;
     working_dir.resize(parent_slash);
 
-    const std::wstring child = runtime_dir + L"\\luajit.exe";
+    const std::wstring child = runtime_dir + L"\\luvjit.exe";
     std::wstring command = L"\"" + child + L"\" \"" + working_dir + L"\\main.lua\"";
     std::vector<wchar_t> command_buffer(command.begin(), command.end());
     command_buffer.push_back(L'\0');
 
     STARTUPINFOW startup{};
     startup.cb = sizeof(startup);
-    // Launch luajit.exe (a console-subsystem interpreter) with its console
+    // Launch luvjit.exe (a console-subsystem interpreter) with its console
     // window hidden, so no black console flashes alongside the ImGui window.
     startup.dwFlags = STARTF_USESHOWWINDOW;
     startup.wShowWindow = SW_HIDE;
