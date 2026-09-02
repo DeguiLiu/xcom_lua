@@ -130,6 +130,13 @@ local IMGUI_COMMANDS = {
     { IMGUI_ACTION.close_window, "on_close" },
 }
 
+local STATUS_TEXT = {
+    [0] = "ok", [-1] = "bad parameter", [-2] = "not open",
+    [-3] = "already open", [-4] = "busy", [-5] = "full",
+    [-6] = "io error", [-7] = "timeout", [-8] = "drain incomplete",
+    [-9] = "unsupported",
+}
+
 local HEADER_H = 32
 local STATUS_H = 26
 local CONN_W = 165
@@ -806,7 +813,11 @@ function Window:core_send(data_bytes, flags)
         return
     end
     if data_bytes and #data_bytes > 0 then
-        xcom.send(self.core, data_bytes, flags or xcom.send_text)
+        local rc = tonumber(xcom.send(self.core, data_bytes, flags or xcom.send_text))
+        if rc ~= xcom.ok and self.status and self.status.labels then
+            c.set_text(self.status.labels[3],
+                       "send failed: " .. (STATUS_TEXT[rc] or tostring(rc)))
+        end
     end
 end
 
@@ -1082,14 +1093,6 @@ function Window:_sync_imgui_autosave()
         self:_log_close_with_retry()
     end
 end
-
--- Status code -> short label for status-bar messages.
-local STATUS_TEXT = {
-    [0] = "ok", [-1] = "bad parameter", [-2] = "not open",
-    [-3] = "already open", [-4] = "busy", [-5] = "full",
-    [-6] = "io error", [-7] = "timeout", [-8] = "drain incomplete",
-    [-9] = "unsupported",
-}
 
 -- Close the log with a bounded retry (Python retries the close on a 250 ms
 -- timer until the writer drains; here we retry synchronously a few times,
