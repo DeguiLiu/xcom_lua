@@ -21,9 +21,11 @@ Usage: runtime\luvjit.exe tests/stress_warp_ui.lua [seconds] [kib_per_s]
 
 if arg and arg[0] and arg[0]:sub(1, 1) ~= "@" then
     local dir = arg[0]:match("^(.*)[/\\]") or "."
-    -- Tests live in <root>/tests; resolve modules from the app root one level
-    -- up so core/ and ui/ resolve regardless of the cwd the test is run from.
-    local root = dir:match("^(.*)[/\\]tests$") or dir
+    -- Tests live in <root>/tests; strip a trailing "tests" path component so
+    -- core/ and ui/ resolve from the app root whether arg[0] is relative
+    -- ("tests/x.lua" -> ".") or absolute ("<root>/tests/x.lua" -> "<root>").
+    local root = dir:gsub("[/\\]tests$", "")
+    if root == "" then root = "." end
     package.path = root .. "/core/?.lua;" .. root .. "/ui/?.lua;" ..
                    package.path
 end
