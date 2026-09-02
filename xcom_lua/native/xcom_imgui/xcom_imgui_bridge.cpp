@@ -1224,7 +1224,7 @@ extern "C" __declspec(dllexport) int xcom_imgui_init(HWND hwnd) {
     const UINT width = static_cast<UINT>(std::max<LONG>(1, client_rect.right - client_rect.left));
     const UINT height = static_cast<UINT>(std::max<LONG>(1, client_rect.bottom - client_rect.top));
     DXGI_SWAP_CHAIN_DESC swap_desc{};
-    swap_desc.BufferCount = 2;
+    swap_desc.BufferCount = 1;
     swap_desc.BufferDesc.Width = width;
     swap_desc.BufferDesc.Height = height;
     swap_desc.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -1232,13 +1232,15 @@ extern "C" __declspec(dllexport) int xcom_imgui_init(HWND hwnd) {
     swap_desc.OutputWindow = hwnd;
     swap_desc.SampleDesc.Count = 1;
     swap_desc.Windowed = TRUE;
-    swap_desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    swap_desc.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
     constexpr D3D_FEATURE_LEVEL feature_levels[] = {
         D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_0,
     };
     D3D_FEATURE_LEVEL feature_level{};
     const HRESULT device_result = D3D11CreateDeviceAndSwapChain(
-        nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, D3D11_CREATE_DEVICE_SINGLETHREADED, feature_levels,
+        nullptr, D3D_DRIVER_TYPE_WARP, nullptr,
+        D3D11_CREATE_DEVICE_SINGLETHREADED | D3D11_CREATE_DEVICE_PREVENT_INTERNAL_THREADING_OPTIMIZATIONS,
+        feature_levels,
         static_cast<UINT>(IM_ARRAYSIZE(feature_levels)), D3D11_SDK_VERSION,
         &swap_desc, &runtime.swap_chain_, &runtime.device_, &feature_level,
         &runtime.context_);
@@ -1258,48 +1260,32 @@ extern "C" __declspec(dllexport) int xcom_imgui_init(HWND hwnd) {
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     io.ConfigInputTextCursorBlink = true;
     ImFontConfig font_config;
-    // OversampleH=1 (was 2): keeps atlas pixel-perfect at the same time as
-    // halving its per-glyph storage.  The legacy 2x oversample was a hold-over
-    // from the Siemens Slab display styling; with PixelSnapH the visible
-    // quality difference is minor and the memory savings are large.
-    font_config.OversampleH = 1;
+    font_config.OversampleH = 2;
     font_config.OversampleV = 1;
     font_config.PixelSnapH = true;
-    // Restrict the body font to Latin (Basic Latin + Latin-1 Supplement).  The
-    // serial monitor handles ASCII text; GetGlyphRangesDefault() also packs
-    // thousands of CJK glyphs into the atlas that never get touched here.
-    static const ImWchar kLatinRanges[] = { 0x20, 0xFF, 0 };
-    font_config.GlyphRanges = kLatinRanges;
+    font_config.GlyphRanges = io.Fonts->GetGlyphRangesDefault();
     const std::string body_font = module_asset_path("SiemensSlabRoman.ttf");
-    if (ImFont* font = io.Fonts->AddFontFromFileTTF(body_font.c_str(), 15.0f, &font_config)) {
+    if (ImFont* font = io.Fonts->AddFontFromFileTTF(body_font.c_str(), 17.0f, &font_config)) {
         io.FontDefault = font;
-    } else if (ImFont* font = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segoeui.ttf", 15.0f, &font_config)) {
+    } else if (ImFont* font = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segoeui.ttf", 17.0f, &font_config)) {
         io.FontDefault = font;
     }
     ImFontConfig heading_config = font_config;
     const std::string heading_font = module_asset_path("SiemensSlabBold.TTF");
-    runtime.heading_font_ = io.Fonts->AddFontFromFileTTF(heading_font.c_str(), 16.0f, &heading_config);
-    if (!runtime.heading_font_) runtime.heading_font_ = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segoeuib.ttf", 16.0f, &heading_config);
+    runtime.heading_font_ = io.Fonts->AddFontFromFileTTF(heading_font.c_str(), 18.0f, &heading_config);
+    if (!runtime.heading_font_) runtime.heading_font_ = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segoeuib.ttf", 18.0f, &heading_config);
     // Monospace data face for the serial log / hex column.  A proportionally
     // spaced font (Siemens Slab) makes every RX frame and hex byte column
     // ragged; a fixed-width face is the standard for serial monitors and lets
     // byte indices line up.  Fall back to Cascadia Mono if Consolas is absent
     // on this build, else the default font (caller renders lines plainly).
-    // Limited to printable ASCII (0x20-0x7E) — the receive log is byte/ASCII.
-    constexpr std::uint16_t kMonoGlyphRanges[4] = {0x20, 0x7E, 0x00, 0x00};
-    ImFontConfig mono_config;
-    mono_config.OversampleH = 1;
-    mono_config.OversampleV = 1;
-    mono_config.PixelSnapH = true;
-    static const ImWchar kAsciiRanges[] = { 0x20, 0x7E, 0 };
-    mono_config.GlyphRanges = kAsciiRanges;
     runtime.mono_font_ = io.Fonts->AddFontFromFileTTF(
-        "C:\\Windows\\Fonts\\consola.ttf", 14.0f, &mono_config,
-        kAsciiRanges);
+        "C:\\Windows\\Fonts\\consola.ttf", 16.0f, nullptr,
+        io.Fonts->GetGlyphRangesDefault());
     if (!runtime.mono_font_) {
         runtime.mono_font_ = io.Fonts->AddFontFromFileTTF(
-            "C:\\Windows\\Fonts\\cascadiamono.ttf", 14.0f, &mono_config,
-            kAsciiRanges);
+            "C:\\Windows\\Fonts\\cascadiamono.ttf", 16.0f, nullptr,
+            io.Fonts->GetGlyphRangesDefault());
     }
     apply_style(runtime.layout_);
     if (!ImGui_ImplWin32_Init(hwnd)) {

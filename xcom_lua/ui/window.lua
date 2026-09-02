@@ -381,6 +381,21 @@ function Window:dispatch(hwnd, msg, wparam, lparam)
         imgui_handled = ok and handled
     end
 
+    -- Demand-driven repaint (see render_imgui): any real input message pulls
+    -- the next frame to the interactive 16 ms cadence.  High-frequency system
+    -- chatter (NCHITTEST, ERASEBKGND, PAINT, TIMER) deliberately does NOT —
+    -- triggering on those would defeat the idle heartbeat entirely.
+    if self.imgui then
+        if (m >= 0x0005 and m <= 0x0019) or     -- WM_SIZE..WM_SETFOCUS range
+           (m >= 0x00A0 and m <= 0x00A9) or     -- nonclient mouse (drag/resize)
+           (m >= 0x0100 and m <= 0x0109) or     -- WM_KEYDOWN..WM_SYSDEADCHAR
+           (m >= 0x0200 and m <= 0x020E) or     -- mouse move/click/wheel
+           m == 0x0007 or                       -- WM_SETFOCUS
+           m == 0x000C then                     -- WM_SETTEXT (title/status)
+            self:request_frame(FRAME_INTERVAL_ACTIVE_MS)
+        end
+    end
+
     if m == w.wm.WM_NCHITTEST then
         return self:on_nchittest(lparam)
     end
@@ -928,6 +943,9 @@ function Window:poll_display()
         return
     end
     self:_append_imgui_receive(text)
+    -- New receive data changed the log tail; pull the next frame at the data
+    -- cadence instead of waiting for the idle heartbeat.
+    self:request_frame(FRAME_INTERVAL_DATA_MS)
     if self._log_active then
         xcom.log_append(self.core, text, #text)
     end
@@ -972,11 +990,38 @@ end
 -- jit.off: this is the ImGui frame driver — it calls into the xcom_imgui C
 -- DLL, whose wndproc path re-enters Lua through the WndProc FFI callback.
 -- Traced frames were the second source of the "bad callback" PANIC.
+-- Frame pacing under WARP (software) rendering.  A full frame costs ~45-60 ms
+-- of CPU, so the old fixed 16 ms cadence burned ~70% of a core redrawing an
+-- idle UI.  Frames are now demand-driven with a per-cause interval:
+--   * interactive (mouse/keyboard/window messages): 16 ms  — feels instant
+--   * receive data pending: 100 ms (10 FPS coalesced log tail)
+--   * idle heartbeat: 500 ms (status text, cursor blink, clock fallbacks)
+-- Anything that changes what is on screen calls request_frame() to pull the
+-- next frame earlier; the floor keeps one heartbeat frame alive.
+local FRAME_INTERVAL_ACTIVE_MS = 16
+local FRAME_INTERVAL_DATA_MS = 100
+local FRAME_INTERVAL_IDLE_MS = 500
+
+function Window:request_frame(interval_ms)
+    if not self.imgui then return end
+    local now = uv.now()
+    local next_frame = now + (interval_ms or FRAME_INTERVAL_ACTIVE_MS)
+    if not self._imgui_next_frame or next_frame < self._imgui_next_frame then
+        self._imgui_next_frame = next_frame
+    end
+end
+
 function Window:render_imgui()
     if not self.imgui then return end
     local now = uv.now()
     if self._imgui_next_frame and now < self._imgui_next_frame then return end
-    self._imgui_next_frame = now + 16
+    -- Skip frames entirely while minimized: nothing is visible, and WARP
+    -- repaints are pure wasted CPU.
+    if self._minimized then
+        self._imgui_next_frame = now + FRAME_INTERVAL_IDLE_MS
+        return
+    end
+    self._imgui_next_frame = now + FRAME_INTERVAL_IDLE_MS
     if not self.imgui:frame() then return end
     local receive_changed = self:_flush_imgui_receive()
     local rx = self._imgui_receive or ""
@@ -1237,6 +1282,9 @@ function Window:poll_status()
             self._last_tx_fmt = snap.tx_bytes
             c.set_text(self.status.labels[2],
                        string.format("RX %d  TX %d", snap.rx_bytes, snap.tx_bytes))
+            -- Byte counters are drawn in the ImGui header; refresh at the data
+            -- cadence while traffic flows, else fall back to the heartbeat.
+            self:request_frame(FRAME_INTERVAL_DATA_MS)
         end
         local drops = snap.rx_pool_exhausted_bytes + snap.tx_rejected
         local trim = snap.ui_trimmed_bytes
@@ -1309,6 +1357,16 @@ function Window:on_size(wparam, lparam)
     local lp = tonumber(lparam) or 0
     local wd = lp % 65536
     local hg = math.floor(lp / 65536) % 65536
+    -- SIZE_MINIMIZED = 1: nothing is visible, so render_imgui skips frames at
+    -- the idle cadence until restore; SIZE_RESTORED = 0 / SIZE_MAXIMIZED = 2
+    -- clear the flag and resume normal pacing.  A minimized WM_SIZE also
+    -- reports a 0x0 client area — skip the layout update so restore repaints
+    -- from the last valid geometry.
+    if tonumber(wparam) == 1 then
+        self._minimized = true
+        return 0
+    end
+    self._minimized = false
     if self._layout then
         self._layout.body_w = wd
         local layout = self._layout
