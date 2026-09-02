@@ -49,6 +49,33 @@
 - **非拥有切片**：`Slice<T>` 只借用端口列表内存，提供 `constexpr/noexcept` 迭代，不产生临时容器拷贝。
 - **策略化布局**：`assets/layout.toml` 提供侧栏宽度、间距、字体内边距和区域高度；解析失败时回退到编译期安全默认值。
 
+## 性能原则（2026-09 内存优化轮）
+
+### 已量化的内存构成（luvjit + ImGui 全栈）
+
+| 层 | 实测 | 说明 |
+| --- | --- | --- |
+| 纯 LuaJIT + ffi spin 基线 | ~7 MB | `luvjit.exe -e "while true do end"` |
+| `require("luv")` + 事件循环主动运行 | +~54 MB | libuv 线程池/堆；主程序从未主动进入，实际不占 |
+| Intel HARDWARE DX11 UMD | +~65 MB | 用户态驱动管线 + 着色器缓存，本机实测 |
+| **WARP + 单缓冲后全栈稳定值** | **~23 MB private / ~43 MB WS** | `c90cc28` 之后 |
+
+### 已验证的削减手段（按性价比排序）
+
+1. **DX11 HARDWARE → WARP**（`D3D_DRIVER_TYPE_WARP` + `D3D11_CREATE_DEVICE_PREVENT_INTERNAL_THREADING_OPTIMIZATIONS`）：一个改动省 ~65 MB，代价是每帧 45-60 ms CPU。串口控制台的 UI 复杂度完全够用。
+2. **交换链 2 缓冲 FLIP_DISCARD → 1 缓冲 DISCARD**：flip 模型强制一个全尺寸 staging buffer，本 UI 不需要。
+3. **帧率按因分级**（`window.lua`）：WARP 帧是纯 CPU 开销。交互 16 ms / 数据到达 100 ms / 空闲心跳 500 ms / 最小化跳帧；空闲 CPU 73% → 10%。`request_frame(interval)` 由"改了屏幕内容的代码"调用拉早下一帧，高频系统消息（NCHITTEST/PAINT/TIMER）不得触发，否则节流失效。
+4. **核心固定池按波特率定容**（`xcom_config.hpp`）：`kRxBlockCount=128`（512 KiB）、`kDisplayBatchCount=32`（512 KiB）。921600 波特 ≈ 90 KiB/s，10 ms drain 节奏下余量为秒级。容量必须是 2 的幂（SpscRing 掩码）。
+5. **无效手段（已实测否决）**：字体 atlas 裁剪（OversampleH=1 + Latin/ASCII 字符集 + 缩字号）只省 <1 MB，视觉损失明显，已回退；去 luv 省约 1 MB，不值得架构回归。
+
+### 测量方法论（防再踩坑）
+
+- **纯 spin 探针会高估**：`require("luv")` 的 54 MB 开销只在 libuv 事件循环主动运行时存在；主程序路径的 `uv.run("nowait")` 立即返回，从不进入。判断某依赖的内存代价必须**在实际宿主程序**里量（A/B 两个 EXE 跑同一 main.lua）。
+- **初始化中途数据会低估**：DX11 初始化期间读到的 8.6 MB 是假象；稳定值要等初始化完成后多测几次（间隔几秒取一致值）。
+- **Private Bytes 反映驱动提交内存**，Working Set 受页面共享影响；评估"进程占用"以 Private 为准。
+- **WARP 下 BitBlt 跨进程截屏返回全黑**，用 `PrintWindow(hwnd, hdc, 2)`（PW_RENDERFULLCONTENT）替代；窗口必须先 `ShowWindow(5)`。
+- **空闲 CPU 用 GetProcessTimes 差分**（3 s 窗口），比任务管理器瞬时值客观。
+
 ## 实施边界
 
 - `coact` 的无锁池、ABA 标记和缓存行对齐只用于事件/队列等并发核心；ImGui 窗口线程是单线程消息循环，不为 UI 强行引入原子或对象池。
