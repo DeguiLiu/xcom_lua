@@ -50,3 +50,6 @@ third_party/xcom_imgui/*
 
 # Root-level runtime diagnostics
 xcom_diag.log
+
+# Root-level runtime screenshot
+ui_current.png
