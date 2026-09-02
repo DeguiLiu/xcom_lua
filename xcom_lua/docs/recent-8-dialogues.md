@@ -1,113 +1,94 @@
 # 最近八轮对话开发总结
 
-更新时间：2026-09-01
+更新时间：2026-09-02
 
-本文按最近八轮对话的主题归纳开发结果，重点记录目标、实现位置、验证情况和当前边界。它是开发交接文档，不替代具体模块设计文档。
+本文按最近八轮对话的主题归纳开发结果，重点记录目标、实现位置、验证情况和当前边界。它是开发交接文档，不替代具体模块设计文档。此前八轮（窗口启动、多发送、ImGui 迁移初版、Siemens 视觉调整等）见 git 历史 `029b4d8`。
 
-## 1. 从“窗口能启动”到可用客户端
+## 1. 桥接层与 Lua 代码重构
 
-最初目标是用 LuaJIT + Win32 FFI 实现 Windows 串口调试客户端，并对齐现有 PySide6 版 `xcom_client`。客户端已经能够创建窗口、进入消息循环，并复用 `xcom_core.dll` 的 C ABI。
+对照 `MEMORY.md` 约束对两侧代码做结构化重构：
 
-主要运行时修复包括：
+- C++ 桥接层：提取 `palette::` 命名调色板常量（消除约 40 处魔法色值）、`ScopedHeadingFont` 改收 `ImFont*`、共享 `release_gl_resources`/`release_dx_resources` 失败路径、修正 `std::exchange` 丢弃返回值的误用、修正 `draw_console` 缩进。
+- Lua 侧：提取 `Window:_serial_config()`/`_display_options()` 消除三处 imgui/原生双路径重复分支；合并重复的多发送循环；删除 `Window._stop`、`send_panel` 的 `MAX_PAGES`/`set_entry` 等死代码。
+- 删除 `ActionObserver`：单消费者场景下 publish→lambda 回写→exchange 是恒等变换，`xcom_imgui_draw_console` 直接返回 Action 位掩码（`MEMORY.md` 速查表同步改为"动作掩码直返"）。
+- 修正 `MEMORY.md` 与代码不一致：`Hsm<Context>` 无继承，从"CRTP"改为"类模板静态绑定"。
 
-- 修正 Win32 回调异常，避免 `WndProc` 抛错导致窗口行为异常。
-- 修正 `GetModuleHandleA`、`FillRect` 等 Win32 符号的 DLL 归属。
-- 修正 ComboBox 参数传递和 `lparam` cdata 的数值转换。
-- 使用 `PeekMessageW` 非阻塞消息泵，并与 libuv `uv.run("nowait")` 同线程协作。
-- 处理 `WM_PAINT`、背景擦除和子窗口裁剪，降低闪烁、透明和无法点击问题。
+相关代码：`xcom_lua/native/xcom_imgui/xcom_imgui_bridge.cpp`、`xcom_lua/ui/window.lua`、`MEMORY.md`。
 
-相关入口：`xcom_lua/ui/window.lua`、`xcom_lua/ui/win32.lua`。
+## 2. 串口功能补全（对照 PySide6 版差距盘点）
 
-## 2. 多发送、自动循环和日志保存
+经子代理对照 `xcom_client` 盘点功能差距后，按优先级补齐：
 
-根据对 PySide6 功能对齐的要求，发送区扩展为单发送和多发送两种模式：
+- 错误环消费：`Window:_poll_errors()` 在 250 ms 状态轮询中弹出 `xcom_take_error`，`E<code>: <message>` 显示到状态栏第 4 槽（实测 COM99 打开失败可弹出 "Win32 serial open failed"）。
+- 两阶段关闭 drain：`on_close` 重排为 停定时器 → `_final_drain()`（64 KiB/轮 × 500 轮硬上限）→ 存配置 → 日志 flush/close → 关串口 → 销毁窗口，退出不再丢尾部数据。
+- 窗口置顶生效：`always_on_top` 配置经 `SetWindowPos(HWND_TOPMOST)` 真正应用（此前只存不用）。
+- Alt+0..7 快捷发送：`WM_SYSKEYDOWN` 分支（含小键盘），imgui 与原生面板两路。
+- 日志错误反馈与重试：`_log_close_with_retry()`（500 ms × 4 次有界重试）、三处 `log_open` 检查返回码并回退 UI 勾选、`STATUS_TEXT` 状态码映射；修正"ABI 状态码是 cdata、`not rc` 把 0 误判为真"的隐蔽 bug（全部改为 `tonumber(rc) == xcom.ok`）。
 
-- 多发送支持分页，最多 50 页，每页保存多条发送项。
-- 每条发送项可单独启用/禁用，并支持 HEX 和换行选项。
-- 增加多发送自动循环和周期设置，使用 libuv timer 驱动。
-- 保留单条自动发送逻辑，并在连接状态变化时重新同步定时器。
-- 增加接收日志自动保存开关，未配置路径时给出状态提示。
-- 配置写入 `config.ini`，窗口重启后恢复分页、发送项和周期。
+相关代码：`xcom_lua/ui/window.lua`、`xcom_lua/ui/win32.lua`（补 SWP/HWND 常量）。
 
-相关代码：`xcom_lua/ui/send_panel.lua`、`xcom_lua/ui/imgui_bridge.lua`、`xcom_lua/ui/window.lua`、`xcom_lua/main.lua`。
+## 3. "bad callback" PANIC 崩溃排查与修复
 
-## 3. ImGui 迁移和桥接层重构
+症状：客户端启动后 6-18 秒 `PANIC: unprotected error in call to Lua API (bad callback)`，HEAD 版本同样复现（既有 bug，非当轮引入）。
 
-界面从原先分散的 Win32 控件逐步迁移到 Dear ImGui。项目桥接代码已从 `third_party` 移到项目目录：
+排查过程：二分法（禁 `_poll_errors`、禁 display timer）、全局 `jit.off()` 对照（215 秒稳定，确认 JIT 相关）、`jit.attach` trace-abort 探测（修复后 0 abort）。
 
-`xcom_lua/native/xcom_imgui/xcom_imgui_bridge.cpp`
+根因与修复：LuaJIT 禁止 FFI callback 从 JIT 编译代码重入；`jit.off(run_message_loop)` 只关了外层函数，回调链仍可能被追踪。修复为对所有 C→Lua 重入点显式禁用：`Window.dispatch`、`poll_display`、`poll_status`、`render_imgui`、`_send_imgui_multi` 及全部 luv timer 回调闭包 `jit.off(fn, true)`（递归子函数），回调引用保存到 `self._*_callback` 防 GC。
 
-Dear ImGui 本体仍作为外部依赖保留在 `third_party/xcom_imgui/imgui`，避免把项目代码和第三方代码混在一起。
+验证：200 秒长时运行零 PANIC。诊断中曾出现的"30 秒崩溃"经查为并发多进程日志互扰的误判。
 
-桥接层当前采用统一 UI 组件和表驱动描述：
+相关代码：`xcom_lua/ui/window.lua`（各 jit.off 标注点）。
 
-- `PanelScope`、`Section`、`Field`、`Toggle`、`PrimaryAction`、`EmptyState` 统一绘制和生命周期。
-- `Command<Action>` 将按钮动作映射为稳定的 C ABI 位掩码。
-- `StyleDecorator`/RAII 负责 ImGui style push/pop 配对。
-- `ActionObserver` 汇总 UI 动作，再交给 Lua 状态层处理。
-- `ComboSpec`、`ToggleSpec` 和 `std::array` 减少重复的控件分支。
-- `layout.toml` 集中管理侧栏宽度、间距、字体和区域高度。
+## 4. DX11 渲染后端与接收文本 ABI 下沉
 
-当前仍有一处桥接层本地修改未提交，提交前应继续编译并进行 Windows 截图复核。
+渲染后端从 OpenGL 迁移到 DX11，并把每帧 64 KiB 字符串的 FFI 传递下沉到 DLL 内部：
 
-## 4. Siemens 视觉风格和布局校正
+- `xcom_imgui_bridge.cpp` 改用 `imgui_impl_dx11`：`D3D11CreateDeviceAndSwapChain`（FLIP_DISCARD 双缓冲）、`create_render_target`/`cleanup_render_target`/`release_dx_resources`、`WM_SIZE` 时 `ResizeBuffers` 重建 RTV。
+- 新增 C ABI `xcom_imgui_set_receive_text(text, length)`：接收文本存 DLL 内 `receive_text_`，Lua 侧 `render_imgui` 仅在 dirty 时推送一次，`xcom_imgui_draw_console` 的 receive 参数传 `nil, 0`。
+- Lua 配套：`_append_imgui_receive`（分块追加，列表预修剪 ≤64 KiB）+ `_flush_imgui_receive`（单次 `table.concat`，返回 dirty 标志）。
+- 资源路径修复：`module_resource_path` 从 exe 目录改为 DLL 目录优先 + 父目录探测 + exe 回退，解决运行时包 `Could not load font file!` 断言崩溃（字体在 `<app>/assets/` 而 DLL 在 `<app>/runtime/`）。
+- 新增 `xcom.exe` 启动器（`native/launcher/`，CMake WIN32 target + 图标），Explorer 双击即可启动。
 
-针对截图中白边过多、字号过小、右栏过宽和控件堆叠的问题，进行了以下方向的调整：
+## 5. C++17 与 stdint 改进
 
-- 使用 Siemens Slab Roman/Bold 字体，正文约 16px，标题约 17px，并保留系统字体回退。
-- 使用 Siemens 蓝、深色标题栏、浅色内容区和青绿色状态强调色。
-- 侧栏宽度收窄到约 194px，减少右侧配置区占用。
-- 顶部标题栏贴齐窗口顶部，去除上、左、右的额外空白。
-- 将大号 `Refresh` 按钮改为串口 ComboBox 右侧的小型刷新按钮。
-- 规划 Open/Close 放在串口选择下一行，避免顶部控制栏过度拥挤。
-- 接收区、发送区和连接区按固定间距与列边界组织，空状态文本在接收区域内居中。
+按 `MEMORY.md` 提取的编码基准二次加固桥接层：
 
-视觉调整仍需在 920×650 和大窗口两种尺寸下实机截图验证，不能仅依赖 Linux 单元测试。
+- 样式表表驱动：28 行重复 `style.Colors[x] = rgb(...)` 收敛为 `constexpr std::array kStyleColors` + `apply_style()`。
+- `[[nodiscard]]`/`noexcept`：`create_render_target`；wndproc 里 best-effort 调用用 `(void)` 显式丢弃并注释。
+- `IM_ARRAYSIZE` → `std::size`；魔法数收敛为 `kReceiveFallbackHeight`/`kClearColor` constexpr。
+- stdint：`DWORD owner_thread_` → `std::uint32_t`、`DWORD length` → `std::uint32_t`（API 边界必须的 Win32 类型保留）。
+- 核心侧（会话早期）：log/display 池预算下调（`kFileBlockCount` 256→16、`kRxBlockCount` 1024→256、`kDisplayBatchCount` 256→64 等），`LogWriter` 改为惰性 `start`，降低启动常驻内存。
 
-## 5. C++17 结构化改造
+## 6. 热点函数性能优化
 
-根据 `MEMORY.md` 的工程约束，桥接层和核心代码统一遵循现代 C++17 风格：
+帧循环（16 ms）与显示轮询（10 ms）的四项优化：
 
-- 使用 `if constexpr`、`constexpr`、`inline constexpr` 和类型萃取把可判定逻辑前移到编译期。
-- 使用 `std::exchange`、`std::move`、`noexcept` 和 `[[nodiscard]]` 明确资源转移、异常边界和错误处理。
-- 使用 RAII 管理 Win32/OpenGL/ImGui 生命周期，减少失败路径泄漏。
-- 在 coact 核心保留 CRTP、策略模板、对象池、tagged-CAS、缓存行隔离和类型擦除等设计。
-- 在 ImGui 桥接层使用模板命令、装饰器、观察者、受控单例和表驱动布局；不把并发对象池强行引入单线程 UI。
+- 接收区渲染 O(64 KiB)→O(可视行)：`ImGuiListClipper` 裁剪 + `receive_line_offsets_` 行偏移缓存（`set_receive_text` 时一次 O(n) 扫描），并新增尾随自动滚动（贴底跟随、上滚脱离）。
+- `_flush_imgui_receive` 双拷贝→单分配：chunk 列表已预修剪，去掉二次 `..`/`:sub`；单 chunk 时零拷贝。
+- `controls.lua set_text` 等值短路：`ctl._last_text == text` 跳过 `SetWindowTextA`（已审计全部调用点均只读 status label，缓存安全）。
+- `poll_status` 变化检测：port_state / RX/TX / drops 三组统计值未变时跳过 `string.format` 分配。
 
-完整约束和模式速查见根目录 `MEMORY.md`。
+验证：90 秒实机零 PANIC，截图确认空状态文案、头部装饰线、侧栏渲染无回归。
 
-## 6. LuaJIT/libuv 运行时集成
+## 7. LuaJIT 高性能编码实践
 
-已编译并验证 `luv.dll` 与 `luvjit.exe`，客户端现在可以使用 libuv timer，同时保留 Win32 消息循环。启动脚本为：
+应用社区通行实践并用基准量化：
 
-`run_xcom_lua.cmd`
+- `core/ansi.lua`（接收热路径）逐字节 `buf:sub(i,i)`+`:byte()` → 单一 `string.byte(buf,i)`（消除每字节一次的 1 字节串分配）；CSI terminator 改返回字节码（`term == 109`），删除 `is_csi_terminator`；`parse_params`/`match_csi`/`feed` 内 `string.find/sub/match/tonumber` 全部局部化为 upvalue。
+- `jit.attach` trace-abort 探测确认当前代码 0 abort（NYI 已不是瓶颈），热路径实为解释执行——局部化在解释模式同样有效。
+- 基准（200 KB 混合 SGR × 20）：旧 11-12 ms → 新 9-11 ms（约 8-15% 提升）；30 条 ansi 断言全绿。
+- 结论：单线程 UI-bound 串口工具瓶颈在渲染与数据链路（前几轮已优化），继续微调收益边际递减，不再投入。
 
-启动器优先加载本地构建的 `build/native-release/bin/xcom_core.dll`，找不到时回退到 `xcom_lua/runtime/xcom_core.dll`。
+## 8. C4819 根治、集成测试与提交推送
 
-## 7. 生成物和仓库边界
+- `xcom_imgui/CMakeLists.txt` 补 `/utf-8`（xcom_core 已有、imgui 漏配）：UTF-8 注释字符在 CP936 环境触发 C4819，且尾部字节可能被误解析为续行反斜杠。修复后全量重建零警告。
+- `xcom_ffi.close()` 便捷封装；`find_dll` 优先探测运行时包 DLL 再回退 build 目录（无编译环境可用）。
+- 新增 Windows 集成测试 4 个：`integration_test.lua`（11 断言）、`send_help_test.lua`、`serial_integration_test.lua`（注入接收路径）、`serial_external_receive_test.lua`（真实串口外部收包），README 补充用法。
+- `.gitignore` 补根目录运行时垃圾（`xcom_diag.log`、`ui_current.png`）。
+- 全部工作已提交并推送 Gitee：`51505f1`（DX11+崩溃修复+性能）、`ac6bc2a`（发送失败反馈）、`0ee4377`（DLL 查找顺序）、`c0dbf23`（C4819+集成测试）、`5fb4dc0`（清理误提交截图）。
 
-`xcom_lua/runtime/` 是可选的 Windows 运行包，不是源码目录：
+## 当前边界与下一步
 
-| 文件 | 类型 | 来源 |
-| --- | --- | --- |
-| `xcom_core.dll` | 生成物 | 项目 `xcom_core` CMake target |
-| `xcom_imgui.dll` | 生成物 | `native/xcom_imgui` + Dear ImGui |
-| `luvjit.exe`、`luajit.exe`、`lua51.dll`、`luv.dll` | 下载/打包运行时 | LuaJIT + libuv |
-
-这六个文件合计约 7.5 MB。它们被单独提交是为了让没有编译环境的 Windows 用户可以直接启动；构建缓存、截图、日志、参考仓库和临时下载目录仍由 `.gitignore` 排除。来源和重建说明见 `xcom_lua/runtime/README.md`。
-
-## 8. 验证、提交和下一步
-
-已经完成的验证：
-
-- Lua 逻辑测试共 143 条断言通过（ANSI、配置、视图模型、FFI）。
-- `xcom_core.dll` v1.3 已编译，异步打开、session churn 和 smoke host 测试通过。
-- Windows 上已实际启动 LuaJIT 客户端并进入消息循环。
-- 运行包已推送到 Gitee，最近提交为 `a1503f3 Add optional Windows runtime bundle`。
-
-下一步应集中在同一条短链路上：
-
-1. 编译当前未提交的 ImGui 桥接改动。
-2. 在 920×650 和大窗口下检查标题栏、右栏宽度、刷新图标、Open/Close 和重绘。
-3. 截图确认字号、字体加载和 Siemens 蓝色对比度。
-4. 通过后再提交桥接层改动，并更新运行包中的 `xcom_imgui.dll`。
+- 已知未做（P2 锦上添花）：Settings 齿轮菜单、深色主题、状态栏时钟、Protocol/Help 占位 tab、WM_QUERYENDSESSION 优雅关闭。
+- 串口功能对齐度：核心能力 100%，错误反馈/关闭完整性已补齐，UI 完整度约 70%（缺设置菜单类）。
+- 本机无 COM 口环境，串口测试经 COM3 实测（`serial_integration_test` 状态码全 0）；无硬件的收发回归依赖注入路径。
