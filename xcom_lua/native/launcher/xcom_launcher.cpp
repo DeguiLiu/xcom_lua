@@ -30,7 +30,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     startup.wShowWindow = SW_HIDE;
     PROCESS_INFORMATION process{};
     if (!CreateProcessW(child.c_str(), command_buffer.data(), nullptr, nullptr,
-                        FALSE, 0U, nullptr, working_dir.c_str(), &startup,
+                        FALSE, CREATE_NO_WINDOW, nullptr, working_dir.c_str(), &startup,
                         &process)) {
         return static_cast<int>(GetLastError());
     }
