@@ -13,8 +13,10 @@
 #include <array>
 #include <cstdint>
 #include <cfloat>
+#include <cstring>
 
 #include "imgui.h"
+#include "imgui_internal.h"
 #include "imgui_impl_dx11.h"
 #include "imgui_impl_win32.h"
 
@@ -24,13 +26,13 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(
 namespace {
 struct LayoutConfig final {
     static constexpr size_t kFieldCount = 10U;
-    static constexpr float kSidebarWidth = 164.0f;
+    static constexpr float kSidebarWidth = 180.0f;
     static constexpr float kCompactThreshold = 760.0f;
     static constexpr float kReceiveHeight = 0.0f;
-    static constexpr float kSendHeight = 212.0f;
-    static constexpr float kHeaderHeight = 46.0f;
-    static constexpr float kPanelGap = 6.0f;
-    static constexpr float kWindowPadding = 8.0f;
+    static constexpr float kSendHeight = 180.0f;
+    static constexpr float kHeaderHeight = 36.0f;
+    static constexpr float kPanelGap = 0.0f;
+    static constexpr float kWindowPadding = 1.0f;
     static constexpr float kItemSpacing = 7.0f;
     static constexpr float kFramePaddingY = 4.0f;
     static constexpr float kSectionGap = 4.0f;
@@ -47,8 +49,9 @@ struct LayoutConfig final {
     float section_gap = kSectionGap;
 };
 static_assert(LayoutConfig::kSidebarWidth > 0.0f);
-static_assert(LayoutConfig::kSendHeight >= 140.0f);
-constexpr float kReceiveFallbackHeight = 228.0f;
+static_assert(LayoutConfig::kSendHeight >= 100.0f);
+constexpr float kFooterHeight = 22.0f;
+constexpr unsigned int kPanelBorder = 0x4B5A63;
 
 template <typename T>
 class Slice final {
@@ -96,8 +99,10 @@ public:
     bool initialized_ = false;
     bool frame_active_ = false;
     ImFont* heading_font_ = nullptr;
+    ImFont* mono_font_ = nullptr;
     LayoutConfig layout_{};
     std::string receive_text_{};
+    std::string status_text_{};
     // Byte offset of every line start in receive_text_ (offset 0 included);
     // rescanned by xcom_imgui_set_receive_text and consumed by the receive
     // clipper so per-frame rendering walks only visible lines.
@@ -123,6 +128,14 @@ enum class Action : std::uint32_t {
     ActionMinimizeWindow = 1 << 16,
     ActionMaximizeWindow = 1 << 17,
     ActionCloseWindow = 1 << 18,
+    ActionSendSlot0 = 1 << 19,
+    ActionSendSlot1 = 1 << 20,
+    ActionSendSlot2 = 1 << 21,
+    ActionSendSlot3 = 1 << 22,
+    ActionSendSlot4 = 1 << 23,
+    ActionSendSlot5 = 1 << 24,
+    ActionSendSlot6 = 1 << 25,
+    ActionSendSlot7 = 1 << 26,
 };
 
 constexpr int action_mask(const Action action) noexcept {
@@ -136,6 +149,10 @@ constexpr int& operator|=(int& value, const Action action) noexcept {
 
 static_assert(action_mask(Action::ActionOpen) == (1 << 0));
 static_assert(action_mask(Action::ActionCloseWindow) == (1 << 18));
+
+constexpr Action send_slot_action(const int index) noexcept {
+    return static_cast<Action>(1 << (19 + index));
+}
 
 template <Action ActionValue>
 struct Command final {
@@ -157,21 +174,21 @@ ImVec4 rgb(unsigned int value, float alpha = 1.0f) {
 // the dashboard; keep in sync with ui/window.lua's PAL and assets/layout.toml).
 namespace palette {
     constexpr unsigned int kHeaderDark = 0x1E1E1E;   // header strip / dark buttons
-    constexpr unsigned int kAccentTeal = 0x009999;   // primary brand accent
-    constexpr unsigned int kAccentHover = 0x00B3B3;  // primary button hover
-    constexpr unsigned int kAccentPress = 0x007F80;  // primary button press
+    constexpr unsigned int kAccentTeal = 0x0078B8;   // Siemens blue primary
+    constexpr unsigned int kAccentHover = 0x168DCA;  // primary button hover
+    constexpr unsigned int kAccentPress = 0x005A8A;  // primary button press
     constexpr unsigned int kHeaderChrome = 0x106EBE; // window button hover
     constexpr unsigned int kHeaderChromeDown = 0x005A9E; // window button press
     constexpr unsigned int kTextInverse = 0xFFFFFF;  // on-dark text / knob
-    constexpr unsigned int kTextHeading = 0x008080;  // section heading
+    constexpr unsigned int kTextHeading = 0x006A9B;  // section heading
     constexpr unsigned int kTextMuted = 0x5A6B7A;    // field labels / disabled
     constexpr unsigned int kTextBody = 0x1F2933;     // default text
     constexpr unsigned int kStatusOnline = 0x7AD8D8; // ONLINE badge
     constexpr unsigned int kStatusOffline = 0xFFD28A; // OFFLINE badge
     constexpr unsigned int kHeaderSubtitle = 0xCDEBFA; // header strapline
     constexpr unsigned int kToggleOff = 0xD5DCE3;    // toggle track (disabled)
-    constexpr unsigned int kSurfaceLight = 0xF7F9FB; // receive panel card
-    constexpr unsigned int kSurfaceDefault = 0xF4F7F9; // default child panel
+    constexpr unsigned int kSurfaceLight = 0xF1F5F8; // receive panel card
+    constexpr unsigned int kSurfaceDefault = 0xEDF3F7; // default child panel
 }
 
 namespace ui {
@@ -187,7 +204,7 @@ public:
     ~PanelScope() { ImGui::EndChild(); }
     PanelScope(const PanelScope&) = delete;
     PanelScope& operator=(const PanelScope&) = delete;
-    explicit operator bool() const { return visible_; }
+    [[nodiscard]] explicit operator bool() const noexcept { return visible_; }
 private:
     bool visible_;
 };
@@ -260,7 +277,7 @@ PanelScope Panel(const char* id, const ImVec2& size, bool border = true,
     return PanelScope(id, size, border, flags, background);
 }
 
-void Section(std::string_view title, std::string_view subtitle = {}, bool separator = true) {
+void Section(std::string_view title, std::string_view subtitle = {}, bool separator = false) {
     ScopedHeadingFont heading(ImGuiRuntime::instance().heading_font_);
     ImGui::TextColored(rgb(palette::kTextHeading), "%.*s", static_cast<int>(title.size()), title.data());
     if (subtitle.empty()) {
@@ -294,9 +311,64 @@ struct ComboSpec final {
     return ImGui::Combo(spec.id, spec.value, spec.items, spec.count);
 }
 
-bool Toggle(const char* label, int* value);
-bool PrimaryAction(const char* label, const ImVec2& size);
+[[nodiscard]] bool GridComboField(const ComboSpec& spec) {
+    ImGui::TableNextColumn();
+    // Keep labels on a common left edge; the value column supplies the
+    // scanning alignment and has 20 px more room in the sidebar.
+    ImGui::TextColored(rgb(palette::kTextMuted), "%s", spec.label);
+    ImGui::TableNextColumn();
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(4.0f, 3.0f));
+    ImGui::SetNextItemWidth(-1.0f);
+    const bool changed = ImGui::Combo(spec.id, spec.value, spec.items, spec.count);
+    ImGui::PopStyleVar();
+    return changed;
+}
+
+[[nodiscard]] bool Toggle(const char* label, int* value);
+[[nodiscard]] bool PrimaryAction(const char* label, const ImVec2& size);
+[[nodiscard]] bool DangerAction(const char* label, const ImVec2& size);
 void EmptyState(std::string_view title, std::string_view detail);
+
+enum class UtilityIcon : std::uint8_t { Clear, Save, Path, Refresh };
+
+[[nodiscard]] bool IconButton(const char* id, const UtilityIcon icon,
+                              const char* tooltip) {
+    // 28×26 was 24×22: larger hit area + heavier icon shapes (1.8 px stroke)
+    // match the 13-15 px text size of the surrounding controls, so the
+    // toolbar reads as one weight instead of "shrinking icons vs body text".
+    constexpr ImVec2 kSize(28.0f, 26.0f);
+    const bool pressed = ImGui::InvisibleButton(id, kSize);
+    const ImVec2 minimum = ImGui::GetItemRectMin();
+    const ImVec2 maximum = ImGui::GetItemRectMax();
+    ImDrawList* const draw_list = ImGui::GetWindowDrawList();
+    // kTextBody instead of kTextMuted: contrast ~8:1 vs 0xEDF3F7 panel bg,
+    // above the 3:1 threshold for non-text UI components.  kTextMuted gave
+    // a ghost-grey look on the light surface.
+    const ImU32 stroke = ImGui::GetColorU32(rgb(palette::kTextBody));
+    if (ImGui::IsItemHovered()) {
+        draw_list->AddRectFilled(minimum, maximum,
+                                 ImGui::GetColorU32(rgb(0xC9D7E0)), 3.0f);
+    }
+    const ImVec2 center((minimum.x + maximum.x) * 0.5f,
+                        (minimum.y + maximum.y) * 0.5f);
+    if (icon == UtilityIcon::Clear) {
+        draw_list->AddLine(ImVec2(center.x - 6.0f, center.y - 6.0f), ImVec2(center.x + 6.0f, center.y + 6.0f), stroke, 1.8f);
+        draw_list->AddLine(ImVec2(center.x + 6.0f, center.y - 6.0f), ImVec2(center.x - 6.0f, center.y + 6.0f), stroke, 1.8f);
+    } else if (icon == UtilityIcon::Save) {
+        draw_list->AddRect(ImVec2(center.x - 6.0f, center.y - 7.0f), ImVec2(center.x + 6.0f, center.y + 7.0f), stroke, 1.8f);
+        draw_list->AddLine(ImVec2(center.x - 4.0f, center.y - 4.0f), ImVec2(center.x + 4.0f, center.y - 4.0f), stroke, 1.8f);
+        draw_list->AddRectFilled(ImVec2(center.x - 4.0f, center.y + 1.0f), ImVec2(center.x + 4.0f, center.y + 5.0f), stroke);
+    } else if (icon == UtilityIcon::Path) {
+        draw_list->AddRect(ImVec2(center.x - 7.0f, center.y - 3.0f), ImVec2(center.x + 7.0f, center.y + 6.0f), stroke, 1.8f);
+        draw_list->AddLine(ImVec2(center.x - 6.0f, center.y - 3.0f), ImVec2(center.x - 1.0f, center.y - 7.0f), stroke, 1.8f);
+        draw_list->AddLine(ImVec2(center.x - 1.0f, center.y - 7.0f), ImVec2(center.x + 2.0f, center.y - 3.0f), stroke, 1.8f);
+    } else {
+        draw_list->AddCircle(center, 6.0f, stroke, 12, 1.8f);
+        draw_list->AddTriangleFilled(ImVec2(center.x + 7.0f, center.y - 6.0f), ImVec2(center.x + 7.0f, center.y + 1.0f), ImVec2(center.x + 2.0f, center.y - 2.0f), stroke);
+    }
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tooltip);
+    return pressed;
+}
 
 enum class WindowButtonKind : std::uint8_t { Minimize, Maximize, Close };
 
@@ -390,37 +462,32 @@ void Header(int& actions, const bool connected) {
 void ReceiveToolbar(int& actions, int rx_bytes, int tx_bytes, int* receive_hex,
                    int* timestamp, int* pause_display, int* auto_clear,
                    int* auto_clear_bytes, int* auto_save) {
-    ImGui::Separator();
-    if (ImGui::BeginTable("##receive_toolbar", 3, ImGuiTableFlags_SizingStretchProp)) {
-        ImGui::TableNextColumn();
-        if (Toggle("HEX", receive_hex)) actions |= Action::ActionSyncDisplay;
-        ImGui::SameLine(0.0f, 8.0f);
-        if (Toggle("Timestamp", timestamp)) actions |= Action::ActionSyncDisplay;
-        ImGui::TableNextColumn();
-        if (Toggle("Pause", pause_display)) actions |= Action::ActionSyncDisplay;
-        ImGui::SameLine(0.0f, 8.0f);
-        ImGui::TextDisabled("RX %d  /  TX %d", rx_bytes, tx_bytes);
-        ImGui::TableNextColumn();
-        actions |= Command<Action::ActionClear>::Execute([] { return ImGui::SmallButton("Clear"); });
-        ImGui::SameLine(0.0f, 8.0f);
-        actions |= Command<Action::ActionSaveLog>::Execute([] { return ImGui::SmallButton("Save log"); });
-        ImGui::TableNextRow();
-        ImGui::TableNextColumn();
-        ImGui::Dummy(ImVec2(0, 1));
-        ImGui::TableNextColumn();
-        if (Toggle("Auto clear", auto_clear)) actions |= Action::ActionSyncDisplay;
-        ImGui::SameLine(0.0f, 8.0f);
-        ImGui::SetNextItemWidth(64.0f);
-        if (ImGui::InputInt("##clear_bytes", auto_clear_bytes, 0, 0)) actions |= Action::ActionSyncDisplay;
-        ImGui::SameLine(0.0f, 6.0f);
-        ImGui::TextDisabled("bytes");
-        ImGui::TableNextColumn();
-        if (Toggle("Auto save", auto_save)) actions |= Action::ActionSyncAutoSave;
-        ImGui::SameLine(0.0f, 8.0f);
-        actions |= Command<Action::ActionChooseLogPath>::Execute(
-            [] { return ImGui::SmallButton("Log path..."); });
-        ImGui::EndTable();
-    }
+    (void)rx_bytes;
+    (void)tx_bytes;
+    // Row 1: receive-view switches + live counter, side by side above the log.
+    if (Toggle("HEX", receive_hex)) actions |= Action::ActionSyncDisplay;
+    ImGui::SameLine();
+    if (Toggle("Time", timestamp)) actions |= Action::ActionSyncDisplay;
+    ImGui::SameLine();
+    if (Toggle("Hold", pause_display)) actions |= Action::ActionSyncDisplay;
+    // Row 2: secondary auto-* controls + log actions on their own line so the
+    // strip never wraps into the tail view.
+    ImGui::NewLine();
+    if (Toggle("Clear", auto_clear)) actions |= Action::ActionSyncDisplay;
+    ImGui::SameLine(0.0f, 6.0f);
+    ImGui::SetNextItemWidth(60.0f);
+    if (ImGui::InputInt("##clear_bytes", auto_clear_bytes, 0, 0)) actions |= Action::ActionSyncDisplay;
+    ImGui::SameLine(0.0f, 16.0f);
+    if (Toggle("Save", auto_save)) actions |= Action::ActionSyncAutoSave;
+    ImGui::SameLine(0.0f, 8.0f);
+    actions |= Command<Action::ActionChooseLogPath>::Execute(
+        [] { return IconButton("##choose_log_path", UtilityIcon::Path, "Choose log path"); });
+    ImGui::SameLine(0.0f, 8.0f);
+    actions |= Command<Action::ActionSaveLog>::Execute(
+        [] { return IconButton("##save_log", UtilityIcon::Save, "Save receive log"); });
+    ImGui::SameLine(0.0f, 8.0f);
+    actions |= Command<Action::ActionClear>::Execute(
+        [] { return IconButton("##clear_log", UtilityIcon::Clear, "Clear receive log"); });
 }
 
 struct ToggleSpec final {
@@ -438,46 +505,120 @@ void RenderToggles(int& actions, const std::array<ToggleSpec, Count>& specs) {
     }
 }
 
-int ReceiveContent(int rx_bytes, int tx_bytes, int* receive_hex, int* timestamp,
+void TextContextMenu(const char* popup_id, char* buffer, const size_t capacity) {
+    const ImGuiID item_id = ImGui::GetItemID();
+    if (ImGui::IsItemHovered() && ImGui::IsMouseClicked(ImGuiMouseButton_Right))
+        ImGui::OpenPopup(popup_id);
+    if (!ImGui::BeginPopup(popup_id)) return;
+    ImGuiInputTextState* const state = ImGui::GetInputTextState(item_id);
+    const bool has_selection = state != nullptr && state->HasSelection();
+    if (ImGui::MenuItem("Select all")) {
+        if (state != nullptr) state->SelectAll();
+    }
+    if (ImGui::MenuItem("Copy", nullptr, false, buffer != nullptr && buffer[0] != '\0')) {
+        int begin = 0;
+        int end = static_cast<int>(strlen(buffer));
+        if (has_selection) {
+            begin = state->GetSelectionStart();
+            end = state->GetSelectionEnd();
+        }
+        if (end > begin) {
+            std::string selected(buffer + begin, static_cast<size_t>(end - begin));
+            ImGui::SetClipboardText(selected.c_str());
+        }
+    }
+    if (ImGui::MenuItem("Paste", nullptr, false, ImGui::GetClipboardText() != nullptr)) {
+        const char* const clip = ImGui::GetClipboardText();
+        if (clip != nullptr && buffer != nullptr && capacity > 0U) {
+            const size_t length = (std::min)(strlen(clip), capacity - 1U);
+            memcpy(buffer, clip, length);
+            buffer[length] = '\0';
+            if (state != nullptr) state->ReloadUserBufAndMoveToEnd();
+        }
+    }
+    ImGui::EndPopup();
+}
+
+[[nodiscard]] int ReceiveContent(int rx_bytes, int tx_bytes, int* receive_hex, int* timestamp,
                    int* pause_display, int* auto_clear, int* auto_clear_bytes,
                    int* auto_save) {
     int actions = 0;
-    ReceiveToolbar(actions, rx_bytes, tx_bytes, receive_hex, timestamp, pause_display,
-                   auto_clear, auto_clear_bytes, auto_save);
-    const auto& layout = ImGuiRuntime::instance().layout_;
-    const auto receive = Panel("##receive", ImVec2(0, layout.receive_height == 0.0f ? -kReceiveFallbackHeight : layout.receive_height), true,
-                               ImGuiWindowFlags_HorizontalScrollbar, rgb(palette::kSurfaceLight));
-    const std::string& receive_text = ImGuiRuntime::instance().receive_text_;
-    if (receive_text.empty()) {
-        EmptyState("WAITING FOR SERIAL DATA", "Select a port, then open the connection to begin monitoring.");
+    auto& runtime = ImGuiRuntime::instance();
+    const auto& layout = runtime.layout_;
+    // The receive panel reserves only the transmit workspace below it.
+    constexpr float kTransmitSectionReserve = 0.0f;
+    const float transmit_block = layout.send_height + kTransmitSectionReserve;
+    ImGui::PushStyleColor(ImGuiCol_Border, rgb(kPanelBorder, 0.78f));
+    const auto receive = Panel("##receive",
+                               ImVec2(0, layout.receive_height == 0.0f ? -transmit_block : layout.receive_height),
+                               true, ImGuiWindowFlags_HorizontalScrollbar,
+                               rgb(palette::kSurfaceLight));
+    ImGui::PopStyleColor();
+    if (runtime.receive_text_.empty()) {
+        EmptyState("WAITING FOR SERIAL DATA", {});
         return actions;
     }
-    // Clipper path: only visible lines are measured and tessellated, so the
-    // per-frame cost is O(viewport) instead of O(whole 64 KiB buffer) —
-    // the dominant hot spot at high receive rates.  Line offsets are cached
-    // in the runtime and rescanned only when the buffer changes.
-    auto& runtime = ImGuiRuntime::instance();
-    const std::vector<std::size_t>& line_offsets = runtime.receive_line_offsets_;
+    // Streaming receive log: render one logical line at a time via
+    // ImGuiListClipper so the per-frame cost is O(viewport), NOT a reflow of
+    // the whole 64 KiB buffer.  Using ImGui::InputTextMultiline here caused
+    // two problems with a live tail appended every 10-12 ms:
+    //   (1) it re-lays-out *all* lines on each set_receive_text, so lines
+    //       overlapped / tore as the buffer grew; and
+    //   (2) its internal cursor/scroll tracking fought the auto-follow.
+    // A plain TextUnformatted per line keeps row height constant at one glyph
+    // and makes the log rock-solid while data streams.  Copy is exposed through
+    // the right-click "Copy all" (a read-only InputText selection is not worth
+    // re-introducing the reflow bug for).
+    const std::vector<std::size_t>& offsets = runtime.receive_line_offsets_;
+    // Sticky auto-follow: only re-pin while the user is (~1 line) from the
+    // bottom; an upward drag beyond that detaches so the viewer can inspect.
+    constexpr float kFollowTolerance = 20.0f;
+    const bool was_at_bottom =
+        ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - kFollowTolerance;
+    // Render the log glyphs with the fixed-width data face when available so
+    // hex bytes and RX counters line up column-wise (typical serial-monitor
+    // look).  Consistent per-line row height also keeps the clipper's line
+    // metric stable regardless of glyph width.
+    const bool mono_ok = runtime.mono_font_ != nullptr;
+    if (mono_ok) ImGui::PushFont(runtime.mono_font_);
+    const auto pop_mono = ScopedAction([mono_ok] {
+        if (mono_ok) ImGui::PopFont();
+    });
     ImGuiListClipper clipper;
-    clipper.Begin(static_cast<int>(line_offsets.size()));
+    clipper.Begin(static_cast<int>(offsets.size()));
     while (clipper.Step()) {
-        for (int line_index = clipper.DisplayStart; line_index < clipper.DisplayEnd; ++line_index) {
-            const char* line_begin = receive_text.data() + line_offsets[static_cast<std::size_t>(line_index)];
-            const char* line_end = line_index + 1 < static_cast<int>(line_offsets.size())
-                ? receive_text.data() + line_offsets[static_cast<std::size_t>(line_index) + 1]
-                : receive_text.data() + receive_text.size();
-            ImGui::TextUnformatted(line_begin, line_end);
+        for (int ln = clipper.DisplayStart; ln < clipper.DisplayEnd; ++ln) {
+            const auto line = static_cast<std::size_t>(ln);
+            const char* const begin = runtime.receive_text_.data() + offsets[line];
+            const char* const end = line + 1U < offsets.size()
+                ? runtime.receive_text_.data() + offsets[line + 1U]
+                : runtime.receive_text_.data() + runtime.receive_text_.size();
+            ImGui::TextUnformatted(begin, end);
         }
     }
-    // Auto-follow: keep the view pinned to the newest data while the user
-    // stays at (or near) the bottom; a deliberate upward scroll detaches.
-    if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 1.0f) {
+    if (was_at_bottom) {
         ImGui::SetScrollY(ImGui::GetScrollMaxY());
+    }
+    // Right-click context menu: the read-only multiline editor doesn't expose
+    // one by default, so attach one explicitly.  The popup id is scoped to
+    // the receive panel so other panels' right-clicks are unaffected.
+    if (ImGui::IsItemHovered() && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+        ImGui::OpenPopup("##receive_context");
+    }
+    if (ImGui::BeginPopup("##receive_context")) {
+        if (ImGui::MenuItem("Copy all", nullptr, false, !runtime.receive_text_.empty())) {
+            ImGui::SetClipboardText(runtime.receive_text_.c_str());
+        }
+        ImGui::Separator();
+        if (ImGui::MenuItem("Clear log", nullptr, false, !runtime.receive_text_.empty())) {
+            actions |= Action::ActionClear;
+        }
+        ImGui::EndPopup();
     }
     return actions;
 }
 
-int TransmitContent(int* send_hex, int* send_crlf, int* send_auto, int* send_period,
+[[nodiscard]] int TransmitContent(int* send_hex, int* send_crlf, int* send_auto, int* send_period,
                     char* send_text, size_t send_capacity, char* multi_text,
                     size_t multi_slot_capacity, int* multi_enabled, int* multi_hex,
                     int* multi_crlf, int* multi_page, int* multi_page_count,
@@ -485,14 +626,24 @@ int TransmitContent(int* send_hex, int* send_crlf, int* send_auto, int* send_per
     int actions = 0;
     if (ImGui::BeginTabBar("##transmit_tabs")) {
         if (ImGui::BeginTabItem("Single")) {
+            ImGui::SetCursorPosX(0.0f);
+            // Let the editor consume the available panel height so the
+            // transmit workspace does not end in a large unused band.
+            const float editor_height = (std::max)(76.0f,
+                ImGui::GetContentRegionAvail().y - 30.0f);
             ImGui::SetNextItemWidth(-110.0f);
-            if (ImGui::InputTextMultiline("##send", send_text, send_capacity, ImVec2(-110.0f, 76.0f), ImGuiInputTextFlags_EnterReturnsTrue)) actions |= Action::ActionSend;
+            if (ImGui::InputTextMultiline("##send", send_text, send_capacity,
+                                          ImVec2(-110.0f, editor_height),
+                                          ImGuiInputTextFlags_EnterReturnsTrue)) actions |= Action::ActionSend;
+            TextContextMenu("##send_context", send_text, send_capacity);
             ImGui::SameLine();
-            actions |= Command<Action::ActionSend>::Execute([] { return PrimaryAction("Send", ImVec2(96, 76)); });
+            ImGui::SetCursorPosY(ImGui::GetCursorPosY() + (editor_height - 36.0f) * 0.5f);
+            actions |= Command<Action::ActionSend>::Execute(
+                [] { return PrimaryAction("Send", ImVec2(96, 36)); });
             const std::array<ToggleSpec, 3> options{{
-                {"HEX send", send_hex, Action::ActionSyncSettings},
-                {"Send newline", send_crlf, Action::ActionSyncSettings},
-                {"Auto send", send_auto, Action::ActionSyncSettings},
+                {"HEX", send_hex, Action::ActionSyncSettings},
+                {"NEWLINE", send_crlf, Action::ActionSyncSettings},
+                {"AUTO", send_auto, Action::ActionSyncSettings},
             }};
             RenderToggles(actions, options);
             ImGui::SameLine();
@@ -503,40 +654,78 @@ int TransmitContent(int* send_hex, int* send_crlf, int* send_auto, int* send_per
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem("Multi")) {
-            for (int index = 0; index < 8; ++index) {
-                char label[16];
-                char enabled_label[20];
-                sprintf_s(label, "##multi%d", index);
-                sprintf_s(enabled_label, "##enabled%d", index);
-                if (Toggle(enabled_label, &multi_enabled[index])) actions |= Action::ActionSyncSettings;
-                ImGui::SameLine();
-                ImGui::SetNextItemWidth(-1.0f);
-                if (ImGui::InputText(label, multi_text + index * multi_slot_capacity, multi_slot_capacity)) actions |= Action::ActionSyncSettings;
+            // Two-column grid keeps all eight slots visible in the compact
+            // 920x650 layout while retaining the enable/index/content anchors.
+            if (ImGui::BeginTable("##multi_grid", 2, ImGuiTableFlags_SizingStretchProp)) {
+                ImGui::TableSetupColumn("left", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+                ImGui::TableSetupColumn("right", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+                for (int row = 0; row < 4; ++row) {
+                    ImGui::TableNextRow();
+                    for (int column = 0; column < 2; ++column) {
+                        const int index = row + column * 4;
+                        char label[16];
+                        char enabled_label[20];
+                        sprintf_s(label, "##multi%d", index);
+                        sprintf_s(enabled_label, "##enabled%d", index);
+                        ImGui::TableNextColumn();
+                        ImGui::PushID(index);
+                        if (Toggle(enabled_label, &multi_enabled[index])) actions |= Action::ActionSyncSettings;
+                        ImGui::SameLine(0.0f, 4.0f);
+                        ImGui::TextDisabled("%d", index + 1);
+                        ImGui::SameLine(0.0f, 6.0f);
+                        // Reserve room for the enable marker, index and the
+                        // numeric Send N button.  The button width is calibrated
+                        // for a single glyph so the InputText gets the rest.
+                        ImGui::SetNextItemWidth(-44.0f);
+                        if (ImGui::InputText(label, multi_text + index * multi_slot_capacity, multi_slot_capacity)) actions |= Action::ActionSyncSettings;
+                        TextContextMenu("##multi_context", multi_text + index * multi_slot_capacity, multi_slot_capacity);
+                        ImGui::SameLine(0.0f, 4.0f);
+                        char send_label[12];
+                        // Short numeric labels keep the row tight; tooltip
+                        // preserves the slot identity.  Plain "N" avoids the
+                        // "Send >" misread caused by ">" being clipped.
+                        sprintf_s(send_label, "%d", index + 1);
+                        if (ImGui::Button(send_label, ImVec2(32.0f, 0.0f))) {
+                            actions |= send_slot_action(index);
+                        }
+                        if (ImGui::IsItemHovered()) {
+                            ImGui::SetTooltip("Send slot %d", index + 1);
+                        }
+                        ImGui::PopID();
+                    }
+                }
+                ImGui::EndTable();
             }
+            ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(3.0f, 2.0f));
             const std::array<ToggleSpec, 2> options{{
-                {"HEX multi", multi_hex, Action::ActionSyncSettings},
-                {"Newline multi", multi_crlf, Action::ActionSyncSettings},
+                {"HEX", multi_hex, Action::ActionSyncSettings},
+                {"NL", multi_crlf, Action::ActionSyncSettings},
             }};
             RenderToggles(actions, options);
             ImGui::SameLine();
-            actions |= Command<Action::ActionSendEnabled>::Execute([] { return ImGui::Button("Send enabled"); });
-            ImGui::SameLine();
+            actions |= Command<Action::ActionSendEnabled>::Execute([] { return ImGui::Button("Send"); });
+            // Keep paging and auto-cycle on the same compact utility row as
+            // the send controls to avoid a stranded second line.
+            ImGui::SameLine(0.0f, 10.0f);
             actions |= Command<Action::ActionPreviousPage>::Execute([] { return ImGui::Button("<"); });
             ImGui::SameLine();
-            ImGui::Text("Page %d / %d", *multi_page + 1, *multi_page_count);
+            ImGui::AlignTextToFramePadding();
+            ImGui::Text("%d/%d", *multi_page + 1, *multi_page_count);
             ImGui::SameLine();
             actions |= Command<Action::ActionNextPage>::Execute([] { return ImGui::Button(">"); });
             ImGui::SameLine();
-            actions |= Command<Action::ActionAddPage>::Execute([] { return ImGui::SmallButton("+ page"); });
+            actions |= Command<Action::ActionAddPage>::Execute([] { return ImGui::SmallButton("+"); });
             ImGui::SameLine();
-            actions |= Command<Action::ActionRemovePage>::Execute([] { return ImGui::SmallButton("- page"); });
-            const std::array<ToggleSpec, 1> cycle{{{"Auto cycle", multi_auto, Action::ActionSyncMultiAuto}}};
+            actions |= Command<Action::ActionRemovePage>::Execute([] { return ImGui::SmallButton("-"); });
+            ImGui::SameLine(0.0f, 6.0f);
+            const std::array<ToggleSpec, 1> cycle{{{"Loop", multi_auto, Action::ActionSyncMultiAuto}}};
             RenderToggles(actions, cycle);
             ImGui::SameLine();
             ImGui::SetNextItemWidth(80.0f);
             if (ImGui::InputInt("##multi_period", multi_period, 0, 0)) actions |= Action::ActionSyncMultiAuto;
             ImGui::SameLine();
             ImGui::TextDisabled("ms");
+            ImGui::PopStyleVar();
             ImGui::EndTabItem();
         }
         ImGui::EndTabBar();
@@ -544,18 +733,25 @@ int TransmitContent(int* send_hex, int* send_crlf, int* send_auto, int* send_per
     return actions;
 }
 
-int ConnectionContent(char* port, size_t port_capacity, bool connected,
+[[nodiscard]] int ConnectionContent(char* port, size_t port_capacity, bool connected,
                       int* baud, int* data_bits, int* stop_bits, int* parity,
                       int* flow, int* dtr, int* rts,
-                      const std::array<ComboSpec, 5>& serial_fields) {
+                      const std::array<ComboSpec, 5>& serial_fields,
+                      int rx_bytes, int tx_bytes, int* receive_hex, int* timestamp,
+                      int* pause_display, int* auto_clear, int* auto_clear_bytes,
+                      int* auto_save) {
     int actions = 0;
-    Section("CONNECTION", connected ? "Port is active" : "Choose a port to begin");
-    Field("PORT NAME");
-    ImGui::SetNextItemWidth(-1.0f);
-    if (ImGui::InputText("##port", port, port_capacity)) actions |= Action::ActionSyncSettings;
-    Field("AVAILABLE PORTS");
-    ImGui::SetNextItemWidth(-30.0f);
-    if (ImGui::BeginCombo("##available_ports", port[0] ? port : "Select a port")) {
+    const auto& runtime = ImGuiRuntime::instance();
+    const std::string_view status = runtime.status_text_.empty()
+        ? std::string_view(connected ? "Port is active" : "Select a port")
+        : std::string_view(runtime.status_text_);
+    Section("CONNECTION", status);
+    // Single "port combo" row: drop the separate editable PORT text field and
+    // an obvious AVAILABLE label.  The combo both shows the persisted/current
+    // port and picks one from the enumerated list; Refresh sits beside it.
+    Field("PORT");
+    ImGui::SetNextItemWidth(-34.0f);
+    if (ImGui::BeginCombo("##port_combo", port[0] ? port : "Select a port")) {
         const auto& port_list = ImGuiRuntime::instance().ports_;
         const Slice<std::string> ports(port_list.data(), port_list.size());
         for (const std::string& candidate : ports) {
@@ -570,24 +766,36 @@ int ConnectionContent(char* port, size_t port_capacity, bool connected,
     }
     ImGui::SameLine(0.0f, 6.0f);
     actions |= Command<Action::ActionRefreshPorts>::Execute(
-        [] { return ImGui::SmallButton("R"); });
+        [] { return IconButton("##refresh_ports", UtilityIcon::Refresh, "Refresh ports"); });
     ImGui::Separator();
     if (!connected) actions |= Command<Action::ActionOpen>::Execute(
         [] { return PrimaryAction("Open", ImVec2(-1, 0)); });
     if (connected) actions |= Command<Action::ActionClose>::Execute(
-        [] { return PrimaryAction("Close", ImVec2(-1, 0)); });
+        [] { return DangerAction("Close", ImVec2(-1, 0)); });
     ImGui::Spacing();
     Section("SERIAL PROFILE");
-    for (const ComboSpec& field : serial_fields) {
-        if (ComboField(field)) actions |= Action::ActionSyncSettings;
+    if (ImGui::BeginTable("##serial_grid", 2, ImGuiTableFlags_SizingStretchProp)) {
+        // Label column at 78 px: 6-char labels like PARITY/FLOW fit at 12 px
+        // with 6 px padding; narrower (60 px) truncated them to BAU/DAT/STO.
+        ImGui::TableSetupColumn("label", ImGuiTableColumnFlags_WidthFixed, 48.0f);
+        ImGui::TableSetupColumn("value", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+        for (const ComboSpec& field : serial_fields) {
+            ImGui::TableNextRow();
+            if (GridComboField(field)) actions |= Action::ActionSyncSettings;
+        }
+        ImGui::EndTable();
     }
     const std::array<ToggleSpec, 2> modem_options{{{"DTR", dtr, Action::ActionSyncSettings}, {"RTS", rts, Action::ActionSyncSettings}}};
     RenderToggles(actions, modem_options);
+    ImGui::Spacing();
+    Section("DISPLAY");
+    ReceiveToolbar(actions, rx_bytes, tx_bytes, receive_hex, timestamp, pause_display,
+                   auto_clear, auto_clear_bytes, auto_save);
     return actions;
 }
 
-bool Toggle(const char* label, int* value) {
-    const ImVec2 size(34.0f, 18.0f);
+[[nodiscard]] bool Toggle(const char* label, int* value) {
+    const ImVec2 size(26.0f, 24.0f);
     const bool changed = ImGui::InvisibleButton(label, size);
     if (changed) *value = *value == 0 ? 1 : 0;
     const bool enabled = *value != 0;
@@ -607,7 +815,7 @@ bool Toggle(const char* label, int* value) {
     return changed;
 }
 
-bool PrimaryAction(const char* label, const ImVec2& size = ImVec2(0, 0)) {
+[[nodiscard]] bool PrimaryAction(const char* label, const ImVec2& size = ImVec2(0, 0)) {
     ImGui::PushStyleColor(ImGuiCol_Button, rgb(palette::kAccentTeal));
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, rgb(palette::kAccentHover));
     ImGui::PushStyleColor(ImGuiCol_ButtonActive, rgb(palette::kAccentPress));
@@ -618,15 +826,76 @@ bool PrimaryAction(const char* label, const ImVec2& size = ImVec2(0, 0)) {
     return clicked;
 }
 
+[[nodiscard]] bool DangerAction(const char* label, const ImVec2& size = ImVec2(0, 0)) {
+    ImGui::PushStyleColor(ImGuiCol_Button, rgb(0xC0392B));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, rgb(0xD9534F));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, rgb(0x962D22));
+    const bool clicked = WithRounding(3.0f, [](const char* text, const ImVec2& button_size) {
+        return ImGui::Button(text, button_size);
+    })(label, size);
+    ImGui::PopStyleColor(3);
+    return clicked;
+}
+
 void EmptyState(std::string_view title, std::string_view detail) {
     const ImVec2 available = ImGui::GetContentRegionAvail();
     const float title_width = ImGui::CalcTextSize(title.data(), title.data() + title.size()).x;
-    const float detail_width = ImGui::CalcTextSize(detail.data(), detail.data() + detail.size()).x;
-    const float start_y = ImGui::GetCursorPosY() + (available.y - 42.0f) * 0.34f;
-    ImGui::SetCursorPos(ImVec2((ImGui::GetWindowWidth() - title_width) * 0.5f, start_y));
-    ImGui::TextDisabled("%.*s", static_cast<int>(title.size()), title.data());
-    ImGui::SetCursorPosX((ImGui::GetWindowWidth() - detail_width) * 0.5f);
-    ImGui::TextDisabled("%.*s", static_cast<int>(detail.size()), detail.data());
+    const float start_y = ImGui::GetCursorPosY() + (available.y - 42.0f) * 0.5f;
+    ImGui::SetCursorPos(ImVec2(12.0f, start_y));
+    ImGui::TextDisabled("> %.*s", static_cast<int>(title.size()), title.data());
+    if (!detail.empty()) {
+        ImGui::SetCursorPosX(24.0f);
+        ImGui::TextDisabled("%.*s", static_cast<int>(detail.size()), detail.data());
+    }
+}
+
+void Footer(const bool connected, const int rx_bytes, const int tx_bytes) {
+    auto& runtime = ImGuiRuntime::instance();
+    const auto footer = Panel("##status_footer", ImVec2(0, kFooterHeight), false,
+                              ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse,
+                              rgb(0xDCE7EE));
+    if (!footer) return;
+    ImDrawList* const draw_list = ImGui::GetWindowDrawList();
+    const ImVec2 origin = ImGui::GetWindowPos();
+    const float footer_width = ImGui::GetWindowWidth();
+    const float content_boundary = (std::max)(180.0f,
+        footer_width - runtime.layout_.sidebar_width);
+    const float baseline = origin.y + (kFooterHeight - ImGui::GetFontSize()) * 0.5f;
+    const ImU32 border = ImGui::GetColorU32(rgb(kPanelBorder, 0.9f));
+    const ImU32 divider = ImGui::GetColorU32(rgb(0xAFC1CC, 0.9f));
+    draw_list->AddRectFilled(ImVec2(origin.x, origin.y),
+                             ImVec2(origin.x + footer_width, origin.y + kFooterHeight),
+                             ImGui::GetColorU32(rgb(0xD6E3EA)));
+    draw_list->AddLine(ImVec2(origin.x, origin.y + 0.5f),
+                       ImVec2(origin.x + footer_width, origin.y + 0.5f), border, 1.5f);
+    const std::string_view state_label = connected ? "ONLINE" : "OFFLINE";
+    const ImU32 state_color = ImGui::GetColorU32(
+        connected ? rgb(palette::kAccentTeal) : rgb(palette::kTextMuted));
+    const float state_width = ImGui::CalcTextSize(state_label.data(),
+                                                   state_label.data() + state_label.size()).x;
+    const ImVec2 state_min(origin.x + 10.0f, origin.y + 3.0f);
+    const ImVec2 state_max(state_min.x + state_width + 12.0f, origin.y + kFooterHeight - 3.0f);
+    draw_list->AddRectFilled(state_min, state_max,
+                             ImGui::GetColorU32(connected ? rgb(0xC6ECE8) : rgb(0xE9E0CF)), 3.0f);
+    draw_list->AddText(ImVec2(state_min.x + 6.0f, baseline), state_color,
+                       state_label.data(), state_label.data() + state_label.size());
+    char counters[48]{};
+    if (connected) sprintf_s(counters, "RX %d   TX %d", rx_bytes, tx_bytes);
+    else strcpy_s(counters, "RX --   TX --");
+    const float counters_width = ImGui::CalcTextSize(counters).x;
+    const float counter_x = (std::max)(content_boundary - counters_width - 18.0f,
+                                       (state_max.x - origin.x) + 24.0f);
+    draw_list->AddText(ImVec2(origin.x + counter_x, baseline),
+                       ImGui::GetColorU32(rgb(palette::kTextMuted)), counters);
+    const std::string_view hint = connected ? "Ready" : "Open a port";
+    const float hint_width = ImGui::CalcTextSize(hint.data(), hint.data() + hint.size()).x;
+    draw_list->AddText(ImVec2(origin.x + (std::max)(footer_width - hint_width - 14.0f,
+                                                     content_boundary + 8.0f), baseline),
+                       ImGui::GetColorU32(rgb(palette::kTextMuted)), hint.data(),
+                       hint.data() + hint.size());
+    draw_list->AddLine(ImVec2(origin.x + content_boundary, origin.y + 4.0f),
+                       ImVec2(origin.x + content_boundary, origin.y + kFooterHeight - 4.0f),
+                       divider, 1.0f);
 }
 }
 
@@ -702,10 +971,10 @@ struct LayoutEntry final {
     float LayoutConfig::* member;
 };
 constexpr std::array kLayoutEntries{
-    LayoutEntry{"sidebar_width",    160.0f, 320.0f, &LayoutConfig::sidebar_width},
+    LayoutEntry{"sidebar_width",    150.0f, 320.0f, &LayoutConfig::sidebar_width},
     LayoutEntry{"compact_threshold", 600.0f, 1200.0f, &LayoutConfig::compact_threshold},
     LayoutEntry{"receive_height",     0.0f, 600.0f, &LayoutConfig::receive_height},
-    LayoutEntry{"send_height",      140.0f, 360.0f, &LayoutConfig::send_height},
+    LayoutEntry{"send_height",      100.0f, 360.0f, &LayoutConfig::send_height},
     LayoutEntry{"header_height",     40.0f,  72.0f, &LayoutConfig::header_height},
     LayoutEntry{"panel_gap",          2.0f,  24.0f, &LayoutConfig::panel_gap},
     LayoutEntry{"window_padding",     4.0f,  24.0f, &LayoutConfig::window_padding},
@@ -814,6 +1083,7 @@ void shutdown_impl() {
     runtime.initialized_ = false;
     runtime.frame_active_ = false;
     runtime.heading_font_ = nullptr;
+    runtime.mono_font_ = nullptr;
     runtime.receive_text_.clear();
 }
 }
@@ -828,12 +1098,12 @@ struct StyleColorEntry final {
     float alpha;
 };
 constexpr std::array kStyleColors{
-    StyleColorEntry{ImGuiCol_Text, 0x1F2933, 1.0f},
+    StyleColorEntry{ImGuiCol_Text, 0x243746, 1.0f},
     StyleColorEntry{ImGuiCol_TextDisabled, 0x5A6B7A, 1.0f},
-    StyleColorEntry{ImGuiCol_WindowBg, 0xE8EEF2, 1.0f},
-    StyleColorEntry{ImGuiCol_ChildBg, 0xF4F7F9, 1.0f},
+    StyleColorEntry{ImGuiCol_WindowBg, 0xE6EDF2, 1.0f},
+    StyleColorEntry{ImGuiCol_ChildBg, 0xEDF3F7, 1.0f},
     StyleColorEntry{ImGuiCol_PopupBg, 0xFFFFFF, 1.0f},
-    StyleColorEntry{ImGuiCol_Border, 0x8FAFC4, 0.38f},
+    StyleColorEntry{ImGuiCol_Border, 0xAAB7BF, 0.9f},
     StyleColorEntry{ImGuiCol_BorderShadow, 0xFFFFFF, 0.0f},
     StyleColorEntry{ImGuiCol_FrameBg, 0xFFFFFF, 1.0f},
     StyleColorEntry{ImGuiCol_FrameBgHovered, 0xE8F3F8, 1.0f},
@@ -844,17 +1114,17 @@ constexpr std::array kStyleColors{
     StyleColorEntry{ImGuiCol_Header, 0xE3F0FB, 1.0f},
     StyleColorEntry{ImGuiCol_HeaderHovered, 0xD4E7F7, 1.0f},
     StyleColorEntry{ImGuiCol_HeaderActive, 0xD4E7F7, 1.0f},
-    StyleColorEntry{ImGuiCol_CheckMark, 0x009999, 1.0f},
+    StyleColorEntry{ImGuiCol_CheckMark, 0x0078B8, 1.0f},
     StyleColorEntry{ImGuiCol_SliderGrab, 0x0078D7, 1.0f},
     StyleColorEntry{ImGuiCol_SliderGrabActive, 0x005A9E, 1.0f},
     StyleColorEntry{ImGuiCol_Tab, 0xEEF1F4, 1.0f},
     StyleColorEntry{ImGuiCol_TabHovered, 0xE3F0FB, 1.0f},
-    StyleColorEntry{ImGuiCol_TabActive, 0x009999, 1.0f},
+    StyleColorEntry{ImGuiCol_TabActive, 0x0078B8, 1.0f},
     StyleColorEntry{ImGuiCol_TabUnfocused, 0xEEF1F4, 1.0f},
-    StyleColorEntry{ImGuiCol_TabUnfocusedActive, 0x009999, 1.0f},
-    StyleColorEntry{ImGuiCol_ScrollbarBg, 0xEEF1F4, 1.0f},
-    StyleColorEntry{ImGuiCol_ScrollbarGrab, 0xB4C0CC, 1.0f},
-    StyleColorEntry{ImGuiCol_ScrollbarGrabHovered, 0x93A5B6, 1.0f},
+    StyleColorEntry{ImGuiCol_TabUnfocusedActive, 0x0078B8, 1.0f},
+    StyleColorEntry{ImGuiCol_ScrollbarBg, 0xD8E2E9, 1.0f},
+    StyleColorEntry{ImGuiCol_ScrollbarGrab, 0x8FA9B9, 1.0f},
+    StyleColorEntry{ImGuiCol_ScrollbarGrabHovered, 0x6D8EA3, 1.0f},
     StyleColorEntry{ImGuiCol_ScrollbarGrabActive, 0x0078D7, 1.0f},
 };
 
@@ -869,8 +1139,8 @@ void apply_style(const LayoutConfig& layout) {
     style.PopupRounding = 6.0f;
     style.ScrollbarRounding = 4.0f;
     style.WindowBorderSize = 0.0f;
-    style.FrameBorderSize = 0.0f;
-    style.ChildBorderSize = 0.0f;
+    style.FrameBorderSize = 1.0f;
+    style.ChildBorderSize = 1.0f;
     style.WindowPadding = ImVec2(0.0f, 0.0f);
     style.FramePadding = ImVec2(8.0f, layout.frame_padding_y);
     style.ItemSpacing = ImVec2(layout.item_spacing, layout.section_gap);
@@ -935,6 +1205,10 @@ extern "C" __declspec(dllexport) int xcom_imgui_init(HWND hwnd) {
     load_layout_config();
     ImGui::StyleColorsLight();
     ImGuiIO& io = ImGui::GetIO();
+    // Keep keyboard navigation and the native Win32 clipboard/context menu
+    // path enabled for every InputText widget.
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+    io.ConfigInputTextCursorBlink = true;
     ImFontConfig font_config;
     font_config.OversampleH = 2;
     font_config.OversampleV = 1;
@@ -950,6 +1224,20 @@ extern "C" __declspec(dllexport) int xcom_imgui_init(HWND hwnd) {
     const std::string heading_font = module_asset_path("SiemensSlabBold.TTF");
     runtime.heading_font_ = io.Fonts->AddFontFromFileTTF(heading_font.c_str(), 18.0f, &heading_config);
     if (!runtime.heading_font_) runtime.heading_font_ = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segoeuib.ttf", 18.0f, &heading_config);
+    // Monospace data face for the serial log / hex column.  A proportionally
+    // spaced font (Siemens Slab) makes every RX frame and hex byte column
+    // ragged; a fixed-width face is the standard for serial monitors and lets
+    // byte indices line up.  Fall back to Cascadia Mono if Consolas is absent
+    // on this build, else the default font (caller renders lines plainly).
+    constexpr std::uint16_t kMonoGlyphRanges[4] = {0x20, 0x7E, 0x00, 0x00};
+    runtime.mono_font_ = io.Fonts->AddFontFromFileTTF(
+        "C:\\Windows\\Fonts\\consola.ttf", 16.0f, nullptr,
+        io.Fonts->GetGlyphRangesDefault());
+    if (!runtime.mono_font_) {
+        runtime.mono_font_ = io.Fonts->AddFontFromFileTTF(
+            "C:\\Windows\\Fonts\\cascadiamono.ttf", 16.0f, nullptr,
+            io.Fonts->GetGlyphRangesDefault());
+    }
     apply_style(runtime.layout_);
     if (!ImGui_ImplWin32_Init(hwnd)) {
         ImGui::DestroyContext();
@@ -985,33 +1273,32 @@ extern "C" __declspec(dllexport) int xcom_imgui_draw_console(
     ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_Always);
     ImGui::SetNextWindowSize(io.DisplaySize, ImGuiCond_Always);
     ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
-        ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse;
+        ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
+        ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse;
     if (ImGui::Begin("##xcom_dashboard", nullptr, flags)) {
-        ui::Header(actions, connected != 0);
-        ImGui::Dummy(ImVec2(0.0f, 8.0f));
-        ImGui::SetCursorPosX(8.0f);
-        const std::array<ui::ComboSpec, 5> serial_fields{{
-            {"##baud", "BAUD RATE", baud, kBaudItems, static_cast<int>(std::size(kBaudItems))},
-            {"##data_bits", "DATA BITS", data_bits, kDataItems, static_cast<int>(std::size(kDataItems))},
-            {"##stop_bits", "STOP BITS", stop_bits, kStopItems, static_cast<int>(std::size(kStopItems))},
-            {"##parity", "PARITY", parity, kParityItems, static_cast<int>(std::size(kParityItems))},
-            {"##flow", "FLOW CONTROL", flow, kFlowItems, static_cast<int>(std::size(kFlowItems))},
-        }};
-        const float content_width = ImGui::GetContentRegionAvail().x - 8.0f;
         const auto& layout = runtime.layout_;
+        ui::Header(actions, connected != 0);
+        ImGui::SetCursorPosY(layout.header_height);
+        ImGui::SetCursorPosX(layout.window_padding);
+        const std::array<ui::ComboSpec, 5> serial_fields{{
+            {"##baud", "BAUD", baud, kBaudItems, static_cast<int>(std::size(kBaudItems))},
+            {"##data_bits", "DATA", data_bits, kDataItems, static_cast<int>(std::size(kDataItems))},
+            {"##stop_bits", "STOP", stop_bits, kStopItems, static_cast<int>(std::size(kStopItems))},
+            {"##parity", "PARITY", parity, kParityItems, static_cast<int>(std::size(kParityItems))},
+            {"##flow", "FLOW", flow, kFlowItems, static_cast<int>(std::size(kFlowItems))},
+        }};
+        const float content_width = ImGui::GetContentRegionAvail().x - layout.window_padding;
         const float compact_sidebar = layout.sidebar_width - 28.0f;
         const float sidebar_width = content_width < layout.compact_threshold
             ? (compact_sidebar > 160.0f ? compact_sidebar : 160.0f)
             : layout.sidebar_width;
-        if (const auto monitor = ui::Panel("##monitor_column", ImVec2(-sidebar_width - 6.0f, 0)); monitor) {
-            ui::Section("RECEIVE", "MONITOR · LIVE SERIAL STREAM", false);
+        if (const auto monitor = ui::Panel("##monitor_column", ImVec2(-sidebar_width, -kFooterHeight), false); monitor) {
             actions |= ui::ReceiveContent(rx_bytes, tx_bytes, receive_hex, timestamp,
                                           pause_display, auto_clear, auto_clear_bytes,
                                           auto_save);
             // Binding (not a bare temporary) keeps the panel's EndChild in this
             // scope, so the workspace stays open across the section below.
-            const auto send_workspace = ui::Panel("##send_workspace", ImVec2(0, layout.send_height));
-            ui::Section("TRANSMIT", "SEND A COMMAND OR BUILD A REUSABLE QUEUE", false);
+            const auto send_workspace = ui::Panel("##send_workspace", ImVec2(0, layout.send_height), false);
             actions |= ui::TransmitContent(send_hex, send_crlf, send_auto, send_period,
                                            send_text, send_capacity, multi_text,
                                            multi_slot_capacity, multi_enabled, multi_hex,
@@ -1020,11 +1307,18 @@ extern "C" __declspec(dllexport) int xcom_imgui_draw_console(
         }
         ImGui::SameLine(0.0f, layout.panel_gap);
         {
-            const auto serial_column = ui::Panel("##serial_column", ImVec2(0, 0));
+            ImGui::PushStyleColor(ImGuiCol_Border, rgb(kPanelBorder, 0.9f));
+            const auto serial_column = ui::Panel("##serial_column", ImVec2(0, -kFooterHeight));
+            ImGui::PopStyleColor();
             actions |= ui::ConnectionContent(port, port_capacity, connected != 0,
                                               baud, data_bits, stop_bits, parity, flow,
-                                              dtr, rts, serial_fields);
+                                              dtr, rts, serial_fields, rx_bytes, tx_bytes,
+                                              receive_hex, timestamp, pause_display,
+                                              auto_clear, auto_clear_bytes, auto_save);
         }
+        ImGui::SetCursorPosY(ImGui::GetIO().DisplaySize.y - kFooterHeight);
+        ImGui::SetCursorPosX(0.0f);
+        ui::Footer(connected != 0, rx_bytes, tx_bytes);
     }
     ImGui::End();
     // The accumulated action mask is the C ABI return value — returned to the
@@ -1050,8 +1344,29 @@ extern "C" __declspec(dllexport) void xcom_imgui_set_receive_text(
     offsets.clear();
     offsets.push_back(0);
     for (std::size_t index = 0; index < bounded_length; ++index) {
-        if (runtime.receive_text_[index] == '\n') offsets.push_back(index + 1);
+        const char character = runtime.receive_text_[index];
+        if (character == '\n') {
+            offsets.push_back(index + 1);
+        } else if (character == '\r' &&
+                   (index + 1U >= bounded_length || runtime.receive_text_[index + 1U] != '\n')) {
+            offsets.push_back(index + 1);
+        }
     }
+}
+
+extern "C" __declspec(dllexport) void xcom_imgui_set_status(const char* text) {
+    auto& runtime = ImGuiRuntime::instance();
+    if (!runtime.initialized_ || GetCurrentThreadId() != runtime.owner_thread_) return;
+    constexpr std::size_t kStatusLimit = 160U;
+    // Null-safe: an empty view's data() may be null, and assign(nullptr, 0)
+    // is undefined; short-circuit instead of clamping a null pointer.
+    if (text == nullptr || text[0] == '\0') {
+        runtime.status_text_.clear();
+        return;
+    }
+    const std::string_view value(text);
+    runtime.status_text_.assign(value.data(),
+                                value.size() < kStatusLimit ? value.size() : kStatusLimit);
 }
 
 extern "C" __declspec(dllexport) int xcom_imgui_new_frame() {
@@ -1073,7 +1388,10 @@ extern "C" __declspec(dllexport) int xcom_imgui_render() {
     runtime.context_->OMSetRenderTargets(1, &runtime.render_target_, nullptr);
     runtime.context_->ClearRenderTargetView(runtime.render_target_, kClearColor);
     ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
-    runtime.swap_chain_->Present(1, 0);
+    // Present immediately during interactive resize. Waiting for a vblank
+    // leaves the previous frame visible while Windows is in its modal sizing
+    // loop, which looks like a stretched/ghosted dashboard.
+    runtime.swap_chain_->Present(0, 0);
     runtime.frame_active_ = false;
     return 1;
 }
@@ -1093,8 +1411,10 @@ extern "C" __declspec(dllexport) int xcom_imgui_wndproc(
                 // null target, which xcom_imgui_render() then guards against.
                 (void)create_render_target(runtime);
             }
+            InvalidateRect(hwnd, nullptr, FALSE);
         }
     }
+    if (msg == WM_EXITSIZEMOVE) InvalidateRect(hwnd, nullptr, FALSE);
     // ImGui's handler returns an LRESULT; the C ABI collapses it to a handled
     // boolean so the caller never sees a pointer-sized value for a true/false.
     return ImGui_ImplWin32_WndProcHandler(hwnd, msg, wparam, lparam) ? 1 : 0;

@@ -106,6 +106,14 @@ local IMGUI_ACTION = {
     minimize = 65536,
     maximize = 131072,
     close_window = 262144,
+    send_slot_0 = 524288,
+    send_slot_1 = 1048576,
+    send_slot_2 = 2097152,
+    send_slot_3 = 4194304,
+    send_slot_4 = 8388608,
+    send_slot_5 = 16777216,
+    send_slot_6 = 33554432,
+    send_slot_7 = 67108864,
 }
 
 local IMGUI_COMMANDS = {
@@ -128,6 +136,14 @@ local IMGUI_COMMANDS = {
     { IMGUI_ACTION.minimize, "_imgui_minimize" },
     { IMGUI_ACTION.maximize, "_toggle_maximize" },
     { IMGUI_ACTION.close_window, "on_close" },
+    { IMGUI_ACTION.send_slot_0, "_imgui_send_slot", 0 },
+    { IMGUI_ACTION.send_slot_1, "_imgui_send_slot", 1 },
+    { IMGUI_ACTION.send_slot_2, "_imgui_send_slot", 2 },
+    { IMGUI_ACTION.send_slot_3, "_imgui_send_slot", 3 },
+    { IMGUI_ACTION.send_slot_4, "_imgui_send_slot", 4 },
+    { IMGUI_ACTION.send_slot_5, "_imgui_send_slot", 5 },
+    { IMGUI_ACTION.send_slot_6, "_imgui_send_slot", 6 },
+    { IMGUI_ACTION.send_slot_7, "_imgui_send_slot", 7 },
 }
 
 local STATUS_TEXT = {
@@ -137,11 +153,11 @@ local STATUS_TEXT = {
     [-9] = "unsupported",
 }
 
-local HEADER_H = 32
-local STATUS_H = 26
-local CONN_W = 165
-local PAGE_MARGIN = 8
-local PANEL_GAP = 8
+local HEADER_H = 36
+local STATUS_H = 22
+local CONN_W = 180
+local PAGE_MARGIN = 1
+local PANEL_GAP = 0
 -- Header window-button strip (min/max/close), drawn in on_paint and hit
 -- tested in on_nchittest / _header_button_at — keep these three in sync.
 local HEADER_BUTTON_W = 40
@@ -284,7 +300,7 @@ create_class = function(hinst)
     -- color, so the client area is never transparent/desktop-passthrough even
     -- before the first WM_PAINT.  A NULL hbrBackground leaves the client area
     -- un-painted (transparent) and makes WM_ERASEBKGND pointless.
-    wc.style = 0x0020  -- CS_OWNDC: raw OpenGL requires a window-owned DC.
+    wc.style = 0x0020  -- CS_OWNDC keeps the DX11 swap-chain target stable.
     wc.hbrBackground = ffi.cast("HBRUSH", 6)  -- COLOR_WINDOW + 1 = 6
     return wc
 end
@@ -295,8 +311,8 @@ Window._create_class = create_class
 -- ---------------------------------------------------------------------------
 function Window:build_ui(tw, th)
     local body_h = th - HEADER_H - STATUS_H
-    local send_h = 158
-    local content_y = HEADER_H + 6
+    local send_h = 180
+    local content_y = HEADER_H
     local send_y = th - STATUS_H - send_h
     local conn_x = tw - PAGE_MARGIN - CONN_W
     local recv_w = conn_x - PANEL_GAP - PAGE_MARGIN
@@ -373,11 +389,11 @@ function Window:dispatch(hwnd, msg, wparam, lparam)
     end
     if m == w.wm.WM_PAINT then
         if self.imgui then
-            -- OpenGL owns the client surface while ImGui is active.  Calling
+            -- DX11 owns the client surface while ImGui is active.  Calling
             -- the legacy GDI painter here races SwapBuffers during expose and
             -- resize, which causes stale frames and visible flicker.  Begin/
             -- EndPaint only acknowledges the invalid region; the next loop
-            -- iteration performs the actual redraw through OpenGL.
+            -- iteration performs the actual redraw through DX11.
             local ps = ffi.new("PAINTSTRUCT")
             local hdc = w.user32.BeginPaint(self.hwnd, ps)
             if hdc then w.user32.EndPaint(self.hwnd, ps) end
@@ -389,7 +405,7 @@ function Window:dispatch(hwnd, msg, wparam, lparam)
     end
     if m == w.wm.WM_ERASEBKGND then
         if self.imgui then
-            -- Do not let GDI erase an OpenGL-owned surface between frames.
+            -- Do not let GDI erase a DX11-owned surface between frames.
             return 1
         end
         -- Fill the whole client area with the page background colour so the
@@ -663,10 +679,16 @@ function Window:_save_config()
     local data = self.cfg_data
     local rc = ffi.new("RECT")
     if w.user32.GetWindowRect(self.hwnd, rc) ~= 0 then
-        config.set(data, "window", "x", rc.left)
-        config.set(data, "window", "y", rc.top)
-        config.set(data, "window", "w", rc.right - rc.left)
-        config.set(data, "window", "h", rc.bottom - rc.top)
+        local width = rc.right - rc.left
+        local height = rc.bottom - rc.top
+        -- Minimized windows report (-32000, -32000, 160, 28).  Never persist
+        -- that sentinel geometry or the next launch will be invisible.
+        if width >= 640 and height >= 480 and rc.left > -10000 and rc.top > -10000 then
+            config.set(data, "window", "x", rc.left)
+            config.set(data, "window", "y", rc.top)
+            config.set(data, "window", "w", width)
+            config.set(data, "window", "h", height)
+        end
     end
     local conn = self.conn
     if conn then
@@ -783,11 +805,20 @@ function Window:core_open()
     -- blocking, so roll the intent back instead of waiting for a snapshot
     -- that will never report OPEN.
     local serial = self:_serial_config()
+    if not serial.port or serial.port == "" then
+        self.vm:reject_open()
+        if self.imgui then self.imgui:set_status("Select a port first") end
+        return
+    end
+    if self.imgui then self.imgui:set_status("Opening " .. serial.port .. " ...") end
     local rc = xcom.open_async(self.core, serial.port, serial.baud_rate,
         serial.data_bits, serial.stop_bits, serial.parity, serial.flow_control,
         serial.dtr, serial.rts)
     if rc ~= xcom.ok then
         self.vm:reject_open()
+        if self.imgui then
+            self.imgui:set_status("Open failed: " .. (STATUS_TEXT[tonumber(rc)] or tostring(rc)))
+        end
         c.set_text(self.status.labels[1], "OPEN FAILED")
         self:_render_ui_state()
     end
@@ -977,7 +1008,7 @@ function Window:_dispatch_imgui_actions(actions)
     end
     for _, command in ipairs(IMGUI_COMMANDS) do
         if bit.band(actions, command[1]) ~= 0 then
-            self[command[2]](self)
+            self[command[2]](self, command[3])
         end
     end
 end
@@ -1009,6 +1040,15 @@ function Window:_imgui_send_enabled()
             if payload then self:core_send(payload, xcom.send_text) end
         end
     end
+end
+
+function Window:_imgui_send_slot(index)
+    if not self.imgui then return end
+    local text, enabled = self.imgui:multi_entry(index)
+    if not enabled or text == "" then return end
+    local payload = xcom.build_send_payload(text,
+        self.imgui.multi_hex[0] ~= 0, self.imgui.multi_crlf[0] ~= 0)
+    if payload then self:core_send(payload, xcom.send_text) end
 end
 
 function Window:_imgui_previous_page()
@@ -1134,6 +1174,9 @@ end
 function Window:_poll_errors()
     local err = xcom.take_error(self.core)
     if err then
+        if self.imgui then
+            self.imgui:set_status(string.format("E%d: %s", err.code, err.message))
+        end
         c.set_text(self.status.labels[4],
                    string.format("E%d: %s", err.code, err.message))
     end
@@ -1160,7 +1203,13 @@ function Window:poll_status()
         -- Probe (and exercise) the v1.3 async-open result so the open does not
         -- depend solely on snapshot phase; any definitive state (OPEN/FAULT)
         -- is still applied by on_snapshot below.
-        xcom.take_open_result(self.core)
+        local open_result = tonumber(xcom.take_open_result(self.core))
+        if open_result and open_result ~= xcom.ok and open_result ~= xcom.err_busy then
+            if self.imgui then
+                self.imgui:set_status("Open failed: " ..
+                    (STATUS_TEXT[open_result] or tostring(open_result)))
+            end
+        end
     end
     local snap = xcom.get_snapshot(self.core)
     if snap then
@@ -1170,6 +1219,13 @@ function Window:poll_status()
         self.generation = snap.generation
         if self.vm:on_snapshot(snap) then
             self:_render_ui_state()
+            if self.imgui then
+                if snap.port_state == xcom.port_open then
+                    self.imgui:set_status("Connected: " .. (self._imgui_port or "serial port"))
+                elseif snap.port_state == xcom.port_fault then
+                    self.imgui:set_status("Open failed; check the port and parameters")
+                end
+            end
         end
         -- Skip the string.format allocations when the counters are unchanged
         -- (the 250 ms poller otherwise formats four identical strings per
@@ -1274,7 +1330,10 @@ function Window:on_size(wparam, lparam)
             self.status.layout(wd, hg - STATUS_H)
         end
         self._imgui_next_frame = nil
-        w.user32.InvalidateRect(self.hwnd, nil, 1)
+        -- DX11 clears and redraws the client surface; requesting a GDI erase
+        -- here creates a visible flash and can expose an old swap-chain frame
+        -- while the user is dragging the border.
+        w.user32.InvalidateRect(self.hwnd, nil, 0)
     end
     return 0
 end
@@ -1303,7 +1362,7 @@ function Window:on_paint()
         local card_rect = ffi.new("RECT", left, top, right, bottom)
         w.user32.FillRect(hdc, card_rect, card_brush)
     end
-    local content_y = layout.content_y or (HEADER_H + 6)
+    local content_y = layout.content_y or HEADER_H
     local send_y = layout.send_y or 466
     card(PAGE_MARGIN, content_y, (layout.conn_x or 700) - PANEL_GAP / 2,
          send_y - 4)

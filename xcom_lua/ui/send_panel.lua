@@ -39,8 +39,8 @@ function M.build(panel, x, y, panel_w, h)
     sp.single_send = c.button(panel, "Send", { x = x + panel_w - 98, y = cy, w = 90, h = 70 })
     cy = cy + 74
     sp.single_hex = c.checkbox(panel, "HEX", { x = x, y = cy, w = 46, h = 20 })
-    sp.single_crlf = c.checkbox(panel, "Send newline", { x = x + 50, y = cy, w = 104, h = 20 })
-    sp.single_auto = c.checkbox(panel, "Auto cycle", { x = x + 158, y = cy, w = 90, h = 20 })
+    sp.single_crlf = c.checkbox(panel, "NEWLINE", { x = x + 50, y = cy, w = 104, h = 20 })
+    sp.single_auto = c.checkbox(panel, "AUTO", { x = x + 158, y = cy, w = 90, h = 20 })
     sp.single_period = c.edit(panel, "1000", { x = x + panel_w - 120, y = cy, w = 56, h = 20 })
     sp.single_ms = c.label(panel, "ms", { x = x + panel_w - 60, y = cy, w = 30, h = 20 })
     cy = cy + 26

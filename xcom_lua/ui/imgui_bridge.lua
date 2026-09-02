@@ -6,6 +6,7 @@ void xcom_imgui_set_ports(const char* const* names, int count);
 int xcom_imgui_new_frame(void);
 int xcom_imgui_render(void);
 void xcom_imgui_set_receive_text(const char* text, size_t length);
+void xcom_imgui_set_status(const char* text);
 int xcom_imgui_wndproc(void* hwnd, unsigned int msg, uintptr_t wparam, intptr_t lparam);
 int xcom_imgui_draw_console(char* port, size_t port_capacity, int connected,
   int rx_bytes, int tx_bytes, int* baud, int* data_bits, int* stop_bits,
@@ -89,6 +90,10 @@ function M:set_receive_text(text)
     text = text or ""
     local n = math.min(#text, RECEIVE_CAPACITY - 1)
     self.lib.xcom_imgui_set_receive_text(text, n)
+end
+
+function M:set_status(text)
+    self.lib.xcom_imgui_set_status(text or "")
 end
 
 function M:draw(connected, rx_bytes, tx_bytes)

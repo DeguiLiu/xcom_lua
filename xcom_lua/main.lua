@@ -26,17 +26,46 @@ local window = require("window")
 local w = require("win32")
 local xcom = require("xcom_ffi")
 
+-- Resolve Win32 libraries before reading monitor metrics below.  Window.new
+-- also calls this defensively, but geometry normalization happens first.
+w.load()
+
+-- LuaJIT must not trace any frame that can be re-entered by Win32 or ImGui's
+-- C callbacks.  A single missed child trace causes the process-level
+-- ``bad callback`` panic when a combo/button is clicked.  The UI is I/O
+-- bound, so interpreted Lua has negligible impact and keeps every callback
+-- path deterministic; native ImGui/core code remains optimized C++.
+if jit and jit.off then jit.off() end
+
 local APP_DIR = (arg and arg[0] and arg[0]:match("^(.*)[/\\]")) or "."
 local CONFIG_PATH = APP_DIR .. "/config.ini"
 
 -- Load persisted settings (safe defaults on missing/corrupt file).
 local cfg_data = config.load(CONFIG_PATH)
+-- Window geometry is persisted across sessions, but monitor changes and DPI
+-- scaling can leave an old maximized rectangle (for example 2560x1440) that
+-- makes the dashboard appear to lose controls.  Clamp it to the current
+-- work area and fall back to the compact desktop layout when the saved value
+-- is clearly a stale full-screen rectangle.
+local screen_w = math.max(640, tonumber(w.user32.GetSystemMetrics(w.SM_CXSCREEN)) or 1280)
+local screen_h = math.max(480, tonumber(w.user32.GetSystemMetrics(w.SM_CYSCREEN)) or 720)
+local saved_w = tonumber(config.get(cfg_data, "window", "w", 920)) or 920
+local saved_h = tonumber(config.get(cfg_data, "window", "h", 650)) or 650
+local saved_x = tonumber(config.get(cfg_data, "window", "x", 80)) or 80
+local saved_y = tonumber(config.get(cfg_data, "window", "y", 60)) or 60
+if saved_w >= screen_w - 8 or saved_h >= screen_h - 8 then
+    saved_w, saved_h = math.min(1100, screen_w - 80), math.min(760, screen_h - 100)
+end
+saved_w = math.max(920, math.min(saved_w, screen_w))
+saved_h = math.max(650, math.min(saved_h, screen_h))
+saved_x = math.max(0, math.min(saved_x, screen_w - saved_w))
+saved_y = math.max(0, math.min(saved_y, screen_h - saved_h))
 local cfg = {
     window = {
-        x = config.get(cfg_data, "window", "x", 80),
-        y = config.get(cfg_data, "window", "y", 60),
-        w = config.get(cfg_data, "window", "w", 920),
-        h = config.get(cfg_data, "window", "h", 650),
+        x = saved_x,
+        y = saved_y,
+        w = saved_w,
+        h = saved_h,
     },
     port = config.get(cfg_data, "port", "name", ""),
     baud_rate = config.get(cfg_data, "serial", "baud_rate", 115200),

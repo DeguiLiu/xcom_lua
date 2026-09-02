@@ -1,12 +1,15 @@
 # Runtime layout metrics. Values are validated and safely defaulted by the bridge.
 [layout]
-sidebar_width = 194
+sidebar_width = 180
 compact_threshold = 760
 receive_height = 0
-send_height = 212
-header_height = 46
-panel_gap = 6
-window_padding = 8
+# send_height drives the receive log size: receive_height==0 means the log
+# panel takes everything the send workspace does not.  Keep send compact so
+# the log dominates the viewport (the transmit area scrolls if needed).
+send_height = 180
+header_height = 36
+panel_gap = 0
+window_padding = 1
 item_spacing = 7
 frame_padding_y = 4
 section_gap = 4
