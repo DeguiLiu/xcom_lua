@@ -645,6 +645,16 @@ void TextContextMenu(const char* popup_id, char* buffer, const size_t capacity) 
     const auto pop_mono = ScopedAction([mono_ok] {
         if (mono_ok) ImGui::PopFont();
     });
+    // Keep short logs visually anchored to the receive panel's lower edge.
+    // Once the logical content exceeds the viewport, the clipper supplies the
+    // full scroll range and the tail-follow block below keeps the newest line
+    // at ScrollMaxY instead.
+    const float line_height = ImGui::GetTextLineHeightWithSpacing();
+    const float content_height = line_height * static_cast<float>(offsets.size());
+    const float available_height = ImGui::GetContentRegionAvail().y;
+    if (content_height < available_height) {
+        ImGui::SetCursorPosY(ImGui::GetCursorPosY() + available_height - content_height);
+    }
     ImGuiListClipper clipper;
     clipper.Begin(static_cast<int>(offsets.size()));
     while (clipper.Step()) {
