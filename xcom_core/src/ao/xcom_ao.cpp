@@ -161,16 +161,30 @@ bool rx_format_block(RxCtx* self, const uint8_t* bytes, uint32_t len)
     }
 
     uint32_t written = 0U;
-    // Reserve room for the timestamp prefix up front; the payload branches
-    // budget against the remaining capacity (kDisplayBatchBytes - ts).
-    const uint32_t ts = rx_timestamp_prefix(core, out);
+    // A receive callback may split a logical line across blocks.  Keep the
+    // timestamp at a line boundary by inserting one separator when the prior
+    // block did not end in CR/LF.  The state is Dispatcher-owned, so no lock
+    // or atomic is needed on this hot formatting path.
+    const bool timestamped = core->timestamp.load(std::memory_order_acquire) != 0U;
+    const bool needs_separator = timestamped && !core->display_at_line_start;
+    if (needs_separator) {
+        out[written++] = static_cast<uint8_t>('\n');
+    }
+    const uint32_t ts = timestamped
+        ? rx_timestamp_prefix(core, out + written) : 0U;
     written += ts;
-    const uint32_t budget = kDisplayBatchBytes - ts;
+    const uint32_t budget = kDisplayBatchBytes - written;
     // Compile-time specialize the hex vs text formatter on the runtime view
     // bit; the branch is resolved once per block, not per input byte.
-    written += (core->hex_view.load(std::memory_order_acquire) != 0U)
-                   ? format_payload<true>(out + written, budget, bytes, len)
-                   : format_payload<false>(out + written, budget, bytes, len);
+    const uint32_t payload_written = (core->hex_view.load(std::memory_order_acquire) != 0U)
+        ? format_payload<true>(out + written, budget, bytes, len)
+        : format_payload<false>(out + written, budget, bytes, len);
+    written += payload_written;
+    if (payload_written > 0U) {
+        const uint8_t last = out[written - 1U];
+        core->display_at_line_start = last == static_cast<uint8_t>('\n') ||
+                                      last == static_cast<uint8_t>('\r');
+    }
 
     if (written == 0U) {
         core->display.release_buf(bid);
@@ -403,6 +417,7 @@ void serial_do_open(SerialCtx& ctx, const coact::Event&) noexcept
     core->open_generation.fetch_add(1U, std::memory_order_relaxed);
     core->generation.store(core->open_generation.load(std::memory_order_relaxed),
                            std::memory_order_release);
+    core->display_at_line_start = true;
     core->port_state.store(XCOM_PORT_OPEN, std::memory_order_release);
     core->diag_emit(0U, static_cast<uint16_t>(DiagEvent::kOpenOk),
                     core->cfg_baud, core->generation.load(
@@ -419,6 +434,7 @@ void serial_do_close(SerialCtx& ctx, const coact::Event&) noexcept
         core->sink.owner_close(core);
     }
     core->generation.fetch_add(1U, std::memory_order_relaxed);
+    core->display_at_line_start = true;
     core->port_state.store(XCOM_PORT_CLOSED, std::memory_order_release);
     core->diag_emit(0U, static_cast<uint16_t>(DiagEvent::kCloseOk),
                     core->generation.load(std::memory_order_relaxed),

@@ -537,6 +537,10 @@ struct CoreCtx {
     std::atomic<std::uint8_t> hex_view{0U};
     std::atomic<std::uint8_t> timestamp{0U};
     std::atomic<std::uint8_t> pause_display{0U};
+    // Dispatcher-owned receive formatting state.  Serial callbacks may split
+    // a logical line across blocks; timestamps must never be inserted in the
+    // middle of that line.
+    bool display_at_line_start = true;
 
     // AutoTickGate: the template itself is owned by AutoSendAo after a typed
     // coact event transfers its TxBlock. 1 means a tick is queued/in flight.
