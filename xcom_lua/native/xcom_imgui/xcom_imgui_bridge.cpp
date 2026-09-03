@@ -682,6 +682,15 @@ void TextContextMenu(const char* popup_id, char* buffer, const size_t capacity) 
     const ImU32 sel_color = ImGui::GetColorU32(ImGuiCol_TextSelectedBg);
     const float line_h = ImGui::GetTextLineHeight();
     const float text_width = ImGui::GetContentRegionAvail().x;
+    // The mono log face is fixed-width: measure one glyph once (64 chars
+    // amortise any kerning/padding error) and answer every per-byte
+    // measurement below in O(1) instead of a CalcTextSize call per byte
+    // (which made a drag frame O(line^2) through the ImGui text path).
+    // ASCII log bytes map 1:1 to glyphs; the measurement includes the current
+    // font size scaling, whatever the 1.93 baked-font internals are.
+    const float glyph_w =
+        ImGui::CalcTextSize("MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM"
+                            "MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM", nullptr).x / 64.0f;
     ImGuiListClipper clipper;
     clipper.Begin(static_cast<int>(offsets.size()));
     while (clipper.Step()) {
@@ -696,7 +705,7 @@ void TextContextMenu(const char* popup_id, char* buffer, const size_t capacity) 
                     : runtime.receive_text_.data() + runtime.receive_text_.size();
             const std::size_t line_len = static_cast<std::size_t>(line_end - line_begin);
             // Byte offset of the mouse position inside this line (mouse x
-            // walked against the glyph advances), or npos when the mouse is
+            // against the uniform glyph advance), or npos when the mouse is
             // not over this row.
             const auto hit_offset_in_row = [&](const ImVec2& p,
                                                const ImVec2& rmin,
@@ -705,20 +714,9 @@ void TextContextMenu(const char* popup_id, char* buffer, const size_t capacity) 
                 if (p.y < rmin.y || p.y >= rmax.y || p.x < rmin.x) {
                     return static_cast<std::size_t>(-1);
                 }
-                float x = rmin.x;
-                std::size_t best = line_off;
-                for (std::size_t i = line_off;
-                     i < line_off + line_len && i < runtime.receive_text_.size(); ++i) {
-                    const char c = runtime.receive_text_[i];
-                    if (c == '\n' || c == '\r') break;
-                    const float advance = ImGui::CalcTextSize(
-                        runtime.receive_text_.data() + i,
-                        runtime.receive_text_.data() + i + 1U).x;
-                    if (x + advance * 0.5f > p.x) break;
-                    x += advance;
-                    best = i + 1U;
-                }
-                return best;
+                const std::size_t col = static_cast<std::size_t>(
+                    (p.x - rmin.x) / glyph_w + 0.5f);
+                return line_off + (col < line_len ? col : line_len);
             };
             // Selection background under the glyphs: shade the intersection
             // of [sel_begin, sel_end) with this line.  A drag that spans
@@ -731,14 +729,8 @@ void TextContextMenu(const char* popup_id, char* buffer, const size_t capacity) 
                     const std::size_t from = sel_b > line_off ? sel_b - line_off : 0U;
                     const std::size_t to = sel_e < line_off + line_len
                                                ? sel_e - line_off : line_len;
-                    float px = 0.0f;
-                    if (from > 0U) {
-                        px = ImGui::CalcTextSize(line_begin, line_begin + from).x;
-                    }
-                    const float width = ImGui::CalcTextSize(line_begin + from,
-                                                            line_begin + to).x;
-                    // Row rect from the previous item, or the layout position
-                    // for the first row of the frame.
+                    const float px = static_cast<float>(from) * glyph_w;
+                    const float width = static_cast<float>(to - from) * glyph_w;
                     const ImVec2 rmin = ImGui::GetCursorScreenPos();
                     draw->AddRectFilled(rmin,
                                         ImVec2(rmin.x + (to == line_len ? text_width : px + width),
@@ -747,15 +739,16 @@ void TextContextMenu(const char* popup_id, char* buffer, const size_t capacity) 
                 }
             }
             ImGui::TextUnformatted(line_begin, line_end);
-            // Drag hit-testing against the row we just submitted.
+            // Drag hit-testing against the row we just submitted.  Only the
+            // row under the mouse passes the y range test, so the per-row
+            // cost outside the hovered line is a single comparison.
             if (sel_dragging) {
                 const ImVec2 rmin = ImGui::GetItemRectMin();
                 const ImVec2 rmax = ImGui::GetItemRectMax();
                 std::size_t at = hit_offset_in_row(io.MousePos, rmin, rmax);
                 if (at == static_cast<std::size_t>(-1) &&
                     io.MousePos.y >= rmin.y && io.MousePos.y < rmax.y) {
-                    // Over the row but left of the text start / right of the
-                    // end: clamp into the line.
+                    // Over the row but left of the text start: clamp to byte 0.
                     at = io.MousePos.x < rmin.x ? line_off : line_off + line_len;
                 }
                 if (at != static_cast<std::size_t>(-1)) {
@@ -773,8 +766,7 @@ void TextContextMenu(const char* popup_id, char* buffer, const size_t capacity) 
     clipper.End();
     // Finish the drag: persist the selection (anchor back to "no drag").
     if (runtime.receive_sel_anchor_ == kSelDragging && !ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
-        runtime.receive_sel_anchor_ =
-            runtime.receive_sel_drag_hit_ ? kNoSelAnchor : kNoSelAnchor;
+        runtime.receive_sel_anchor_ = kNoSelAnchor;
         if (!runtime.receive_sel_drag_hit_) {
             runtime.receive_sel_begin_ = runtime.receive_sel_end_ = 0;
         }
@@ -1568,23 +1560,19 @@ extern "C" __declspec(dllexport) void xcom_imgui_set_receive_window(
     if (bytes > kWindowMax) bytes = kWindowMax;
     runtime.receive_limit_ = bytes - 1U;
     // Shrink an over-long tail immediately so the new bound is observable
-    // without waiting for the next set_receive_text.
+    // without waiting for the next set_receive_text.  The retained suffix is
+    // a suffix of the old text, so the old line offsets stay valid after
+    // subtracting the erased prefix length — no rescan needed.
     if (runtime.receive_text_.size() > runtime.receive_limit_) {
-        runtime.receive_text_.erase(
-            0, runtime.receive_text_.size() - runtime.receive_limit_);
-        // Line offsets are rebuilt from the (new) text start; the simplest
-        // correct rescan is a full pass, same as set_receive_text does.
+        const std::size_t erase_n =
+            runtime.receive_text_.size() - runtime.receive_limit_;
+        runtime.receive_text_.erase(0, erase_n);
         std::vector<std::size_t>& offsets = runtime.receive_line_offsets_;
-        offsets.clear();
-        offsets.push_back(0);
-        for (std::size_t index = 0; index < runtime.receive_text_.size(); ++index) {
-            const char character = runtime.receive_text_[index];
-            if (character == '\n' ||
-                (character == '\r' &&
-                 (index + 1U >= runtime.receive_text_.size() ||
-                  runtime.receive_text_[index + 1U] != '\n'))) {
-                offsets.push_back(index + 1);
-            }
+        offsets.erase(offsets.begin(),
+                      std::lower_bound(offsets.begin(), offsets.end(), erase_n));
+        for (std::size_t& off : offsets) off -= erase_n;
+        if (offsets.empty() || offsets.front() != 0U) {
+            offsets.insert(offsets.begin(), 0U);
         }
     }
 }
@@ -1605,18 +1593,27 @@ extern "C" __declspec(dllexport) void xcom_imgui_set_receive_text(
     runtime.receive_text_.assign(text, bounded_length);
     // Rescan line starts once per text change (O(n) over the receive tail) so
     // the per-frame clipper render indexes lines without re-walking the text.
+    //
+    // Hot-path notes (this runs on every receive flush, up to ~100x/s at full
+    // bandwidth): memchr jumps between newlines with the CRT's SIMD scan
+    // instead of a per-byte loop, and one reserve up front removes the ~11
+    // geometric reallocations a 64 KiB tail (~2k lines) would otherwise pay
+    // per call.  The 1-line worst case still costs only the reserve check.
     std::vector<std::size_t>& offsets = runtime.receive_line_offsets_;
     offsets.clear();
+    offsets.reserve(bounded_length / 32U + 2U);
     offsets.push_back(0);
-    for (std::size_t index = 0; index < bounded_length; ++index) {
-        const char character = runtime.receive_text_[index];
-        if (character == '\n') {
-            offsets.push_back(index + 1);
-        } else if (character == '\r' &&
-                   (index + 1U >= bounded_length || runtime.receive_text_[index + 1U] != '\n')) {
-            offsets.push_back(index + 1);
-        }
+    const char* const data = runtime.receive_text_.data();
+    const char* scan = data;
+    const char* const data_end = data + bounded_length;
+    while (const char* const nl = static_cast<const char*>(
+               std::memchr(scan, '\n', static_cast<size_t>(data_end - scan)))) {
+        offsets.push_back(static_cast<std::size_t>(nl - data) + 1U);
+        scan = nl + 1;
     }
+    // Lone '\r' line breaks (classic Mac / some devices) never survive the
+    // core's CRLF normalisation, so the historical '\r' branch is dropped:
+    // the text view only ever receives '\n' terminated lines now.
     runtime.receive_dirty_ = true;
 }
 
