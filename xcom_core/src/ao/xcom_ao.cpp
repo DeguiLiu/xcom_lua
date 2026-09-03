@@ -96,11 +96,30 @@ uint32_t format_payload(uint8_t* out, uint32_t budget,
     }
     else {
         // Text view transfers the borrowed payload into its owned display slot.
+        //
+        // ImGui's InputTextMultiline treats ONLY '\n' as a line break
+        // (STB_TEXTEDIT_NEWLINE='\n'; layout scans with ImMemchr(line,'\n')).
+        // Serial devices emit CRLF line endings, and a raw '\r' is rendered as
+        // a control glyph that corrupts the log's line layout and scrolling.
+        // Normalise CRLF -> LF (and a lone CR -> LF) so every line ends on a
+        // boundary ImGui understands.  NOTE: this is the shared display buffer,
+        // so the auto-save log (which drains the same buffer) records the
+        // normalised line endings too; the hex view is the byte-faithful path.
         const uint32_t n = (len < budget) ? len : budget;
-        if (n > 0U) {
-            std::memcpy(out, bytes, n);
+        uint32_t written = 0U;
+        for (uint32_t i = 0U; i < n; ++i) {
+            const uint8_t b = bytes[i];
+            if (b == static_cast<uint8_t>('\r')) {
+                // CRLF -> single LF; lone CR -> LF.
+                out[written++] = static_cast<uint8_t>('\n');
+                if (i + 1U < n && bytes[i + 1U] == static_cast<uint8_t>('\n')) {
+                    ++i;  // consume the paired LF
+                }
+            } else {
+                out[written++] = b;
+            }
         }
-        return n;
+        return written;
     }
 }
 
