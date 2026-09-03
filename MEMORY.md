@@ -68,6 +68,15 @@
 4. **核心固定池按波特率定容**（`xcom_config.hpp`）：`kRxBlockCount=128`（512 KiB）、`kDisplayBatchCount=32`（512 KiB）。921600 波特 ≈ 90 KiB/s，10 ms drain 节奏下余量为秒级。容量必须是 2 的幂（SpscRing 掩码）。
 5. **无效手段（已实测否决）**：字体 atlas 裁剪（OversampleH=1 + Latin/ASCII 字符集 + 缩字号）只省 <1 MB，视觉损失明显，已回退；去 luv 省约 1 MB，不值得架构回归。
 
+### 接收显示窗口（可配置）
+
+- **配置项**：`config.ini` 的 `[display] receive_window_bytes`，默认 65536，Lua 与 C++ 两侧统一 clamp 到 **16 KiB..1 MiB**（`imgui_bridge.clamp_receive_window` 与 `xcom_imgui_set_receive_window` 的 `kWindowMin/kWindowMax` 必须保持一致）。
+- **贯通链**：config.ini → `main.lua` → `cfg.receive_window_bytes` → bridge `M.new`（clamp 后经新 ABI `xcom_imgui_set_receive_window` 推入 DLL）→ C++ 侧 `ImGuiRuntime::receive_limit_`（运行时成员，设置时立即重裁尾部 + 重扫行偏移）；Lua 侧 `Window._receive_window` 驱动 chunk 裁剪。
+- **回写契约**：`_save_config` 持久化 clamp 后的**有效值**——手改 config.ini 后跑一次程序，非法值会被规整为合法值写回。测试/预览脚本若硬编码 cfg 绕过该配置，退出时会用默认值**回写覆盖**手改配置（stress_warp_ui.lua 已改为读真实配置，新增此类脚本时必须警惕）。
+- **下限/上限依据**：< 16 KiB 可视日志饥饿；> 1 MiB 时 `set_receive_text` 的 O(n) 行偏移重扫超出 WARP 帧预算。
+- **裁剪实现（性能要点）**：`_append_imgui_receive` 用**游标**淘汰整块（`table.remove(chunks,1)` 的 O(n) 搬移改为 O(1) 前进），flush 时从游标 concat + 至多一次 `:sub(-window)` 尾部裁剪。整块淘汰仅在"淘汰后剩余仍超窗"时发生——否则超大中部批次由 flush 尾裁保住真实最后 N 字节（旧实现的整块丢弃会丢块内上下文）。
+- 与 `max_display_bytes` 的区别：后者是 core 侧 ABI 字段但当前无消费者（`xcom_set_options` 只消费 hex_view/timestamp/pause_display），属遗留无效配置；显示窗口的真实上限由本配置控制，完整数据留存依赖 auto-save 日志。
+
 ### 测量方法论（防再踩坑）
 
 - **纯 spin 探针会高估**：`require("luv")` 的 54 MB 开销只在 libuv 事件循环主动运行时存在；主程序路径的 `uv.run("nowait")` 立即返回，从不进入。判断某依赖的内存代价必须**在实际宿主程序**里量（A/B 两个 EXE 跑同一 main.lua）。
