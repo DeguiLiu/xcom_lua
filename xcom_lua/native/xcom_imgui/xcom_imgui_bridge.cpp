@@ -605,7 +605,6 @@ void TextContextMenu(const char* popup_id, char* buffer, const size_t capacity) 
                                true, ImGuiWindowFlags_AlwaysVerticalScrollbar,
                                rgb(palette::kSurfaceLight));
     ImGui::PopStyleColor();
-    const bool receive_changed = runtime.receive_dirty_;
     if (runtime.receive_text_.empty()) {
         EmptyState("WAITING FOR SERIAL DATA", {});
         runtime.receive_dirty_ = false;
@@ -658,7 +657,11 @@ void TextContextMenu(const char* popup_id, char* buffer, const size_t capacity) 
             ImGui::TextUnformatted(begin, end);
         }
     }
-    if (receive_changed && follow_tail) {
+    // Anchor the viewport after the clipper has submitted its full logical
+    // height.  This must run on every tail-follow frame (not only on the
+    // mutation frame), because a rolling 64 KiB buffer can change its maximum
+    // scroll range while WARP is still presenting the previous frame.
+    if (follow_tail) {
         ImGui::SetScrollY(ImGui::GetScrollMaxY());
     }
     runtime.receive_scroll_y_ = ImGui::GetScrollY();
