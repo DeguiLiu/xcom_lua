@@ -99,6 +99,10 @@ local append_all = function()
     local buf = {}
     for _ = 1, REPEAT do buf[#buf + 1] = mock_chunk() end
     win:_append_imgui_receive(table.concat(buf))
+    -- poll_display normally requests the frame; the preview bypasses the
+    -- poller, so pull the data-cadence frame explicitly (otherwise the
+    -- stream only advances on the 500 ms idle heartbeat).
+    win:request_frame(100)
 end
 
 -- Seed a full viewport first so the very first frame is not near-empty:

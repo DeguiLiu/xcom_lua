@@ -81,6 +81,12 @@ constexpr const char* kStopItems[] = { "1", "1.5", "2" };
 constexpr const char* kParityItems[] = { "None", "Odd", "Even", "Mark", "Space" };
 constexpr const char* kFlowItems[] = { "None", "RTS / CTS", "XON / XOFF" };
 
+// Selection-anchor sentinels for the receive-log drag selection.  Byte
+// offsets into receive_text_; kNoSelAnchor means "no active selection",
+// kSelDragging marks "left button held, range extends with the drag".
+constexpr std::size_t kNoSelAnchor = static_cast<std::size_t>(-1);
+constexpr std::size_t kSelDragging = static_cast<std::size_t>(-2);
+
 class ImGuiRuntime final {
 public:
     static ImGuiRuntime& instance() {
@@ -112,6 +118,17 @@ public:
     bool receive_dirty_ = false;
     bool receive_follow_tail_ = true;
     float receive_scroll_y_ = 0.0f;
+    // Text selection over the receive log (drag with the left button).
+    // Anchor/drag are byte offsets into receive_text_; sel_begin/sel_end are
+    // the ordered pair the renderer shades.  anchor == kNoSelAnchor means "no
+    // selection"; anchor == kSelDragging means "mouse is held, extend the
+    // range" (both constants live at file scope above the class).
+    std::size_t receive_sel_anchor_ = kNoSelAnchor;
+    std::size_t receive_sel_begin_ = 0;
+    std::size_t receive_sel_end_ = 0;
+    // Byte offset where the current drag started (set on the first row hit).
+    std::size_t receive_sel_drag_origin_ = 0;
+    bool receive_sel_drag_hit_ = false;
     // Byte offset of every line start in receive_text_ (offset 0 included);
     // rescanned by xcom_imgui_set_receive_text and consumed by the receive
     // clipper so per-frame rendering walks only visible lines.
@@ -602,61 +619,190 @@ void TextContextMenu(const char* popup_id, char* buffer, const size_t capacity) 
     ImGui::PushStyleColor(ImGuiCol_Border, rgb(kPanelBorder, 0.78f));
     const auto receive = Panel("##receive",
                                ImVec2(0, layout.receive_height == 0.0f ? -transmit_block : layout.receive_height),
-                               true, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse,
-                               rgb(palette::kSurfaceLight));
+                               true, 0, rgb(palette::kSurfaceLight));
     ImGui::PopStyleColor();
     if (runtime.receive_text_.empty()) {
         EmptyState("WAITING FOR SERIAL DATA", {});
         runtime.receive_dirty_ = false;
+        runtime.receive_follow_tail_ = true;
+        runtime.receive_scroll_y_ = 0.0f;
         return actions;
     }
-    // Use ImGui's multiline editor as a read-only log viewport.  Unlike a
-    // single TextWrapped item, it computes the complete line/scroll geometry
-    // for a 64 KiB tail and exposes reliable wheel, drag and text selection.
-    // Sticky tail-follow: new data is kept at the bottom by default.  A
-    // deliberate upward wheel/drag detaches the view so history can be read;
-    // returning to the bottom re-enables follow automatically.
-    constexpr float kFollowTolerance = 20.0f;
-    const float scroll_y = ImGui::GetScrollY();
-    const float scroll_max = ImGui::GetScrollMaxY();
+    // Official ImGui log-window pattern (imgui_demo.cpp ShowExampleAppLog):
+    // a scrolling child + one TextUnformatted per line through ImGuiListClipper,
+    // with auto-scroll decided by "was the view at the bottom BEFORE this
+    // frame's content grew".  The earlier InputTextMultiline viewport fought
+    // this on two fronts: its internal stb_textedit layout engine only treats
+    // '\n' as a line break (a trailing '\r' rendered as a glyph and broke the
+    // row metric), and its own cursor/scroll state raced the follow logic.
+    const std::vector<std::size_t>& offsets = runtime.receive_line_offsets_;
+    // Capture the at-bottom state BEFORE any rendering mutates the scroll
+    // range.  Scrolling away (wheel/drag/scrollbar) makes this false, which
+    // detaches the follow; scrolling back to the bottom re-attaches it.
+    const bool was_at_bottom =
+        ImGui::GetScrollY() >= ImGui::GetScrollMaxY();
+    runtime.receive_follow_tail_ = was_at_bottom;
+    // --- text selection (drag with the left button) ---------------------
+    // Hit-testing runs per submitted row using GetItemRectMin/Max after each
+    // TextUnformatted — no manual scroll math, the rects are authoritative.
+    // The byte offset inside the hit line is computed from the mouse x with
+    // the glyph advance of the (mono) font.
     const ImGuiIO& io = ImGui::GetIO();
-    const bool hovered = ImGui::IsWindowHovered(ImGuiHoveredFlags_AllowWhenBlockedByActiveItem);
-    if (hovered && io.MouseWheel > 0.0f) runtime.receive_follow_tail_ = false;
-    if (scroll_y < runtime.receive_scroll_y_ - kFollowTolerance && io.MouseWheel == 0.0f) {
-        runtime.receive_follow_tail_ = false;
+    const bool log_hovered = ImGui::IsWindowHovered(ImGuiHoveredFlags_AllowWhenBlockedByActiveItem);
+    // Selection state machine:
+    //   * mouse-down over the log  -> start a drag (anchor set on first hit)
+    //   * mouse held               -> extend to the current hit offset
+    //   * mouse released           -> selection persists until the next press
+    // The byte offset for a mouse position is computed per submitted row
+    // during the clipper pass (GetItemRectMin/Max is authoritative, no
+    // manual scroll math).
+    const bool sel_drag_start =
+        log_hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left);
+    if (sel_drag_start) {
+        runtime.receive_sel_anchor_ = kSelDragging;
+        runtime.receive_sel_begin_ = 0;
+        runtime.receive_sel_end_ = 0;
+        runtime.receive_sel_drag_hit_ = false;
     }
-    if (scroll_y >= scroll_max - kFollowTolerance) runtime.receive_follow_tail_ = true;
-    const bool follow_tail = runtime.receive_follow_tail_;
+    const bool sel_dragging =
+        runtime.receive_sel_anchor_ == kSelDragging &&
+        ImGui::IsMouseDown(ImGuiMouseButton_Left);
+    const bool has_selection = runtime.receive_sel_end_ > runtime.receive_sel_begin_;
     // Render the log glyphs with the fixed-width data face when available so
     // hex bytes and RX counters line up column-wise (typical serial-monitor
-    // look).  Consistent per-line row height also keeps the clipper's line
-    // metric stable regardless of glyph width.
+    // look).  A consistent per-line row height also keeps the clipper metric
+    // stable regardless of glyph width.
     const bool mono_ok = runtime.mono_font_ != nullptr;
     if (mono_ok) ImGui::PushFont(runtime.mono_font_);
     const auto pop_mono = ScopedAction([mono_ok] {
         if (mono_ok) ImGui::PopFont();
     });
-    ImGuiInputTextFlags log_flags = ImGuiInputTextFlags_ReadOnly |
-        ImGuiInputTextFlags_NoHorizontalScroll;
-    const ImVec2 log_size(-1.0f, ImGui::GetContentRegionAvail().y);
-    ImGui::InputTextMultiline("##receive_log", runtime.receive_text_.data(),
-                              runtime.receive_text_.capacity() + 1U,
-                              log_size, log_flags);
-    // Anchor the viewport after the complete text item has established the
-    // true scroll range.  This runs on every tail-follow frame so rolling
-    // buffer updates cannot leave the view one page behind.
-    if (follow_tail) {
-        ImGui::SetScrollY(ImGui::GetScrollMaxY());
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0.0f, 0.0f));
+    ImDrawList* const draw = ImGui::GetWindowDrawList();
+    const ImU32 sel_color = ImGui::GetColorU32(ImGuiCol_TextSelectedBg);
+    const float line_h = ImGui::GetTextLineHeight();
+    const float text_width = ImGui::GetContentRegionAvail().x;
+    ImGuiListClipper clipper;
+    clipper.Begin(static_cast<int>(offsets.size()));
+    while (clipper.Step()) {
+        for (int line_no = clipper.DisplayStart; line_no < clipper.DisplayEnd;
+             ++line_no) {
+            const std::size_t line_off = offsets[static_cast<std::size_t>(line_no)];
+            const char* const line_begin =
+                runtime.receive_text_.data() + line_off;
+            const char* const line_end =
+                line_no + 1 < static_cast<int>(offsets.size())
+                    ? runtime.receive_text_.data() + offsets[static_cast<std::size_t>(line_no) + 1U] - 1
+                    : runtime.receive_text_.data() + runtime.receive_text_.size();
+            const std::size_t line_len = static_cast<std::size_t>(line_end - line_begin);
+            // Byte offset of the mouse position inside this line (mouse x
+            // walked against the glyph advances), or npos when the mouse is
+            // not over this row.
+            const auto hit_offset_in_row = [&](const ImVec2& p,
+                                               const ImVec2& rmin,
+                                               const ImVec2& rmax)
+                -> std::size_t {
+                if (p.y < rmin.y || p.y >= rmax.y || p.x < rmin.x) {
+                    return static_cast<std::size_t>(-1);
+                }
+                float x = rmin.x;
+                std::size_t best = line_off;
+                for (std::size_t i = line_off;
+                     i < line_off + line_len && i < runtime.receive_text_.size(); ++i) {
+                    const char c = runtime.receive_text_[i];
+                    if (c == '\n' || c == '\r') break;
+                    const float advance = ImGui::CalcTextSize(
+                        runtime.receive_text_.data() + i,
+                        runtime.receive_text_.data() + i + 1U).x;
+                    if (x + advance * 0.5f > p.x) break;
+                    x += advance;
+                    best = i + 1U;
+                }
+                return best;
+            };
+            // Selection background under the glyphs: shade the intersection
+            // of [sel_begin, sel_end) with this line.  A drag that spans
+            // rows shades whole intermediate lines (from byte 0 to line end).
+            if (has_selection || sel_dragging) {
+                const std::size_t sel_b = runtime.receive_sel_begin_;
+                const std::size_t sel_e = runtime.receive_sel_end_;
+                if (sel_e > sel_b && line_off < sel_e &&
+                    line_off + line_len > sel_b) {
+                    const std::size_t from = sel_b > line_off ? sel_b - line_off : 0U;
+                    const std::size_t to = sel_e < line_off + line_len
+                                               ? sel_e - line_off : line_len;
+                    float px = 0.0f;
+                    if (from > 0U) {
+                        px = ImGui::CalcTextSize(line_begin, line_begin + from).x;
+                    }
+                    const float width = ImGui::CalcTextSize(line_begin + from,
+                                                            line_begin + to).x;
+                    // Row rect from the previous item, or the layout position
+                    // for the first row of the frame.
+                    const ImVec2 rmin = ImGui::GetCursorScreenPos();
+                    draw->AddRectFilled(rmin,
+                                        ImVec2(rmin.x + (to == line_len ? text_width : px + width),
+                                               rmin.y + line_h),
+                                        sel_color);
+                }
+            }
+            ImGui::TextUnformatted(line_begin, line_end);
+            // Drag hit-testing against the row we just submitted.
+            if (sel_dragging) {
+                const ImVec2 rmin = ImGui::GetItemRectMin();
+                const ImVec2 rmax = ImGui::GetItemRectMax();
+                std::size_t at = hit_offset_in_row(io.MousePos, rmin, rmax);
+                if (at == static_cast<std::size_t>(-1) &&
+                    io.MousePos.y >= rmin.y && io.MousePos.y < rmax.y) {
+                    // Over the row but left of the text start / right of the
+                    // end: clamp into the line.
+                    at = io.MousePos.x < rmin.x ? line_off : line_off + line_len;
+                }
+                if (at != static_cast<std::size_t>(-1)) {
+                    if (!runtime.receive_sel_drag_hit_) {
+                        runtime.receive_sel_drag_origin_ = at;
+                        runtime.receive_sel_drag_hit_ = true;
+                    }
+                    const std::size_t origin = runtime.receive_sel_drag_origin_;
+                    runtime.receive_sel_begin_ = at < origin ? at : origin;
+                    runtime.receive_sel_end_ = at > origin ? at : origin;
+                }
+            }
+        }
+    }
+    clipper.End();
+    // Finish the drag: persist the selection (anchor back to "no drag").
+    if (runtime.receive_sel_anchor_ == kSelDragging && !ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+        runtime.receive_sel_anchor_ =
+            runtime.receive_sel_drag_hit_ ? kNoSelAnchor : kNoSelAnchor;
+        if (!runtime.receive_sel_drag_hit_) {
+            runtime.receive_sel_begin_ = runtime.receive_sel_end_ = 0;
+        }
+    }
+    ImGui::PopStyleVar();
+    // pop_mono is a ScopedAction: its destructor pops the font at scope exit.
+    // Follow-tail pin, official pattern: only when the view was at the bottom
+    // at the START of the frame, called after all rows are submitted so the
+    // scroll range reflects the new content.
+    if (runtime.receive_follow_tail_) {
+        ImGui::SetScrollHereY(1.0f);
     }
     runtime.receive_scroll_y_ = ImGui::GetScrollY();
     runtime.receive_dirty_ = false;
     // Right-click context menu: the read-only multiline editor doesn't expose
     // one by default, so attach one explicitly.  The popup id is scoped to
     // the receive panel so other panels' right-clicks are unaffected.
-    if (ImGui::IsItemHovered() && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+    if (ImGui::IsWindowHovered() && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
         ImGui::OpenPopup("##receive_context");
     }
     if (ImGui::BeginPopup("##receive_context")) {
+        const bool has_sel = runtime.receive_sel_end_ > runtime.receive_sel_begin_;
+        if (ImGui::MenuItem("Copy selection", nullptr, false, has_sel)) {
+            const std::string sel(runtime.receive_text_.substr(
+                runtime.receive_sel_begin_,
+                runtime.receive_sel_end_ - runtime.receive_sel_begin_));
+            ImGui::SetClipboardText(sel.c_str());
+        }
         if (ImGui::MenuItem("Copy all", nullptr, false, !runtime.receive_text_.empty())) {
             ImGui::SetClipboardText(runtime.receive_text_.c_str());
         }
