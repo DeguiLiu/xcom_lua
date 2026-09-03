@@ -77,6 +77,28 @@
 - **裁剪实现（性能要点）**：`_append_imgui_receive` 用**游标**淘汰整块（`table.remove(chunks,1)` 的 O(n) 搬移改为 O(1) 前进），flush 时从游标 concat + 至多一次 `:sub(-window)` 尾部裁剪。整块淘汰仅在"淘汰后剩余仍超窗"时发生——否则超大中部批次由 flush 尾裁保住真实最后 N 字节（旧实现的整块丢弃会丢块内上下文）。
 - 与 `max_display_bytes` 的区别：后者是 core 侧 ABI 字段但当前无消费者（`xcom_set_options` 只消费 hex_view/timestamp/pause_display），属遗留无效配置；显示窗口的真实上限由本配置控制，完整数据留存依赖 auto-save 日志。
 
+### 接收渲染热路径（2026-09-04 性能优化轮）
+
+满带宽（921600 波特）+ 实时渲染全程 CPU ~70% → **~33%**。全链路各环节的复杂度预算与手段：
+
+| 环节 | 频率 | 手段 | 反模式（曾踩） |
+| --- | --- | --- | --- |
+| core 文本格式化 | 每接收块 | `format_payload<false>` 单遍 CRLF→LF 归一 | `memcpy` 原样拷贝把 `\r` 留给显示层 |
+| 行偏移扫描（`set_receive_text`） | 每次 flush（≤100/s） | **`std::memchr` SIMD 跳扫** + `reserve(n/32+2)` 一次到位 | 逐字节循环（慢 4-16×）；clear 后 push_back 几何扩容（64 KiB 尾 ~2k 行 = 11 次 realloc/次） |
+| 窗口收缩重索引 | 配置变更 | 后缀不变性：旧 offsets 减删除量（`lower_bound`+线性平移） | 全量重扫 |
+| 渲染（`ReceiveContent`） | 每帧 | `ImGuiListClipper` O(可视行)；官方 `ShowExampleAppLog` 模式 | `InputTextMultiline`（stb_textedit 全量重排 + 只认 `\n` + 光标/滚动状态竞争） |
+| 选择命中/背景 | 拖拽帧 | **等宽字体 O(1) 数学**：一次测量 64 个 'M' 均摊字形宽，`count × glyph_w` | 每字节一次 `CalcTextSize`（O(line²)）；每选中行两次整段测量 |
+| 滚动跟随 | 每帧 | demo 精确规则：帧首 `GetScrollY()>=GetScrollMaxY()` 判定 + 行提交后 `SetScrollHereY(1.0f)` | 事后 `SetScrollY(GetScrollMaxY())`（新 max 上追赶，两帧间振荡） |
+| Lua 接收裁剪 | 每次 drain | 游标淘汰整块 O(1) | `table.remove(chunks,1)` O(n) 搬移 |
+
+要点与约束：
+
+- **等宽 O(1) 数学的前提是 mono 字体**：字形宽测量用 `CalcTextSize(64×'M')/64` 而非 1.93 内部 `ImFontBaked` API（baked-font 结构是 1.93 WIP 的过渡接口，勿依赖）。ASCII 日志字节 1:1 映射字形；非 ASCII 用 '?' 近似，选择命中足够。
+- **行命中测试用 `GetItemRectMin/Max`**（每行提交后的真实矩形），不要手算 scroll 偏移——`GetCursorScreenPos` 与滚动的语义极易算错。
+- **CRLF 归一只在 core 显示路径**（`format_payload<false>`）：hex 视图与 auto-save 日志（同源 display 缓冲）分别保持字节忠实/随归一；行偏移扫描因此可以只找 `\n`（孤立 `\r` 已在上游归一，历史分支已删）。
+- **`reserve` 时机**：热路径 vector 反复 clear+push_back 必须配 reserve；估算粒度无需精确（`n/32+2` 对 32 字节平均行宽，过估 2× 无害）。
+- Lua 侧同源优化见"接收显示窗口"节的游标裁剪；GC 按 ≥128 KiB 堆增量触发（勿按"有无输入"，输入密集会饿死收集器、持续流量会过度步进）。
+
 ### 测量方法论（防再踩坑）
 
 - **纯 spin 探针会高估**：`require("luv")` 的 54 MB 开销只在 libuv 事件循环主动运行时存在；主程序路径的 `uv.run("nowait")` 立即返回，从不进入。判断某依赖的内存代价必须**在实际宿主程序**里量（A/B 两个 EXE 跑同一 main.lua）。
@@ -90,6 +112,7 @@
 - `coact` 的无锁池、ABA 标记和缓存行对齐只用于事件/队列等并发核心；ImGui 窗口线程是单线程消息循环，不为 UI 强行引入原子或对象池。
 - C ABI 的动作位、缓冲区布局和函数签名属于稳定接口；内部可使用强类型枚举和模板，但导出边界必须显式转换并保持数值兼容。
 - 新增抽象必须证明能减少拷贝、分支或生命周期错误；避免为了展示设计模式而增加运行时分配和隐藏全局状态。
+- **接收链路复杂度预算**（满带宽基线，见"接收渲染热路径"表）：每 flush 的行扫描、每帧的渲染、每拖拽帧的命中测试都不得引入超线性环节——新代码若在 64 KiB 尾部上做整段 `CalcTextSize`/逐字节循环/几何扩容即违规。改 `receive_*` 系列代码时先读该表的反模式列。
 
 ## 模式速查表
 
