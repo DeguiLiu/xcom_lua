@@ -106,6 +106,10 @@ public:
     LayoutConfig layout_{};
     std::string receive_text_{};
     std::string status_text_{};
+    // Set only when the native receive buffer changes.  The renderer uses
+    // this edge-triggered flag to follow new data without stealing the
+    // user's scroll position on ordinary frames.
+    bool receive_dirty_ = false;
     // Byte offset of every line start in receive_text_ (offset 0 included);
     // rescanned by xcom_imgui_set_receive_text and consumed by the receive
     // clipper so per-frame rendering walks only visible lines.
@@ -596,11 +600,13 @@ void TextContextMenu(const char* popup_id, char* buffer, const size_t capacity) 
     ImGui::PushStyleColor(ImGuiCol_Border, rgb(kPanelBorder, 0.78f));
     const auto receive = Panel("##receive",
                                ImVec2(0, layout.receive_height == 0.0f ? -transmit_block : layout.receive_height),
-                               true, ImGuiWindowFlags_HorizontalScrollbar,
+                               true, ImGuiWindowFlags_AlwaysVerticalScrollbar,
                                rgb(palette::kSurfaceLight));
     ImGui::PopStyleColor();
+    const bool receive_changed = runtime.receive_dirty_;
     if (runtime.receive_text_.empty()) {
         EmptyState("WAITING FOR SERIAL DATA", {});
+        runtime.receive_dirty_ = false;
         return actions;
     }
     // Streaming receive log: render one logical line at a time via
@@ -641,9 +647,10 @@ void TextContextMenu(const char* popup_id, char* buffer, const size_t capacity) 
             ImGui::TextUnformatted(begin, end);
         }
     }
-    if (was_at_bottom) {
+    if (receive_changed && was_at_bottom) {
         ImGui::SetScrollY(ImGui::GetScrollMaxY());
     }
+    runtime.receive_dirty_ = false;
     // Right-click context menu: the read-only multiline editor doesn't expose
     // one by default, so attach one explicitly.  The popup id is scoped to
     // the receive panel so other panels' right-clicks are unaffected.
@@ -1444,6 +1451,7 @@ extern "C" __declspec(dllexport) void xcom_imgui_set_receive_text(
     if (!text || length == 0) {
         runtime.receive_text_.clear();
         runtime.receive_line_offsets_.assign(1, 0);
+        runtime.receive_dirty_ = true;
         return;
     }
     const size_t bounded_length = (std::min)(length, runtime.receive_limit_);
@@ -1462,6 +1470,7 @@ extern "C" __declspec(dllexport) void xcom_imgui_set_receive_text(
             offsets.push_back(index + 1);
         }
     }
+    runtime.receive_dirty_ = true;
 }
 
 extern "C" __declspec(dllexport) void xcom_imgui_set_status(const char* text) {
