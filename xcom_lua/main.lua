@@ -84,6 +84,7 @@ local cfg = {
     auto_save = config.get(cfg_data, "display", "auto_save", false),
     save_path = config.get(cfg_data, "display", "save_path", ""),
     always_on_top = config.get(cfg_data, "display", "always_on_top", false),
+    receive_window_bytes = config.get(cfg_data, "display", "receive_window_bytes", 65536),
     send_hex = config.get(cfg_data, "send", "hex", false),
     send_crlf = config.get(cfg_data, "send", "crlf", false),
     autosend_period_ms = config.get(cfg_data, "send", "autosend_period_ms", 0),

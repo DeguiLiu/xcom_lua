@@ -196,8 +196,15 @@ function M.new(cfg, cfg_data, config_path)
     self._handlers = {}             -- id -> handler name string
     self._autosend_on = false
     self._max_display_bytes = 2 * 1024 * 1024
+    -- Receive-tail window (bytes).  Configurable via [display]
+    -- receive_window_bytes in config.ini (clamped to 16 KiB..1 MiB); the
+    -- historical fixed 64 KiB is the default.  Pushed into the ImGui bridge
+    -- at _init_imgui so both sides trim the same tail.
+    self._receive_window = imgui_bridge.clamp_receive_window(
+        cfg.receive_window_bytes)
     self._imgui_receive = ""
     self._imgui_receive_chunks = {}
+    self._imgui_receive_cursor = 1
     self._imgui_receive_chunk_bytes = 0
     self._imgui_receive_dirty = false
     -- P2 layer of run_message_loop: high-priority deferred jobs.  Handlers
@@ -734,6 +741,9 @@ function Window:_save_config()
         config.set(data, "display", "auto_save", c.checkbox_checked(recv.auto_save_cb))
         config.set(data, "send", "receive_hex", opts.receive_hex)
     end
+    -- Persist the effective receive-tail window so a hand-edited config.ini
+    -- survives round-trips (clamped value is what both sides actually use).
+    config.set(data, "display", "receive_window_bytes", self._receive_window)
     if self.imgui then
         config.set(data, "send", "hex", self.imgui.send_hex[0] ~= 0)
         config.set(data, "send", "crlf", self.imgui.send_crlf[0] ~= 0)
@@ -983,30 +993,55 @@ function Window:poll_display()
 end
 jit.off(Window.poll_display)
 
+-- Append a receive batch to the tail window.  Chunks beyond the configured
+-- window are retired by advancing a start cursor — no table.remove (which
+-- shifts the whole array per pop) and no per-append string copies.  The
+-- retired prefix is dropped in one place at flush time (table.concat from the
+-- cursor, or a single :sub when the tail outgrew one chunk).
 function Window:_append_imgui_receive(text)
     if not text or #text == 0 then return end
+    local window = self._receive_window or 65535
     local chunks = self._imgui_receive_chunks
     chunks[#chunks + 1] = text
     self._imgui_receive_chunk_bytes = self._imgui_receive_chunk_bytes + #text
-    while self._imgui_receive_chunk_bytes > 65535 and #chunks > 1 do
-        self._imgui_receive_chunk_bytes = self._imgui_receive_chunk_bytes - #chunks[1]
-        table.remove(chunks, 1)
+    -- Retire whole exhausted chunks by advancing the cursor; their bytes
+    -- leave the accounting immediately so the next append starts clean.
+    -- A chunk is only retired when what REMAINS after retiring it still
+    -- exceeds the window — otherwise a huge middle chunk would be dropped
+    -- whole and the flush's :sub(-window) tail-trim handles it instead.
+    local cursor = self._imgui_receive_cursor or 1
+    while cursor < #chunks and
+          self._imgui_receive_chunk_bytes - #chunks[cursor] > window do
+        self._imgui_receive_chunk_bytes = self._imgui_receive_chunk_bytes - #chunks[cursor]
+        cursor = cursor + 1
     end
-    if #chunks == 1 and #chunks[1] > 65535 then
-        chunks[1] = chunks[1]:sub(-65535)
-        self._imgui_receive_chunk_bytes = #chunks[1]
-    end
+    self._imgui_receive_cursor = cursor
     self._imgui_receive_dirty = true
 end
 
 function Window:_flush_imgui_receive()
     if not self._imgui_receive_dirty then return false end
     local chunks = self._imgui_receive_chunks
-    -- One concat produces the tail in a single allocation; the chunks list is
-    -- already trimmed to <= 64 KiB by _append_imgui_receive, so no second
-    -- concatenation or :sub() copy is needed here.
-    self._imgui_receive = #chunks == 1 and chunks[1] or table.concat(chunks)
+    local cursor = self._imgui_receive_cursor or 1
+    local window = self._receive_window or 65535
+    local tail
+    local count = #chunks - cursor + 1
+    if count <= 0 then
+        tail = ""
+    elseif count == 1 then
+        local only = chunks[cursor]
+        -- A single batch larger than the window keeps only its last bytes.
+        tail = #only > window and only:sub(-window) or only
+    else
+        tail = table.concat(chunks, "", cursor)
+        -- The concat may still exceed the window if the cursor only retires
+        -- WHOLE chunks (one huge chunk in the middle survives whole-chunk
+        -- retirement); trim once.
+        if #tail > window then tail = tail:sub(-window) end
+    end
+    self._imgui_receive = tail
     self._imgui_receive_chunks = {}
+    self._imgui_receive_cursor = 1
     self._imgui_receive_chunk_bytes = 0
     self._imgui_receive_dirty = false
     return true
@@ -1794,6 +1829,7 @@ end
 function Window:on_btn_clear()
     self._imgui_receive = ""
     self._imgui_receive_chunks = {}
+    self._imgui_receive_cursor = 1
     self._imgui_receive_chunk_bytes = 0
     self._imgui_receive_dirty = false
     if self.imgui then

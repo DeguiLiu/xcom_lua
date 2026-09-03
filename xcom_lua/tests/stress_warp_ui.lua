@@ -68,6 +68,10 @@ local cfg = {
     receive_hex = false, timestamp = true, pause_display = false,
     auto_clear_bytes = 0, max_display_bytes = 2 * 1024 * 1024,
     auto_save = false, save_path = "", always_on_top = false,
+    -- Read the receive window from the real config so the harness exercises
+    -- the same [display] receive_window_bytes the production entry uses.
+    receive_window_bytes = config.get(cfg_data, "display",
+                                      "receive_window_bytes", 65536),
     send_hex = false, send_crlf = false, autosend_period_ms = 0,
     quick_pages = { { text = {}, enabled = {} } },
     quick = { text = {}, enabled = {} },
@@ -200,7 +204,7 @@ local shutdown = function()
                         stats.frames, stats.frames / ((uv.now() - t0) / 1000)))
     print(string.format("injection ticks: %d", stats.appended_ticks))
     print(string.format("final Lua heap:  %.1f KiB", collectgarbage("count")))
-    print(string.format("final backlog:   %d B (cap 65535)", backlog()))
+    print(string.format("final backlog:   %d B (window %d B)", backlog(), win._receive_window or 65535))
     print(string.format("trim happened:   %s",
                         stats.injected > 70000 and "yes (rolling window)" or "no"))
     win:on_close()

@@ -110,6 +110,10 @@ public:
     // rescanned by xcom_imgui_set_receive_text and consumed by the receive
     // clipper so per-frame rendering walks only visible lines.
     std::vector<std::size_t> receive_line_offsets_{};
+    // Receive-tail window in bytes, minus the NUL.  Configurable at runtime
+    // via xcom_imgui_set_receive_window ([display] receive_window_bytes in
+    // config.ini); the historical fixed size is the default.
+    std::size_t receive_limit_ = 64U * 1024U - 1U;
 };
 enum class Action : std::uint32_t {
     ActionOpen = 1 << 0,
@@ -1399,19 +1403,52 @@ extern "C" __declspec(dllexport) int xcom_imgui_draw_console(
     return actions;
 }
 
+extern "C" __declspec(dllexport) void xcom_imgui_set_receive_window(
+    size_t bytes) {
+    auto& runtime = ImGuiRuntime::instance();
+    if (!runtime.initialized_ || GetCurrentThreadId() != runtime.owner_thread_) return;
+    // Clamp to the same range the Lua side enforces (RECEIVE_WINDOW_MIN/MAX
+    // in imgui_bridge.lua): below 16 KiB the log viewport starves, above
+    // 1 MiB the per-change line-offset rescan outgrows the WARP frame budget.
+    constexpr size_t kWindowMin = 16U * 1024U;
+    constexpr size_t kWindowMax = 1024U * 1024U;
+    if (bytes < kWindowMin) bytes = kWindowMin;
+    if (bytes > kWindowMax) bytes = kWindowMax;
+    runtime.receive_limit_ = bytes - 1U;
+    // Shrink an over-long tail immediately so the new bound is observable
+    // without waiting for the next set_receive_text.
+    if (runtime.receive_text_.size() > runtime.receive_limit_) {
+        runtime.receive_text_.erase(
+            0, runtime.receive_text_.size() - runtime.receive_limit_);
+        // Line offsets are rebuilt from the (new) text start; the simplest
+        // correct rescan is a full pass, same as set_receive_text does.
+        std::vector<std::size_t>& offsets = runtime.receive_line_offsets_;
+        offsets.clear();
+        offsets.push_back(0);
+        for (std::size_t index = 0; index < runtime.receive_text_.size(); ++index) {
+            const char character = runtime.receive_text_[index];
+            if (character == '\n' ||
+                (character == '\r' &&
+                 (index + 1U >= runtime.receive_text_.size() ||
+                  runtime.receive_text_[index + 1U] != '\n'))) {
+                offsets.push_back(index + 1);
+            }
+        }
+    }
+}
+
 extern "C" __declspec(dllexport) void xcom_imgui_set_receive_text(
     const char* text, size_t length) {
     auto& runtime = ImGuiRuntime::instance();
     if (!runtime.initialized_ || GetCurrentThreadId() != runtime.owner_thread_) return;
-    constexpr size_t kReceiveLimit = 64U * 1024U - 1U;
     if (!text || length == 0) {
         runtime.receive_text_.clear();
         runtime.receive_line_offsets_.assign(1, 0);
         return;
     }
-    const size_t bounded_length = (std::min)(length, kReceiveLimit);
+    const size_t bounded_length = (std::min)(length, runtime.receive_limit_);
     runtime.receive_text_.assign(text, bounded_length);
-    // Rescan line starts once per text change (O(n) over the 64 KiB tail) so
+    // Rescan line starts once per text change (O(n) over the receive tail) so
     // the per-frame clipper render indexes lines without re-walking the text.
     std::vector<std::size_t>& offsets = runtime.receive_line_offsets_;
     offsets.clear();

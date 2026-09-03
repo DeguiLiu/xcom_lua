@@ -6,6 +6,7 @@ void xcom_imgui_set_ports(const char* const* names, int count);
 int xcom_imgui_new_frame(void);
 int xcom_imgui_render(void);
 void xcom_imgui_set_receive_text(const char* text, size_t length);
+void xcom_imgui_set_receive_window(size_t bytes);
 void xcom_imgui_set_status(const char* text);
 int xcom_imgui_wndproc(void* hwnd, unsigned int msg, uintptr_t wparam, intptr_t lparam);
 int xcom_imgui_draw_console(char* port, size_t port_capacity, int connected,
@@ -29,7 +30,16 @@ local PORT_CAPACITY = 128
 local SEND_CAPACITY = 4096
 local MULTI_SLOTS = 8
 local MULTI_SLOT_CAPACITY = 512
-local RECEIVE_CAPACITY = 64 * 1024
+-- Receive-tail window.  Default matches the historical fixed 64 KiB view;
+-- the effective value is per-instance (see M.new) because it is configurable
+-- via [display] receive_window_bytes in config.ini.
+local DEFAULT_RECEIVE_CAPACITY = 64 * 1024
+-- Hard floor/ceiling shared with the native side (xcom_imgui_set_receive_window
+-- clamps to the same range): below 16 KiB the log viewport starves; above
+-- 1 MiB the per-frame line-offset rescan and the ImGui text cost grow past
+-- the WARP frame budget.
+local RECEIVE_WINDOW_MIN = 16 * 1024
+local RECEIVE_WINDOW_MAX = 1024 * 1024
 
 local function int1(value)
     return ffi.new("int[1]", value or 0)
@@ -49,9 +59,21 @@ local function index_of(values, value, fallback)
     return fallback or 0
 end
 
+-- Clamp a configured receive-window size to the shared Lua/native range.
+-- Exported so window.lua can normalize the config value once and push the
+-- SAME number into its chunk trimming and this bridge.
+function M.clamp_receive_window(bytes)
+    local n = math.floor(tonumber(bytes) or DEFAULT_RECEIVE_CAPACITY)
+    if n < RECEIVE_WINDOW_MIN then n = RECEIVE_WINDOW_MIN end
+    if n > RECEIVE_WINDOW_MAX then n = RECEIVE_WINDOW_MAX end
+    return n
+end
+
 function M.new(hwnd, cfg)
     if not M.available then return nil end
     if M.available.xcom_imgui_init(hwnd) == 0 then return nil end
+    local receive_capacity = M.clamp_receive_window(
+        cfg and cfg.receive_window_bytes or DEFAULT_RECEIVE_CAPACITY)
     local self = {
         lib = M.available,
         port = ffi.new("char[?]", PORT_CAPACITY),
@@ -82,13 +104,17 @@ function M.new(hwnd, cfg)
         multi_period = int1(1000),
         auto_save = bool1(cfg.auto_save),
         pages = { { text = {}, enabled = {} } },
+        receive_capacity = receive_capacity,
     }
+    -- Push the configured window into the native receive buffer so both
+    -- sides trim to the same tail size.
+    M.available.xcom_imgui_set_receive_window(receive_capacity)
     return setmetatable(self, { __index = M })
 end
 
 function M:set_receive_text(text)
     text = text or ""
-    local n = math.min(#text, RECEIVE_CAPACITY - 1)
+    local n = math.min(#text, (self.receive_capacity or DEFAULT_RECEIVE_CAPACITY) - 1)
     self.lib.xcom_imgui_set_receive_text(text, n)
 end
 
