@@ -110,6 +110,8 @@ public:
     // this edge-triggered flag to follow new data without stealing the
     // user's scroll position on ordinary frames.
     bool receive_dirty_ = false;
+    bool receive_follow_tail_ = true;
+    float receive_scroll_y_ = 0.0f;
     // Byte offset of every line start in receive_text_ (offset 0 included);
     // rescanned by xcom_imgui_set_receive_text and consumed by the receive
     // clipper so per-frame rendering walks only visible lines.
@@ -621,11 +623,20 @@ void TextContextMenu(const char* popup_id, char* buffer, const size_t capacity) 
     // the right-click "Copy all" (a read-only InputText selection is not worth
     // re-introducing the reflow bug for).
     const std::vector<std::size_t>& offsets = runtime.receive_line_offsets_;
-    // Sticky auto-follow: only re-pin while the user is (~1 line) from the
-    // bottom; an upward drag beyond that detaches so the viewer can inspect.
+    // Sticky tail-follow: new data is kept at the bottom by default.  A
+    // deliberate upward wheel/drag detaches the view so history can be read;
+    // returning to the bottom re-enables follow automatically.
     constexpr float kFollowTolerance = 20.0f;
-    const bool was_at_bottom =
-        ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - kFollowTolerance;
+    const float scroll_y = ImGui::GetScrollY();
+    const float scroll_max = ImGui::GetScrollMaxY();
+    const ImGuiIO& io = ImGui::GetIO();
+    const bool hovered = ImGui::IsWindowHovered(ImGuiHoveredFlags_AllowWhenBlockedByActiveItem);
+    if (hovered && io.MouseWheel > 0.0f) runtime.receive_follow_tail_ = false;
+    if (scroll_y < runtime.receive_scroll_y_ - kFollowTolerance && io.MouseWheel == 0.0f) {
+        runtime.receive_follow_tail_ = false;
+    }
+    if (scroll_y >= scroll_max - kFollowTolerance) runtime.receive_follow_tail_ = true;
+    const bool follow_tail = runtime.receive_follow_tail_;
     // Render the log glyphs with the fixed-width data face when available so
     // hex bytes and RX counters line up column-wise (typical serial-monitor
     // look).  Consistent per-line row height also keeps the clipper's line
@@ -647,9 +658,10 @@ void TextContextMenu(const char* popup_id, char* buffer, const size_t capacity) 
             ImGui::TextUnformatted(begin, end);
         }
     }
-    if (receive_changed && was_at_bottom) {
+    if (receive_changed && follow_tail) {
         ImGui::SetScrollY(ImGui::GetScrollMaxY());
     }
+    runtime.receive_scroll_y_ = ImGui::GetScrollY();
     runtime.receive_dirty_ = false;
     // Right-click context menu: the read-only multiline editor doesn't expose
     // one by default, so attach one explicitly.  The popup id is scoped to
@@ -1451,6 +1463,8 @@ extern "C" __declspec(dllexport) void xcom_imgui_set_receive_text(
     if (!text || length == 0) {
         runtime.receive_text_.clear();
         runtime.receive_line_offsets_.assign(1, 0);
+        runtime.receive_follow_tail_ = true;
+        runtime.receive_scroll_y_ = 0.0f;
         runtime.receive_dirty_ = true;
         return;
     }

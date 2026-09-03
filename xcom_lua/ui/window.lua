@@ -673,6 +673,12 @@ function Window:_final_drain()
 end
 
 function Window:on_close()
+    -- WM_CLOSE can arrive more than once (custom button, Alt+F4, or a
+    -- queued system message).  Closing is a one-shot transaction; ignoring
+    -- re-entrant requests prevents duplicate core drains and DestroyWindow
+    -- calls from leaving the message loop alive.
+    if self._closing then return end
+    self._closing = true
     -- Mirrors Python's closeEvent pipeline: stop auto-send, stop the poll
     -- timers (no new data while we drain), drain accepted bytes to the
     -- display, flush the log, then close the port and destroy the window.
@@ -693,7 +699,12 @@ function Window:on_close()
         self.imgui:close()
         self.imgui = nil
     end
-    w.user32.DestroyWindow(self.hwnd)
+    if self.hwnd then
+        w.user32.DestroyWindow(self.hwnd)
+        self.hwnd = nil
+    else
+        w.user32.PostQuitMessage(0)
+    end
 end
 
 -- Persist the current UI state to config.ini (mirrors Python's DebouncedSaver
