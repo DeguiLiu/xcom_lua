@@ -99,6 +99,31 @@
 - **`reserve` 时机**：热路径 vector 反复 clear+push_back 必须配 reserve；估算粒度无需精确（`n/32+2` 对 32 字节平均行宽，过估 2× 无害）。
 - Lua 侧同源优化见"接收显示窗口"节的游标裁剪；GC 按 ≥128 KiB 堆增量触发（勿按"有无输入"，输入密集会饿死收集器、持续流量会过度步进）。
 
+### 绘图代码效率规范（2026-09-04 绘图审查轮）
+
+对全部 13 个绘图函数（Header/WindowButton/IconButton/Toggle/Section/Field/EmptyState/ReceiveToolbar/ReceiveContent/TransmitContent/ConnectionContent/Footer/GridComboField）审计后的结论与规则：
+
+**已固化的正确模式（新绘图代码必须沿用）：**
+
+- **图标/按钮/徽章一律 `draw_list` 直绘**（AddRectFilled/AddLine/AddCircleFilled/AddText），不走 ImGui 控件 + 文本布局；`WindowButton`/`IconButton`/`Toggle` 是范本。
+- **文本用 `string_view` + `%.*s` / `TextUnformatted`**，零拷贝零临时 string；唯一例外是剪贴板/选中复制（`substr` 构造临时是必要的）。
+- **style/child 栈全部 RAII**（`ScopedAction`），任何早退/异常路径都不会泄漏栈项。
+- **描述表驱动**（`ComboSpec`/`ToggleSpec` + `std::array` + `RenderToggles` 模板），控件循环零重复代码。
+- **Footer 计数用 `sprintf_s` 栈缓冲**（`char[48]`），不构造 std::string。
+
+**每帧文本测量规则（本轮核心产出）：**
+
+- **固定字面量的宽度是常量**——`CalcTextSize("XCOM")`、ONLINE/OFFLINE 徽章、Footer 的 "Ready"/"Open a port" 这类每帧重测纯属浪费（字形查找循环）。缓存模式：函数级 `static`，**以 `ImFont*` 指针为 key**——bridge 重启会 `DestroyContext` 重建字体对象，指针变化即失效重测。字面量两态的用 `float cache[2]` 按状态索引。
+- **动态文本（RX/TX 计数）**：字符串变化才重测宽度（`strcmp` 比字形循环便宜几个量级）；格式化本身每帧照做（数字常变）。
+- **指针缓存悬垂陷阱**：`ComboSpec` 存调用方 `int*`——**禁止**做函数级 static 缓存（Lua bridge 重建传入新地址，旧指针悬垂）。类似地，任何含调用方指针的描述表都只能每帧栈构造（5 个 40 字节结构体的代价可忽略，注释已记录在 `draw_console`）。
+
+**有意不做的（记录决策）：**
+
+- `ReceiveToolbar` 的 4 行单列 `BeginTable` 比纯 cursor 定位重，但重构影响布局，风险收益比不划算——除非未来证明它是瓶颈。
+- `EmptyState` 的 `CalcTextSize` 仅空态冷路径执行，不缓存。
+
+本轮收益量级诚实说明：单帧 ~5-10 μs（省固定文本测量），价值在规则固化与陷阱记录，不在数字。
+
 ### 测量方法论（防再踩坑）
 
 - **纯 spin 探针会高估**：`require("luv")` 的 54 MB 开销只在 libuv 事件循环主动运行时存在；主程序路径的 `uv.run("nowait")` 立即返回，从不进入。判断某依赖的内存代价必须**在实际宿主程序**里量（A/B 两个 EXE 跑同一 main.lua）。
