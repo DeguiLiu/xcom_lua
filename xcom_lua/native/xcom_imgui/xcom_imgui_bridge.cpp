@@ -655,22 +655,18 @@ void TextContextMenu(const char* popup_id, char* buffer, const size_t capacity) 
     if (content_height < available_height) {
         ImGui::SetCursorPosY(ImGui::GetCursorPosY() + available_height - content_height);
     }
-    ImGuiListClipper clipper;
-    clipper.Begin(static_cast<int>(offsets.size()));
-    while (clipper.Step()) {
-        for (int ln = clipper.DisplayStart; ln < clipper.DisplayEnd; ++ln) {
-            const auto line = static_cast<std::size_t>(ln);
-            const char* const begin = runtime.receive_text_.data() + offsets[line];
-            const char* const end = line + 1U < offsets.size()
-                ? runtime.receive_text_.data() + offsets[line + 1U]
-                : runtime.receive_text_.data() + runtime.receive_text_.size();
-            ImGui::TextUnformatted(begin, end);
-        }
-    }
-    // Anchor the viewport after the clipper has submitted its full logical
-    // height.  This must run on every tail-follow frame (not only on the
-    // mutation frame), because a rolling 64 KiB buffer can change its maximum
-    // scroll range while WARP is still presenting the previous frame.
+    // Render the bounded tail as one multi-line item.  ImGui's clipper cannot
+    // reliably infer a row height when each item itself contains a trailing
+    // newline; it then submits only the first few rows and leaves the rest of
+    // the panel blank.  The receive window is capped at 64 KiB, so one
+    // TextUnformatted call is both predictable and inexpensive at the 10 FPS
+    // data cadence.
+    const char* const text_begin = runtime.receive_text_.data();
+    const char* const text_end = text_begin + runtime.receive_text_.size();
+    ImGui::TextUnformatted(text_begin, text_end);
+    // Anchor the viewport after the complete text item has established the
+    // true scroll range.  This runs on every tail-follow frame so rolling
+    // buffer updates cannot leave the view one page behind.
     if (follow_tail) {
         ImGui::SetScrollY(ImGui::GetScrollMaxY());
     }
