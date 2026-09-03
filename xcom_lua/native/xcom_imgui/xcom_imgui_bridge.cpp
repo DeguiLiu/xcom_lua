@@ -602,7 +602,7 @@ void TextContextMenu(const char* popup_id, char* buffer, const size_t capacity) 
     ImGui::PushStyleColor(ImGuiCol_Border, rgb(kPanelBorder, 0.78f));
     const auto receive = Panel("##receive",
                                ImVec2(0, layout.receive_height == 0.0f ? -transmit_block : layout.receive_height),
-                               true, ImGuiWindowFlags_AlwaysVerticalScrollbar,
+                               true, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse,
                                rgb(palette::kSurfaceLight));
     ImGui::PopStyleColor();
     if (runtime.receive_text_.empty()) {
@@ -610,9 +610,9 @@ void TextContextMenu(const char* popup_id, char* buffer, const size_t capacity) 
         runtime.receive_dirty_ = false;
         return actions;
     }
-    // Render the complete bounded tail as wrapped text.  TextWrapped keeps
-    // long serial lines inside the viewport (no horizontal scrolling) while
-    // the child window supplies the native vertical scrollbar and wheel input.
+    // Use ImGui's multiline editor as a read-only log viewport.  Unlike a
+    // single TextWrapped item, it computes the complete line/scroll geometry
+    // for a 64 KiB tail and exposes reliable wheel, drag and text selection.
     // Sticky tail-follow: new data is kept at the bottom by default.  A
     // deliberate upward wheel/drag detaches the view so history can be read;
     // returning to the bottom re-enables follow automatically.
@@ -636,9 +636,12 @@ void TextContextMenu(const char* popup_id, char* buffer, const size_t capacity) 
     const auto pop_mono = ScopedAction([mono_ok] {
         if (mono_ok) ImGui::PopFont();
     });
-    const char* const text_begin = runtime.receive_text_.data();
-    const char* const text_end = text_begin + runtime.receive_text_.size();
-    ImGui::TextWrapped("%.*s", static_cast<int>(text_end - text_begin), text_begin);
+    ImGuiInputTextFlags log_flags = ImGuiInputTextFlags_ReadOnly |
+        ImGuiInputTextFlags_NoHorizontalScroll;
+    const ImVec2 log_size(-1.0f, ImGui::GetContentRegionAvail().y);
+    ImGui::InputTextMultiline("##receive_log", runtime.receive_text_.data(),
+                              runtime.receive_text_.capacity() + 1U,
+                              log_size, log_flags);
     // Anchor the viewport after the complete text item has established the
     // true scroll range.  This runs on every tail-follow frame so rolling
     // buffer updates cannot leave the view one page behind.
