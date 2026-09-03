@@ -610,18 +610,9 @@ void TextContextMenu(const char* popup_id, char* buffer, const size_t capacity) 
         runtime.receive_dirty_ = false;
         return actions;
     }
-    // Streaming receive log: render one logical line at a time via
-    // ImGuiListClipper so the per-frame cost is O(viewport), NOT a reflow of
-    // the whole 64 KiB buffer.  Using ImGui::InputTextMultiline here caused
-    // two problems with a live tail appended every 10-12 ms:
-    //   (1) it re-lays-out *all* lines on each set_receive_text, so lines
-    //       overlapped / tore as the buffer grew; and
-    //   (2) its internal cursor/scroll tracking fought the auto-follow.
-    // A plain TextUnformatted per line keeps row height constant at one glyph
-    // and makes the log rock-solid while data streams.  Copy is exposed through
-    // the right-click "Copy all" (a read-only InputText selection is not worth
-    // re-introducing the reflow bug for).
-    const std::vector<std::size_t>& offsets = runtime.receive_line_offsets_;
+    // Render the complete bounded tail as wrapped text.  TextWrapped keeps
+    // long serial lines inside the viewport (no horizontal scrolling) while
+    // the child window supplies the native vertical scrollbar and wheel input.
     // Sticky tail-follow: new data is kept at the bottom by default.  A
     // deliberate upward wheel/drag detaches the view so history can be read;
     // returning to the bottom re-enables follow automatically.
@@ -645,25 +636,9 @@ void TextContextMenu(const char* popup_id, char* buffer, const size_t capacity) 
     const auto pop_mono = ScopedAction([mono_ok] {
         if (mono_ok) ImGui::PopFont();
     });
-    // Keep short logs visually anchored to the receive panel's lower edge.
-    // Once the logical content exceeds the viewport, the clipper supplies the
-    // full scroll range and the tail-follow block below keeps the newest line
-    // at ScrollMaxY instead.
-    const float line_height = ImGui::GetTextLineHeightWithSpacing();
-    const float content_height = line_height * static_cast<float>(offsets.size());
-    const float available_height = ImGui::GetContentRegionAvail().y;
-    if (content_height < available_height) {
-        ImGui::SetCursorPosY(ImGui::GetCursorPosY() + available_height - content_height);
-    }
-    // Render the bounded tail as one multi-line item.  ImGui's clipper cannot
-    // reliably infer a row height when each item itself contains a trailing
-    // newline; it then submits only the first few rows and leaves the rest of
-    // the panel blank.  The receive window is capped at 64 KiB, so one
-    // TextUnformatted call is both predictable and inexpensive at the 10 FPS
-    // data cadence.
     const char* const text_begin = runtime.receive_text_.data();
     const char* const text_end = text_begin + runtime.receive_text_.size();
-    ImGui::TextUnformatted(text_begin, text_end);
+    ImGui::TextWrapped("%.*s", static_cast<int>(text_end - text_begin), text_begin);
     // Anchor the viewport after the complete text item has established the
     // true scroll range.  This runs on every tail-follow frame so rolling
     // buffer updates cannot leave the view one page behind.
