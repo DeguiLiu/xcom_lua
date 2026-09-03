@@ -474,12 +474,23 @@ void Header(int& actions, const bool connected) {
                        ImVec2(position.x + kBrandInset + 16.0f, brand_center_y + 10.0f), inverse, 1.4f);
     ImFont* const title_font = runtime.heading_font_ ? runtime.heading_font_ : ImGui::GetFont();
     const float title_size = 17.0f;
+    // "XCOM" at a fixed size has a constant width — measure once per font
+    // (function-local static keyed on the font/size pair) instead of every
+    // frame through the glyph-lookup loop.
+    static float cached_title_width = -1.0f;
+    static const ImFont* cached_title_font = nullptr;
+    static float cached_title_size = 0.0f;
+    if (cached_title_font != title_font || cached_title_size != title_size ||
+        cached_title_width < 0.0f) {
+        cached_title_font = title_font;
+        cached_title_size = title_size;
+        cached_title_width = title_font->CalcTextSizeA(
+            title_size, FLT_MAX, 0.0f, "XCOM").x;
+    }
     const float title_y = brand_center_y - title_size * 0.5f + 3.0f;
     const ImVec2 title_pos(position.x + kBrandInset + 34.0f, title_y);
     draw_list->AddText(title_font, title_size, title_pos, inverse, "XCOM");
-    const float title_width = title_font->CalcTextSizeA(
-        title_size, FLT_MAX, 0.0f, "XCOM").x;
-    const float divider_x = title_pos.x + title_width + 12.0f;
+    const float divider_x = title_pos.x + cached_title_width + 12.0f;
     draw_list->AddLine(ImVec2(divider_x, brand_center_y - 8.0f),
                        ImVec2(divider_x, brand_center_y + 8.0f),
                        ImGui::GetColorU32(rgb(palette::kHeaderSubtitle, 0.45f)), 1.0f);
@@ -489,7 +500,21 @@ void Header(int& actions, const bool connected) {
                        ImGui::GetColorU32(rgb(palette::kHeaderSubtitle)), "SERIAL CONSOLE");
     const char* const status = connected ? "ONLINE" : "OFFLINE";
     const float button_group_start = ImGui::GetWindowWidth() - 108.0f;
-    const float status_width = ImGui::CalcTextSize(status).x + 32.0f;
+    // Both status strings are fixed literals: cache their widths, keyed on
+    // the current default font (a bridge restart rebuilds the ImGui context
+    // and hands out a different ImFont*, invalidating the cache).
+    static float status_width_cache[2] = {-1.0f, -1.0f};
+    static const ImFont* status_width_font = nullptr;
+    if (status_width_font != ImGui::GetFont()) {
+        status_width_font = ImGui::GetFont();
+        status_width_cache[0] = -1.0f;
+        status_width_cache[1] = -1.0f;
+    }
+    const int status_idx = connected ? 1 : 0;
+    if (status_width_cache[status_idx] < 0.0f) {
+        status_width_cache[status_idx] = ImGui::CalcTextSize(status).x;
+    }
+    const float status_width = status_width_cache[status_idx] + 32.0f;
     ImGui::SetCursorPos(ImVec2(button_group_start - status_width - 12.0f, 15.0f));
     const ImVec2 status_origin = ImGui::GetCursorScreenPos();
     ImGui::GetWindowDrawList()->AddCircleFilled(
@@ -1098,13 +1123,43 @@ void Footer(const bool connected, const int rx_bytes, const int tx_bytes) {
     char counters[48]{};
     if (connected) sprintf_s(counters, "RX %d   TX %d", rx_bytes, tx_bytes);
     else strcpy_s(counters, "RX --   TX --");
-    const float counters_width = ImGui::CalcTextSize(counters).x;
+    // Re-measure the counter text only when its bytes changed (data frames
+    // at ~10 fps re-format every frame but the string is often identical
+    // between them, e.g. while paused or idle).  Keyed on the font like the
+    // header caches above.
+    static float cached_counters_width = -1.0f;
+    static char cached_counters[48]{};
+    static const ImFont* counters_font = nullptr;
+    const ImFont* const current_font = ImGui::GetFont();
+    if (counters_font != current_font) {
+        counters_font = current_font;
+        cached_counters_width = -1.0f;
+        cached_counters[0] = '\0';
+    }
+    if (cached_counters_width < 0.0f || strcmp(cached_counters, counters) != 0) {
+        cached_counters_width = ImGui::CalcTextSize(counters).x;
+        strcpy_s(cached_counters, counters);
+    }
+    const float counters_width = cached_counters_width;
     const float counter_x = (std::max)(content_boundary - counters_width - 18.0f,
                                        (state_max.x - origin.x) + 24.0f);
     draw_list->AddText(ImVec2(origin.x + counter_x, baseline),
                        ImGui::GetColorU32(rgb(palette::kTextMuted)), counters);
+    // The two hint literals are fixed; cache each width, font-keyed.
     const std::string_view hint = connected ? "Ready" : "Open a port";
-    const float hint_width = ImGui::CalcTextSize(hint.data(), hint.data() + hint.size()).x;
+    static float hint_width_cache[2] = {-1.0f, -1.0f};
+    static const ImFont* hint_width_font = nullptr;
+    if (hint_width_font != current_font) {
+        hint_width_font = current_font;
+        hint_width_cache[0] = -1.0f;
+        hint_width_cache[1] = -1.0f;
+    }
+    const int hint_idx = connected ? 1 : 0;
+    if (hint_width_cache[hint_idx] < 0.0f) {
+        hint_width_cache[hint_idx] = ImGui::CalcTextSize(
+            hint.data(), hint.data() + hint.size()).x;
+    }
+    const float hint_width = hint_width_cache[hint_idx];
     draw_list->AddText(ImVec2(origin.x + (std::max)(footer_width - hint_width - 14.0f,
                                                      content_boundary + 8.0f), baseline),
                        ImGui::GetColorU32(rgb(palette::kTextMuted)), hint.data(),
@@ -1498,6 +1553,10 @@ extern "C" __declspec(dllexport) int xcom_imgui_draw_console(
         ui::Header(actions, connected != 0);
         ImGui::SetCursorPosY(layout.header_height);
         ImGui::SetCursorPosX(layout.window_padding);
+        // NOTE: deliberately NOT a function-local static — ComboSpec stores
+        // the caller's int* pointers, and a rebuilt Lua bridge hands new
+        // addresses in; caching would dangle.  Five small stack structs per
+        // frame are negligible against that hazard.
         const std::array<ui::ComboSpec, 5> serial_fields{{
             {"##baud", "BAUD", baud, kBaudItems, static_cast<int>(std::size(kBaudItems))},
             {"##data_bits", "DATA", data_bits, kDataItems, static_cast<int>(std::size(kDataItems))},
