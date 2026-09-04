@@ -1035,21 +1035,21 @@ function Window:_flush_imgui_receive()
     local chunks = self._imgui_receive_chunks
     local cursor = self._imgui_receive_cursor or 1
     local window = self._receive_window or 65535
-    local tail
+    -- The flush APPENDS the newly drained batches to the retained tail from
+    -- the previous flush, then trims the combined buffer to the window.
+    -- (Replacing the buffer with just the new batches — the old behaviour —
+    -- made every flush discard all prior history, so the viewport only ever
+    -- showed the last few hundred bytes of an active stream.)
+    local combined
     local count = #chunks - cursor + 1
     if count <= 0 then
-        tail = ""
+        combined = self._imgui_receive or ""
     elseif count == 1 then
-        local only = chunks[cursor]
-        -- A single batch larger than the window keeps only its last bytes.
-        tail = #only > window and only:sub(-window) or only
+        combined = (self._imgui_receive or "") .. chunks[cursor]
     else
-        tail = table.concat(chunks, "", cursor)
-        -- The concat may still exceed the window if the cursor only retires
-        -- WHOLE chunks (one huge chunk in the middle survives whole-chunk
-        -- retirement); trim once.
-        if #tail > window then tail = tail:sub(-window) end
+        combined = (self._imgui_receive or "") .. table.concat(chunks, "", cursor)
     end
+    local tail = #combined > window and combined:sub(-window) or combined
     self._imgui_receive = tail
     self._imgui_receive_chunks = {}
     self._imgui_receive_cursor = 1

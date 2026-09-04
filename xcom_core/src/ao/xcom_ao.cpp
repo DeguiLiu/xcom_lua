@@ -69,11 +69,18 @@ void write_three_digits(std::uint8_t* out, std::uint16_t value) noexcept
 // per-iteration hex/text decision at compile time (coact-style profile
 // dispatch) while the caller picks the concrete instantiation from the runtime
 // `hex_view` bit exactly once per block.
+// `strip_state` is the Dispatcher-owned ANSI machine carried across blocks so a
+// sequence split over two receive blocks still resolves. It is unused by the hex
+// instantiation (byte-faithful path), which is why it is a reference parameter
+// rather than a member of the free function.
 template <bool Hex>
 uint32_t format_payload(uint8_t* out, uint32_t budget,
-                        const uint8_t* bytes, uint32_t len) noexcept
+                        const uint8_t* bytes, uint32_t len,
+                        std::uint8_t& strip_state, CoreCtx* core) noexcept
 {
     if constexpr (Hex) {
+        (void)strip_state;
+        (void)core;
         // Each input byte expands to "AA BB " (3 chars). cap_hex reproduces the
         // exact stopping point of the pre-refactor bound
         // ((budget-4)/3 groups, then the trailing space is dropped), so the
@@ -97,28 +104,104 @@ uint32_t format_payload(uint8_t* out, uint32_t budget,
     else {
         // Text view transfers the borrowed payload into its owned display slot.
         //
-        // ImGui's InputTextMultiline treats ONLY '\n' as a line break
-        // (STB_TEXTEDIT_NEWLINE='\n'; layout scans with ImMemchr(line,'\n')).
-        // Serial devices emit CRLF line endings, and a raw '\r' is rendered as
-        // a control glyph that corrupts the log's line layout and scrolling.
-        // Normalise CRLF -> LF (and a lone CR -> LF) so every line ends on a
-        // boundary ImGui understands.  NOTE: this is the shared display buffer,
-        // so the auto-save log (which drains the same buffer) records the
-        // normalised line endings too; the hex view is the byte-faithful path.
+        // Two normalisations for the ImGui log viewport:
+        //  1. CRLF -> LF (a lone CR too): ImGui only treats '\n' as a line
+        //     break; a raw '\r' renders as a control glyph and corrupts the
+        //     row metric.
+        //  2. ANSI escape sequences (CSI/OSC/SGR...) and stray C0 control
+        //     bytes are stripped: many devices (RT-Thread msh etc.) emit
+        //     colour codes, and the ImGui log has no colour semantics —
+        //     unstripped they painted the whole viewport dark.  The hex view
+        //     is the byte-faithful path for debugging exactly such output.
+        //
+        // Per-line timestamp injection (lazy, not at block boundaries):
+        //  * The serial driver can deliver any read() size, so a logical line
+        //    from the device often spans multiple rx blocks.  Inserting a
+        //    timestamp at every block boundary broke lines mid-word (e.g. the
+        //    `mkfs` line was chopped into `m` + `[ts] kfs ...`).
+        //  * We now emit the timestamp exactly at the first visible byte of
+        //    each actual line, using the persistent at_line_start state.
+        //    Mid-line block continuations carry no prefix and no separator —
+        //    the line's timestamp was already emitted when it began (possibly
+        //    in a previous block).  This is the SSCOM-standard model and what
+        //    the test_ts_midline test pins down.
+        //  * The state lives in CoreCtx so a sequence split across blocks
+        //    resolves correctly, and the auto-save log (draining the same
+        //    buffer) records the same normalised text.
+        (void)core;  // core is the live source of at_line_start / strip_state
         const uint32_t n = (len < budget) ? len : budget;
         uint32_t written = 0U;
+        bool at_line_start = core->display_at_line_start;
         for (uint32_t i = 0U; i < n; ++i) {
             const uint8_t b = bytes[i];
-            if (b == static_cast<uint8_t>('\r')) {
-                // CRLF -> single LF; lone CR -> LF.
-                out[written++] = static_cast<uint8_t>('\n');
-                if (i + 1U < n && bytes[i + 1U] == static_cast<uint8_t>('\n')) {
-                    ++i;  // consume the paired LF
+            if (strip_state != 0U) {
+                // Inside an escape sequence.
+                if (strip_state == 1U) {
+                    // Saw ESC: expect '[' (CSI) or ']' (OSC) else terminate.
+                    if (b == static_cast<uint8_t>('[')) {
+                        strip_state = 2U;
+                    } else if (b == static_cast<uint8_t>(']')) {
+                        strip_state = 3U;
+                    } else if (b >= 0x40U && b <= 0x5FU) {
+                        strip_state = 0U;  // two-char escape, done
+                    } else {
+                        strip_state = 0U;  // lone ESC, swallow
+                    }
+                } else if (strip_state == 3U) {
+                    // OSC: terminated by BEL (0x07) or ST (ESC \).
+                    if (b == 0x07U) strip_state = 0U;
+                    else if (b == 0x1BU) strip_state = 4U;
+                } else if (strip_state == 4U) {
+                    strip_state = 0U;  // char after OSC's ESC: done
+                } else {
+                    // CSI: 0x30..0x3F params, 0x20..0x2F intermediates,
+                    // final byte 0x40..0x7E ends the sequence.
+                    if (b >= 0x40U && b <= 0x7EU) strip_state = 0U;
                 }
-            } else {
-                out[written++] = b;
+                continue;
             }
+            if (b == 0x1BU) {  // ESC enters a sequence (consumed)
+                strip_state = 1U;
+                continue;
+            }
+            // Classify the byte.  Visible bytes: LF (line break), TAB, or any
+            // printable ASCII / UTF-8 continuation.  Everything else (BEL, BS,
+            // VT, FF, SO, SI, etc.) is dropped silently.
+            const bool is_cr = b == static_cast<uint8_t>('\r');
+            const bool is_lf = b == static_cast<uint8_t>('\n');
+            const bool is_tab = b == static_cast<uint8_t>('\t');
+            const bool is_printable = b >= 0x20U;
+            if (!is_cr && !is_lf && !is_tab && !is_printable) {
+                continue;
+            }
+            // Determine what byte to write and whether this is a line boundary.
+            uint8_t out_byte = b;
+            bool break_line = is_cr || is_lf;
+            if (is_cr) {
+                out_byte = static_cast<uint8_t>('\n');
+                // CRLF -> single LF; consume the paired LF if it follows.
+                if (i + 1U < n && bytes[i + 1U] == static_cast<uint8_t>('\n')) {
+                    ++i;
+                }
+            }
+            // Lazy timestamp: emit it just before the first visible byte of a
+            // line.  No prefix is written for empty lines (a stream of bare
+            // LFs stays quiet), and the state survives block boundaries.
+            if (!break_line && at_line_start &&
+                budget - written >= kTimestampPrefixBytes) {
+                written += rx_timestamp_prefix(core, out + written);
+            }
+            if (written >= budget) {
+                // No room for the byte; subsequent bytes must be dropped too.
+                // Persist the state and stop — the block boundary will resume
+                // the line in the next batch with its existing prefix.
+                core->display_at_line_start = !break_line;
+                break;
+            }
+            out[written++] = out_byte;
+            at_line_start = break_line;
         }
+        core->display_at_line_start = at_line_start;
         return written;
     }
 }
@@ -180,29 +263,45 @@ bool rx_format_block(RxCtx* self, const uint8_t* bytes, uint32_t len)
     }
 
     uint32_t written = 0U;
-    // A receive callback may split a logical line across blocks.  Keep the
-    // timestamp at a line boundary by inserting one separator when the prior
-    // block did not end in CR/LF.  The state is Dispatcher-owned, so no lock
-    // or atomic is needed on this hot formatting path.
-    const bool timestamped = core->timestamp.load(std::memory_order_acquire) != 0U;
-    const bool needs_separator = timestamped && !core->display_at_line_start;
-    if (needs_separator) {
-        out[written++] = static_cast<uint8_t>('\n');
+    // A receive callback may split a logical line across blocks.  The hex view
+    // keeps a per-block separator+prefix (its output never ends in '\n', so a
+    // block boundary is naturally a new visual line).  The text view instead
+    // emits timestamps lazily inside format_payload<false> at each actual line
+    // start, so a block boundary mid-line does NOT inject a spurious '\n' +
+    // prefix (the previous behaviour chopped "mkfs   - format disk..." into
+    // "m" + "[ts] kfs   - format disk...").  display_at_line_start is owned
+    // by CoreCtx and updated by the text branch on this path; the hex branch
+    // keeps its own update.
+    const bool hex = core->hex_view.load(std::memory_order_acquire) != 0U;
+    if (hex) {
+        const bool timestamped = core->timestamp.load(std::memory_order_acquire) != 0U;
+        const bool needs_separator = timestamped && !core->display_at_line_start;
+        if (needs_separator) {
+            out[written++] = static_cast<uint8_t>('\n');
+        }
+        const uint32_t ts = timestamped
+            ? rx_timestamp_prefix(core, out + written) : 0U;
+        written += ts;
+        const uint32_t budget = kDisplayBatchBytes - written;
+        const uint32_t payload_written =
+            format_payload<true>(out + written, budget, bytes, len,
+                                 core->rx_strip_state, core);
+        written += payload_written;
+        if (payload_written > 0U) {
+            const uint8_t last = out[written - 1U];
+            core->display_at_line_start =
+                last == static_cast<uint8_t>('\n') ||
+                last == static_cast<uint8_t>('\r');
+        }
     }
-    const uint32_t ts = timestamped
-        ? rx_timestamp_prefix(core, out + written) : 0U;
-    written += ts;
-    const uint32_t budget = kDisplayBatchBytes - written;
-    // Compile-time specialize the hex vs text formatter on the runtime view
-    // bit; the branch is resolved once per block, not per input byte.
-    const uint32_t payload_written = (core->hex_view.load(std::memory_order_acquire) != 0U)
-        ? format_payload<true>(out + written, budget, bytes, len)
-        : format_payload<false>(out + written, budget, bytes, len);
-    written += payload_written;
-    if (payload_written > 0U) {
-        const uint8_t last = out[written - 1U];
-        core->display_at_line_start = last == static_cast<uint8_t>('\n') ||
-                                      last == static_cast<uint8_t>('\r');
+    else {
+        // Text view: format_payload<false> owns the per-line timestamp
+        // emission and display_at_line_start state.  No caller-side prefix or
+        // separator is needed.
+        const uint32_t payload_written =
+            format_payload<false>(out, kDisplayBatchBytes, bytes, len,
+                                  core->rx_strip_state, core);
+        written = payload_written;
     }
 
     if (written == 0U) {
@@ -437,6 +536,7 @@ void serial_do_open(SerialCtx& ctx, const coact::Event&) noexcept
     core->generation.store(core->open_generation.load(std::memory_order_relaxed),
                            std::memory_order_release);
     core->display_at_line_start = true;
+    core->rx_strip_state = 0U;
     core->port_state.store(XCOM_PORT_OPEN, std::memory_order_release);
     core->diag_emit(0U, static_cast<uint16_t>(DiagEvent::kOpenOk),
                     core->cfg_baud, core->generation.load(
@@ -454,6 +554,7 @@ void serial_do_close(SerialCtx& ctx, const coact::Event&) noexcept
     }
     core->generation.fetch_add(1U, std::memory_order_relaxed);
     core->display_at_line_start = true;
+    core->rx_strip_state = 0U;
     core->port_state.store(XCOM_PORT_CLOSED, std::memory_order_release);
     core->diag_emit(0U, static_cast<uint16_t>(DiagEvent::kCloseOk),
                     core->generation.load(std::memory_order_relaxed),

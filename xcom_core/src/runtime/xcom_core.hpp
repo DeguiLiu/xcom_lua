@@ -541,6 +541,12 @@ struct CoreCtx {
     // a logical line across blocks; timestamps must never be inserted in the
     // middle of that line.
     bool display_at_line_start = true;
+    // Dispatcher-owned ANSI-strip state for the text view (rx_format_block).
+    // 0 = outside a sequence, 1 = saw ESC, 2 = inside CSI, 3 = inside OSC,
+    // 4 = ESC inside OSC (ST terminator).  Persists across blocks so an
+    // escape split over two receive callbacks still resolves; reset on
+    // open/close alongside display_at_line_start.
+    std::uint8_t rx_strip_state = 0U;
 
     // AutoTickGate: the template itself is owned by AutoSendAo after a typed
     // coact event transfers its TxBlock. 1 means a tick is queued/in flight.
