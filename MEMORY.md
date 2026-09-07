@@ -161,3 +161,70 @@
 - `xcom_core/framework/coact/include/coact/policy.hpp`
 - `xcom_lua/native/xcom_imgui/xcom_imgui_bridge.cpp`
 - `xcom_lua/native/xcom_imgui/layout.toml`
+
+## 参考与依赖资料索引（third_party/ + ref/）
+
+> 本节是 `third_party/README.md` 与 `ref/README.md` 的要义索引，供后续协同不迷失。
+
+### third_party/README.md —— vendored 依赖地图
+
+- **结构分两半**（README:9-12）：
+  - GUI/native（编入 `xcom_imgui.dll`）：`imgui*`、`cimgui*`、`LuaJIT-ImGui`、`xcom_imgui` —— C/C++，LuaJIT 经 FFI 进 DLL。
+  - Pure Lua（`require` 直接用）：`openresty-lua`、`lua51-libs`。
+- **实际被 CMake 编入 DLL 的是哪一个 ImGui？**：⚠️ README 第 26-31 行描述的「imgui-docking 走 cimgui + LuaJIT-ImGui」**与实际不符 / 过时**。实测 `xcom_lua/native/xcom_imgui/CMakeLists.txt:7` `IMGUI_ROOT=third_party/xcom_imgui/imgui`，编译的是 **Dear ImGui 1.93.0 WIP 直连**（`imgui.cpp/_draw/_tables/_widgets + imgui_impl_win32 + imgui_impl_dx11`），不走 cimgui。`third_party/xcom_imgui/` 现有 `imgui/ + cimgui/ + implot/ + LICENSE.txt`。**改字体/主题/绘图 API 参考这个 1.93 WIP 源码树，勿照 LICENSE 里旧 docking 版。**
+- `xcom_imgui/` 是项目自有层（README:69-78）——本项目直接就地编辑的 UI 桥。
+- `openresty-lua`：A 级可用（`jit/*`、`resty/lrucache`、`resty/iconv` 已 patch）；`resty/md5,sha,aes` 需 OpenSSL FFI（B 级）；已配 `libiconv-2.dll` 于 runtime（改 `xcom_client/runtime`？注意本项目挂在 `xcom_lua/runtime/` 下）。测试 `tests/test_openresty_lua.lua`、`tests/test_iconv.lua`。
+- `lua51-libs`：**禁 `stdlib-ext/*`（污染全局）**则用 Penlight `pl.stringx/tablex/utils`。测试 `tests/test_lua51-libs.lua`。
+- 缺 `.dll` 引用（lfs/luasocket/lpeg）需自行 FFI 或打包 LuaJIT 2.1 ABI 版（README:189-192）。
+
+### ref/ —— 项目本地参考源码 + 依赖副本
+
+`ref/README.md` 把 40+ 项按可参考性分为 6 梯队。**总原则：先读速查表区（第 283-305 行）选项目，再看各梯队注释。** 参考文档产出在 `xcom_lua/docs/`（多为本轮 agent 成果）：
+
+- **直接对标**：`llcom/`（README 说 Lua+ImGui —— **纠错**：实为 WPF+C#/XLua，非 ImGui，只可借鉴架构/API 思想）、`SCOMMV23/`（SSCOM V2.3 原始 VC++）。
+- **核心 vendored**：`imgui/`、`implot/+implot_demos/`、`luajitImGui/`、`imgui-filedialog/`、`ImHex/`。
+- **UI 参考**：`edgedepth-terminal/`（60 FPS 多面板 ImGui，最像咱接收区；`docs/imhex-ui-reference.md`、`docs/imgui-patterns-reference.md` 已整）、`SDRPlusPlus/`、`amodemGUI/`（⚠️只含 Linux 二进制无源码，价值低）、`uscope/`、`tracy/`（性能基准）。
+- 参考用法：新增参照项目时用 `curl tarball`（README:311-317 缓存 zip 于 `ref/zip`，可清理）。
+- **陷阱**：`AXIOM-Remote` 默认分支 `dev`；`cycloid/furnace` tarball 含 symlink 会被 Windows 跳过；大项目体积多为图标/资源而非源码。
+
+> 记录时点（2026-09-05）：`ref/` 已含 3 位 agent 产出的 12 份 `xcom_lua/docs/*reference*.md`，见 `ui-redesign-requirements.md` 第 5 节图表。
+
+### 本轮（第 3 轮，Lua 脚本系统）更新
+
+- **ImPlot v1.1 WIP 已克隆**至 `third_party/xcom_imgui/implot/`（git clone master，与 ImGui 1.93 WIP 同代）。API 要点：v1.0 起删除 `SetNextLineStyle` 系，改用 `ImPlotSpec{LineColor, Offset, Stride...}`（implot.h:517-606）；`BeginPlot(title_id, size, flags)`（:769）；`PlotLine(label, xs, ys, count, spec)`（:992）；`DragLineX/TagX/Annotation`（:1082-1090）。集成路径见 `docs/imgui-patterns-reference.md` §7 + `docs/implot-demos-reference.md` §3（bridge.cpp 追加骨架 + Lua 推送封装，时间戳必须用 `uv.now()` 而非 DeltaTime 累加——被动 16-100ms 帧率下会欠采样）。
+- **新增 5 份 agent 研究文档**（`xcom_lua/docs/`）：`imgui-patterns-reference.md`（v2，官方 examples+demo 模式，含"DX11 后端已支持 RendererHasTextures 动态字体、加中文可不传 ranges"的发现）、`imhex-patterns-reference.md`（8 节 97 处行号，采纳清单：三层绘制高亮/颜色缓存失效/TextFormattedSelectable；不采纳：8000 行自绘 TextEditor、View 注册树）、`implot-demos-reference.md`（官方玩具应用集分析：spectrogram 的 view_t 追尾状态机、v1.1 API 改写对照表）、`fontstudio-uscope-reference.md`（P1：CJK ranges 补 Japanese+假名段 0x3040-0x30FF；WaveEdit 自适应网格/2 的幂缩放吸附）、`ui-redesign-requirements.md`（第 3 轮需求全记录）。
+- **CJK 字体现状**：bridge.cpp 已用 `GetGlyphRangesChineseSimplifiedCommon` + msyh.ttc MergeMode；**待补** Japanese 表 + 假名段（SJIS 假名流显示 `?` 的修复，fontstudio 研究的 P1）。
+- **charset 转码双保险**：`core/charset.lua`（FFI 直调 MultiByteToWideChar，支持跨批 DBCS 位置感知挂起 + UTF-16 代理对）为主；`third_party/openresty-lua/lualib/resty/iconv.lua`（已 patch，runtime 有 libiconv-2.dll）为备选（跨平台/更多编码时切换）。
+
+### 本轮（第 4 轮：1.png 控件深抠 ×5 + UI 观感对齐核心决策）
+> 视觉基准 = `pic/1.png`（1802×1291 串口浅色工具），Read 看 PNG=Unsupported，全部用 PIL 逐像素。五份像素 doc 齐（`xcom_lua/docs/`）：`1png-control-buttons.md`(A) / `1png-input-select.md`(B) / `1png-icons.md`(C) / `1png-separators-status-font.md`(D) / `1png-sendzone.md`(E)。
+- **D/E/A 主体是负性结论**（1.png 无实心钮/大圆角卡/ONLINE-OFFLINE pill/圆点徽章/✓ 复选/底部发送坞-编辑器-分页-Loop-实底 SEND），都需按"克制+中文文案+ms"自设重建，勿抄外形。完整过程+校验锚在 `ui-redesign-round2-progress.md` §9/§10。
+- **已落地的核心改动（bridge.cpp）**：`PrimaryAction`(Open/Run)/`DangerAction`(Close) 从实心蓝/红改**白底 #FEFEFE outline**（Open 深字 #1B1B1B、Close 红字 #C00500；淡边=全局 FrameBorderSize=1 + ImGuiCol_Border #D5D5D5@0.9）。`SendAction` 保实心蓝。v9 像素 diff 证侧栏 Open 实心蓝 slab 被清、`#005A98` 1391→952。
+- **本版本桥的像素级判定**（#16，可不做/勿盲做）：
+  - E F3（ms/秒）：bridge 两个周期 InputInt(`##send_period`:1212 / `##multi_period`:1316, 后缀都 ms)本就是**内部一致的整数 ms**，无功能 bug；把 Multi"定时"改成秒会**破坏 ms 语义**（回归）。不改。
+  - B④(47px 行距)：1.png 配置是**左宽列 label 上叠竖排组合**（x241..399 159px 一行）；桥配置是**右窄栏 #EDEDED ~179px 两列 label+combo 横排表**（`##serial_grid` :1404 2col）——**不是同一几何**，硬套 47px 只会在挤侧栏加空白。不改。
+  - B②下拉箭头灰/B③DTR-RTS chip：xcom 用 `Toggle()`(:1441, 28×kToggle 自绘) 与 ImGui 默认箭头，属 xcom 自设；1.png 的 33px 墩/灰三角为参考，不盲换。
+- **接线/字体/文档约束**：桥编的是 ImGui 1.93 WIP（`third_party/xcom_imgui/imgui`, CMakeLists IMGUI_ROOT, 非 cimgui/README docking）。画线 `AddLine(p1,p2,col,th)` 无 cap flags（手绘圆端用 `AddCircleFilled`）。正文16±、强调 #004270、发丝 #EDEDED。
+
+### 本轮（第 5 轮：全 UI 中文本地化 × 最小 CJK 字形 × 无头验证基建，2026-09-05 晚）
+> 承接第 4 轮 1.png 观感收口。本轮把"中文桌面工具"真正落地（此前 label 走英文兜底），并首次建成无头 UI 验证链；行号有漂移时以函数名 + 近似行号为准。锚点均在 `xcom_lua/native/xcom_imgui/xcom_imgui_bridge.cpp`（下称 bridge）。
+- **全 UI 中文本地化**：`struct Lang`（bridge:100，`for_each_text`:180）+ 两张 constexpr 表 `kLangZh`（:222）/`kLangEn`（:260）；`lang()`（:461）按 `ui_lang_zh_` 选表。活动语言在 `load_layout_config` 从 `assets/layout.toml` 的 `[ui] language = "zh"|"en"` 解析（:2594，缺省 zh，贴 pic/1.png 中文基准；扫描器把 `[layout]/[font]/[ui]` 三节并入单遍，section 号路由）。**第 2 轮补**：header 副标题（`subtitle` "串口助手" :244）、右键菜单（`##receive_context` :1500）、脚本控制台（`scripts_title` "脚本控制台" :239）、scope 标签（`scope_title` "波形"）。audit 发现 20 处 label 未过表→全部接线，无残留硬编码。
+- **最小 CJK 字形烘焙（关键决策）**：不再用 stock `GetGlyphRangesChineseSimplifiedCommon`——~3700 字形 × 4 个尺寸撑爆 WARP 软光栅 atlas 预算，且**静默不画**（整帧丢字无报错，见 :2823-2826 注释；mono 字体下方同源文档）。改由 `Lang::for_each_text` **从活动 label 集反推字形**：`ImFontGlyphRangesBuilder::AddText`（:2831，栈构造，8KB bitmap 禁 static）+ `"0123456789"` → `ui_glyph_ranges_`（Runtime 成员持指针，atlas 存的是裸指针须比 builder 活得久，:414）。`merge_ui_glyphs`（:2840）以 `MergeMode` 把 `msyh.ttc`（正文）/`msyhbd.ttc`（粗体标题）/`simsun.ttc`（回退）并进 **body 13/15/17**（`kBodySizes` :2859，15px 为默认面）+ **heading 16**（:2876）。~120 字形量级，atlas 安全。
+- **CRTP `NonCopyable<Derived>` tag base**（bridge:592，protected ctor/dtor + 非虚 + 删拷贝）：`PanelScope`（:601）/`ScopedHeadingFont`（:650）/`ScopedAction`（:666）三处私有继承——§5.9 三个同形 RAII 门槛已达，值得抽基类；析构非虚杜绝 slicing，Move 仍隐式删除（derived 声明了 dtor）。`Lang` **定义点 static_assert**（§5.4）：`is_standard_layout_v && is_trivially_copyable_v`（:216）+ `parity_items/flow_items/serial_field_labels` 尺寸与 Lua `PARITY_ITEMS/FLOW_ITEMS` 锁死（:217-219）。`Action` 位掩码只在 constexpr 辅助里窄化到 `std::uint32_t`（`action_mask`:509 / `send_slot_action`:525），导出 ABI 仍 `int`（`Command<Action>::Execute` 返回 int :532，数值兼容）。
+- **Header/Footer 两处观感修复**：① 状态文字与 Set/Scope/Lua chip 簇重叠——chip 簇起点为 `button_group_start - 144`，故引入锚点 `kChipClusterLeft=144.0f`（bridge:997），状态文字定位到整簇左侧（旧 `-12` 偏移会把字压到 Scope/Lua 上 :998）。② Footer 顶部 1px 分隔线：`AddLine` 在 .5 偏移把 #8C8C8C 抗锯齿混进 #FEFEFE 带 ≈ #C5C5C5（超出 verify ±20 契约）→ 改 `AddRectFilled` 整数高一行单扫描线绘出真实 #8C8C8C（:1886-1890），对应 `verify_v10.py` **check #8 `footer_rule_8c8c8c`**。
+- **图标位置**：`UtilityIcon` 的 path/save/clear 三枚从 **180px 侧栏**（窗边被裁，:1164 注释）移到**接收区顶部工具栏右对齐**（`ReceiveToolbar` :1024/1171-1180，用户选定，合 UartAssist/SSCOM 惯例）。"更多"高级带 `constexpr bool kMoreSectionEnabled=false`（:1757，`if constexpr` 编译期关，代码按用户要求保留待复启）；DTR/RTS 两个 modem Toggle 上移到「打开」按钮正下方（:1729-1734）。
+- **`send_file.lua` 真实泄漏修复**：`step()` 完成分支（:79-88）与 port-closed 分支（:94-100）此前只 `state.timer=nil` 而未 `sys.timer_stop` → 已 fired 的一次性 uv handle 仍被引擎 `timers` 数组强引用（仅 `timer_destroy` 摘除），死 handle 常驻到进程退出。两分支补 `sys.timer_stop` 后再置 nil（与 `schedule()` 自续前回收旧句柄同理）。`tests/test_send_file_caps.lua` 重写为 **23/23 PASS**：覆盖 32MB stat-first 上限（`script_engine.lua:380` `file_read`：`FILE_READ_MAX=32*1024*1024`(:76)，`>32MiB` 直接返回 nil、`fs_open` 从不调用；`==32MiB` 放行）。
+- **Scope Lua 包装**：`ui/imgui_bridge.lua` 的 `M:set_scope_visible`(:240)/`M:scope_clear`(:290)/`M:scope_configure`(:300) 薄封装对应 C 导出（`optional_export` 兜缺失符号）+ `scripts/scope_demo.lua`。脚本经 `env.wave`（script_engine.lua 注入）触达 scope，沿用 wave_demo 推数据模式。
+- **无头验证基建（本轮核心可复用产出）**：**合成鼠标点击到不了 ImGui Win32 后端**（实证：3 次点击产生 3 张逐字节相同的 BitBlt 帧）→ 弃"注入点击"路线，改 env 钩子：`Window:_smoke_env_hooks`（`ui/window.lua:1420`，仅 `XCOM_SMOKE_SETTINGS=1`/`XCOM_SMOKE_SCOPE=1` 时镜像 header chip 开窗，正常运行严格 no-op）+ `scripts/smoke_ui.lua` 灌数据。截屏走 `PrintWindow(hwnd,hdc,PW_RENDERFULLCONTENT)`（WARP 跨进程 BitBlt 全黑，见"测量方法论"）。**时序**：首帧完整渲染约在启动后 **2.4 s**，早于此截到黑帧——截屏前必须等。
+- **串口模拟器（in flight）**：`core/serial_sim.lua` 把字节喂进 core 的 **VIRTUAL/TEST\* 进程内虚拟口**（`xcom_core/src/abi/xcom_abi.cpp:is_virtual_port` :40，规则=精确 "VIRTUAL" 或 "TEST" 前缀；Lua 侧同名规则 :74），经 `xcom.test_inject_rx`（`core/xcom_ffi.lua` 的 `test_inject_rx`）注入 → **真实显示管线全跑通**。文档化 non-goal：不碰 COM 注册表枚举、不模拟 DCB。
+- **验证状态**：v15 干净 dashboard `verify_v10.py` **8/8 PASS**；v23 开着"设置"窗截图，实证中文渲染（含第 2 轮 subtitle/右键菜单/脚本控制台/scope 标签）。本轮快照编号 **v12–v23**。
+- **本轮踩坑固化**：① bash 重定向进 cmd 子进程会被吞（改用 `powershell -Command "cmd /c ..."` + `iconv ... -f GBK`）；② Grep/Read 显示吞掉 `\r`（纯显示假象，文件本身完好）；③ DLL 实读的是 **`runtime/assets/layout.toml`**，改了 `assets/` 必须同步过去；④ DLP：源码永不走 bash 重定向写（见全局 CLAUDE.md）。
+
+### 本轮（第 6 轮：模拟器 E2E 打通 × 接收区拖选绝对坐标重构，2026-09-05 深夜）
+- **串口模拟器完工（第 5 轮 in-flight 项收口）**：`core/serial_sim.lua`（profiles text/gb2312/hexbin/modbus/at-modem/wave/echo；20ms uv pump + pending ring + `tx_observe` 回环/AT 响应）+ `scripts/sim_control.lua` 插件页 + `tests/test_serial_sim.lua` **47/47 PASS**。window.lua 接线以 `_sim_active`（`xcom.list_ports()` 为空才激活）门控——有硬件的机器行为逐位不变。E2E 冒烟：`XCOM_SMOKE_OPEN=1 XCOM_SMOKE_SIM_PROFILE=text|wave` 程序化打开 VIRTUAL 口，stderr 确认 `[sim] pump armed`，text profile 日志区实测渲染 **109 行**数据（`pic/sel_v41.png`），wave 喂 Scope。headless probe 独立证实注入→drain 字节精确（37B 进 39B 计）。
+- **全量回归（agent）**：**零真实回归**。12 个逻辑测试全绿；6 个串口测试缺 COM 属环境性 SKIP；4 个库测试仅因 `third_party → xcom_lua/libs` 迁移未完成（libs/ 空、未跟踪），镜像正确树后 78/43/51/9 全绿。**待办**：完成 libs/ vendoring 或回退测试路径改动。
+- **接收区拖选 BUG 重构（用户报告：选区钉死在屏幕同一行，不随文本上滚）**：根因 = `receive_sel_begin_/end_` 存**窗口相对字节**，而 Lua `_flush_imgui_receive` 每次把整个 64KiB 滑窗换血推给 `xcom_imgui_set_receive_text`——偏移随窗口漂移，选中内容被顶出后偏移"移情"到新内容上，高亮就永远罩在顶部固定几行。修法 = **绝对 lifetime 坐标**：Runtime 新增 `receive_base_`（`receive_text_[0]` 在全流中的绝对偏移，bridge:370）；selection begin/end/drag-origin 全部存绝对字节；渲染时 `line_off` 与 `[sel_b, sel_e)` 比较前先减 base（ReceiveContent 的 `base` 局部量），拖拽命中把窗口偏移 `+ base` 还原为绝对；右键"复制选中"把绝对区间 clamp 回窗口再 substr；`xcom_imgui_set_receive_base(size_t)` 新导出（Lua 在每次 `set_receive_text` 前推 total-#tail）；空缓冲/清空/关闭路径重置 base+选区。旧 DLL 缺符号时 Lua 侧 `optional_export` 探测失败则退化为原窗口相对行为，不崩。
+- **拖拽体验细节**：拖选中冻结贴底跟随（`if (runtime.receive_follow_tail_ && !sel_dragging) SetScrollHereY`）——按住左键时新数据不再把文本从鼠标下抽走；松开后选区随流上滚直至滑出窗口（符合"选中的区域应该在上面，或者已经看不到了"）。与 `docs/win32-flickerfree-selection-todo.md` §三-12 的"capture 中暂停跟随"原则一致。
+- **v23-vs-1.png 十项视觉差距（agent 像素审计，留作下轮 restyle 输入，按影响排序）**：①头部 chip→无边框图标 ②侧栏位置/底色（右#EEEEF0 vs 参考左白+1px #EFEFEF ③缺 3px #005A9E 工作/发送区分隔线 ④页脚顶线+琥珀计数+链接应 #004275 ⑤头分隔线 #C6C6C6→#EDEDED ⑥Logo 实心块→轮廓字形 ⑦内部 hairline 偏重 ⑧工具条字形应 #1B1B1B ⑨离线状态移页脚（可选）⑩发送按钮箭头→#FFFFFF。多数为 bridge palette 一行改色。
+- **验证状态**：DLL 已部署 runtime/（22:07 版含 base 重构 + 拖拽冻结）；应用以 `XCOM_SMOKE_OPEN=1 XCOM_SMOKE_SIM_PROFILE=text` 运行中（PID 38836）。**注意**：WARP 下 PrintWindow 可能截到纯黑帧（DX11 呈现线程空闲时不重绘），需先 `SetWindowPos` 挪 2px 逼一次真实帧再截（snap.py 已含 ShowWindow+SetForeground，但挪窗技巧未固化进脚本——待办）。
+- **本轮快照**：v30–v41（含 `pic/sel_v41.png` = text 流 109 行取证）。

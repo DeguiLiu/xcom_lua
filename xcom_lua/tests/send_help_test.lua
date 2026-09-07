@@ -1,5 +1,12 @@
 -- Send the literal help command with LF and print the real device response.
 -- Usage: runtime\luajit.exe tests\send_help_test.lua COM3
+--
+-- NOT convertible to the VIRTUAL session: the whole point is the peer's TEXT
+-- REPLY to a physical send.  VIRTUAL TX is acceptance-only (xcom_core.cpp
+-- owner_write counts tx_bytes and drops the payload -- no wire, no peer, no
+-- echo), so response_bytes would always be 0 and a green exit would be
+-- vacuous.  With no COM port argument on a host without hardware it prints an
+-- explicit SKIP (exit 0); pass a COM name wired to a real device to run it.
 local ffi = require("ffi")
 ffi.cdef[[void Sleep(unsigned long ms);]]
 local script = (arg and arg[0]) or "tests/send_help_test.lua"
@@ -7,13 +14,28 @@ local dir = script:match("^(.*)[/\\]") or "."
 local root = dir:gsub("[/\\]$", "") .. "/.."
 package.path = root .. "/core/?.lua;" .. package.path
 local xcom = require("xcom_ffi")
+local port = (arg and arg[1])
 local handle, err = xcom.create()
 assert(handle, err)
 local function finish(code)
     xcom.destroy(handle)
     os.exit(code or 0)
 end
-local port = (arg and arg[1]) or "COM3"
+-- VIRTUAL/TEST sessions cannot produce a device reply: skip explicitly.
+if port and (port == "VIRTUAL" or port:sub(1, 4) == "TEST") then
+    print("SKIP " .. port .. ": requires physical COM loopback (VIRTUAL TX is acceptance-only)")
+    finish(0)
+end
+if not port then
+    -- No COM given: only auto-skip when the host really has no ports;
+    -- otherwise keep the original COM3 default unchanged.
+    local ports = xcom.list_ports()
+    if #ports == 0 then
+        print("SKIP (no COM port enumerated): requires physical COM loopback (device reply expected)")
+        finish(0)
+    end
+    port = "COM3"
+end
 local rc = tonumber(xcom.open_async(handle, port, 115200, 8, 0, 0, 0, false, false))
 print("open_async=" .. tostring(rc))
 if rc ~= xcom.ok then finish(1) end

@@ -26,7 +26,7 @@
 - **注入路径**：与 `poll_display` 相同的 `_imgui_receive` 链路（append → 64 KiB 滚动裁剪 → flush → `set_receive_text` → ImGui/WARP 绘制）
 - **注入节奏**：10 ms luv 定时器，按流逝时间补偿每 tick 字节数（libuv periodic timer 不补发被 WARP 帧延迟错过的触发）
 - **交互负载**：每 500 ms 模拟一次鼠标移动（触发交互帧请求）
-- **核心侧数据不丢契约**（RxBlock 池排空、`rx_pool_exhausted_bytes`）由 `tests/stress_fullband.lua` 覆盖，需 COM 硬件，本机无串口暂缓（见 §5）
+- **核心侧数据不丢契约**（RxBlock 池排空、`rx_pool_exhausted_bytes`）由 `tests/stress_fullband.lua` 覆盖，已在 core 的 VIRTUAL 进程内会话上执行通过（无需 COM 硬件，见 §5）
 
 ## 3. 实测数据
 
@@ -77,7 +77,7 @@ trim happened:   yes (rolling window)
 
 ## 5. 边界与后续
 
-- **本机无 COM 口**：核心侧数据不丢契约（`rx_pool_exhausted_bytes` 恒 0、`drain_display` 排空、512 KiB RxBlock 池余量）由 `tests/stress_fullband.lua` 覆盖，待串口硬件可用后执行；理论余量 512 KiB ÷ 90 KiB/s ≈ 5.7 s。
+- **数据不丢契约已覆盖（VIRTUAL）**：`tests/stress_fullband.lua` 现默认走 core 的 VIRTUAL 进程内会话（`xcom_ao` 注入接缝），无需串口硬件即可执行：15 s 满带宽档注入 8.85 MB，`rx_pool_exhausted_bytes=0`、`display_pending=0`、注入零拒绝，VERDICT PASS。注意显示文本视图会把 CRLF 折叠为单 LF（跨 4096 B RxBlock 边界的对不折叠），测试按精确折叠数断言 `drained == injected - folded`；另断言帧行号序列连续（内容级完整性，字节对账看不出等长置换）与有效速率 ≥ 标称 80%。注意粒度：一帧 9400 B 远大于 90 KiB/s 的 10 ms 份额（921 B），实际注入约为标称线速的 10 倍（有意过压）。真需要物理对端的 `serial_external_receive_test`/`send_help_test` 在无串口主机上显式 SKIP（exit 0）。理论余量 512 KiB ÷ 90 KiB/s ≈ 5.7 s（按实际 10 倍过压则不足 0.6 s，仍零拒绝——池与显示排空能力有余量）。
 - **WARP 帧预算**：满带宽 + 交互叠加时渲染 10-13 fps（数据档 100 ms 主导）。若未来 UI 复杂度上升导致帧预算不足，可回退 `D3D_DRIVER_TYPE_HARDWARE`（一行）或提高数据档间隔。
 - 复现命令：
   ```

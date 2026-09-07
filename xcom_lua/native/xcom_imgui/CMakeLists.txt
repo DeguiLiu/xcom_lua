@@ -5,6 +5,7 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 set(IMGUI_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/../../../third_party/xcom_imgui/imgui)
+set(IMPLOT_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/../../../third_party/xcom_imgui/implot)
 set(XCOM_REFERENCE_FONTS_DIR "D:/workspace/SSCOM/xcom_client/resources/fonts" CACHE PATH
     "Directory containing SiemensSlabRoman.ttf and SiemensSlabBold.TTF")
 set(XCOM_LUA_RUNTIME_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../.." CACHE PATH
@@ -16,11 +17,14 @@ add_library(xcom_imgui SHARED
     ${IMGUI_ROOT}/imgui_widgets.cpp
     ${IMGUI_ROOT}/imgui_impl_win32.cpp
     ${IMGUI_ROOT}/imgui_impl_dx11.cpp
+    ${IMPLOT_ROOT}/implot.cpp
+    ${IMPLOT_ROOT}/implot_items.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/xcom_imgui_bridge.cpp
 )
 
 target_include_directories(xcom_imgui PRIVATE
     ${IMGUI_ROOT}
+    ${IMPLOT_ROOT}
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
 target_compile_definitions(xcom_imgui PRIVATE WIN32_LEAN_AND_MEAN)

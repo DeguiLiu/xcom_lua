@@ -1,4 +1,5 @@
 local ffi = require("ffi")
+local bit = require("bit")
 
 ffi.cdef[[
 int xcom_imgui_init(void* hwnd);
@@ -7,6 +8,7 @@ int xcom_imgui_new_frame(void);
 int xcom_imgui_render(void);
 void xcom_imgui_set_receive_text(const char* text, size_t length);
 void xcom_imgui_set_receive_window(size_t bytes);
+void xcom_imgui_set_receive_base(size_t absolute_offset);
 void xcom_imgui_set_status(const char* text);
 int xcom_imgui_wndproc(void* hwnd, unsigned int msg, uintptr_t wparam, intptr_t lparam);
 int xcom_imgui_draw_console(char* port, size_t port_capacity, int connected,
@@ -20,11 +22,50 @@ int xcom_imgui_draw_console(char* port, size_t port_capacity, int connected,
   int* multi_auto, int* multi_period, int* auto_save,
   const char* receive_text, size_t receive_length);
 void xcom_imgui_shutdown(void);
+
+/* ---- feature extensions (Phase 4; each is symbol-probed at load time so
+ * an older DLL without them degrades gracefully — see optional_export) ---- */
+void xcom_imgui_set_baud_extra(int* custom_baud);
+void xcom_imgui_set_multi_extra(int* gap_ms);
+void xcom_imgui_set_charset(int* index);
+void xcom_imgui_set_frame_gap(int* enabled, int* ms);
+void xcom_imgui_set_highlight_rules(const char* packed, int count);
+void xcom_imgui_set_scripts(const char* names_packed, int* enabled, int count);
+void xcom_imgui_set_script_log(const char* text, size_t length);
+void xcom_imgui_set_scripts_visible(int visible);
+int xcom_imgui_take_script_events(int* events, int capacity);
+int xcom_imgui_script_take_command(char* out, int capacity);
+void xcom_imgui_script_load_editor(const char* path, const char* text, size_t length);
+void xcom_imgui_script_select(int index);
+int xcom_imgui_script_take_editor_save(char* out_path, int path_cap,
+                                       char* out_text, int text_cap);
+int xcom_imgui_scope_push(int channel, double x, double y);
+void xcom_imgui_scope_clear(void);
+void xcom_imgui_scope_configure(int channel, int visible);
+void xcom_imgui_scope_set_visible(int visible);
+void xcom_imgui_set_settings_visible(int visible);
+void xcom_imgui_set_plugin_page(const char* id, const char* title,
+                                const char* spec);
+int xcom_imgui_take_plugin_events(char* out, int capacity);
 ]]
 
 local M = {}
 local ok, lib = pcall(ffi.load, "xcom_imgui")
 M.available = ok and lib or nil
+
+-- An export added after the DLL this process loaded was built resolves to a
+-- nil field here (pcall-wrapped: indexing a missing cdata symbol errors).
+-- Every Phase-4 feature call site goes through this probe so an old DLL
+-- simply hides the feature instead of crashing the app.
+local function optional_export(name)
+    local probe_ok, fn = pcall(function() return lib[name] end)
+    return probe_ok and fn or nil
+end
+
+M.optional_export = optional_export
+
+-- Charset dropdown items; index contract shared with the C++ combo.
+M.CHARSET_ITEMS = { "ASCII", "UTF-8", "GB2312", "BIG5", "SHIFT-JIS", "UTF-16" }
 
 local PORT_CAPACITY = 128
 local SEND_CAPACITY = 4096
@@ -106,16 +147,246 @@ function M.new(hwnd, cfg)
         pages = { { text = {}, enabled = {} } },
         receive_capacity = receive_capacity,
     }
+    -- Phase-4 extension state: registered with the DLL only when the
+    -- symbols exist (older DLLs keep working; the features stay hidden).
+    local set_baud_extra = optional_export("xcom_imgui_set_baud_extra")
+    local set_multi_extra = optional_export("xcom_imgui_set_multi_extra")
+    local set_charset = optional_export("xcom_imgui_set_charset")
+    local set_frame_gap = optional_export("xcom_imgui_set_frame_gap")
+    if set_baud_extra then
+        self.baud_custom = int1(cfg.baud_custom or 0)
+        set_baud_extra(self.baud_custom)
+    end
+    if set_multi_extra then
+        self.multi_gap = int1(cfg.multi_gap_ms or 100)
+        set_multi_extra(self.multi_gap)
+    end
+    if set_charset then
+        self.charset = int1(index_of(M.CHARSET_ITEMS, cfg.charset, 0))
+        set_charset(self.charset)
+    end
+    if set_frame_gap then
+        local gap = tonumber(cfg.frame_gap_ms) or 0
+        self.frame_gap_enabled = bool1(gap > 0)
+        self.frame_gap_ms = int1(gap)
+        set_frame_gap(self.frame_gap_enabled, self.frame_gap_ms)
+    end
     -- Push the configured window into the native receive buffer so both
     -- sides trim to the same tail size.
     M.available.xcom_imgui_set_receive_window(receive_capacity)
     return setmetatable(self, { __index = M })
 end
 
-function M:set_receive_text(text)
+function M:set_receive_text(text, base)
     text = text or ""
     local n = math.min(#text, (self.receive_capacity or DEFAULT_RECEIVE_CAPACITY) - 1)
+    -- Publish where this window sits in the lifetime receive stream BEFORE
+    -- pushing (see xcom_imgui_set_receive_base): the native selection is
+    -- stored in those absolute coordinates so it travels with its text as
+    -- the Lua tail slides.  Older DLLs lack the export and simply keep the
+    -- historical window-relative behaviour.
+    local push_base = optional_export("xcom_imgui_set_receive_base")
+    if push_base then push_base(math.floor(base or 0)) end
     self.lib.xcom_imgui_set_receive_text(text, n)
+end
+
+-- Push highlight rules ({pattern, color, style} tables, color = 0xRRGGBB)
+-- to the native renderer as a packed "pattern\0RRGGBB\0style\0" blob.
+-- No-op when the DLL predates the export (rules simply don't render).
+function M:set_highlight_rules(rules)
+    local push = optional_export("xcom_imgui_set_highlight_rules")
+    if not push or not rules or #rules == 0 then
+        if push then push(nil, 0) end
+        return
+    end
+    local parts = {}
+    for _, rule in ipairs(rules) do
+        parts[#parts + 1] = tostring(rule.pattern)
+        parts[#parts + 1] = string.format("%06X", rule.color or 0xE53935)
+        parts[#parts + 1] = rule.style == "bg" and "bg" or "text"
+    end
+    local packed = table.concat(parts, "\0")
+    push(packed, #rules)
+end
+
+-- Mirror the script-engine log tail into the Script Console panel.
+function M:set_script_log(text)
+    local push = optional_export("xcom_imgui_set_script_log")
+    if not push then return end
+    push(text or "", #text or 0)
+end
+
+-- Script list + Lua-owned enable buffer.  names: array of strings.
+-- The bridge keeps `self._script_enabled_buf` alive (Lua-owned int array).
+function M:set_scripts(names)
+    local push = optional_export("xcom_imgui_set_scripts")
+    if not push then return end
+    if not names or #names == 0 then
+        self._script_enabled_buf = nil
+        push(nil, nil, 0)
+        return
+    end
+    local enabled = ffi.new("int[?]", #names)
+    for i = 1, #names do enabled[i - 1] = 0 end
+    self._script_enabled_buf = enabled
+    self._script_names = names
+    local packed = table.concat(names, "\0")
+    push(packed, enabled, #names)
+    return enabled
+end
+
+function M:set_scripts_visible(visible)
+    local push = optional_export("xcom_imgui_set_scripts_visible")
+    if push then push(visible and 1 or 0) end
+end
+
+function M:set_settings_visible(visible)
+    local push = optional_export("xcom_imgui_set_settings_visible")
+    if push then push(visible and 1 or 0) end
+end
+
+function M:set_scope_visible(visible)
+    local push = optional_export("xcom_imgui_scope_set_visible")
+    if push then push(visible and 1 or 0) end
+end
+
+-- Declares (or removes, with spec=nil) one settings-window page rendered by
+-- the C++ side from the line-oriented spec grammar (see xcom_imgui_bridge.cpp
+-- "Plugin spec grammar").  Interactions arrive via take_plugin_events.
+function M:set_plugin_page(id, title, spec)
+    local push = optional_export("xcom_imgui_set_plugin_page")
+    if not push then return end
+    push(id, title or id, spec)
+end
+
+-- Drains queued plugin events as {page, kind, widget, value} records.
+function M:take_plugin_events()
+    local take = optional_export("xcom_imgui_take_plugin_events")
+    if not take then return nil end
+    local buf = self._plugin_event_buf
+    if not buf then
+        buf = ffi.new("char[?]", 4096)
+        self._plugin_event_buf = buf
+    end
+    local n = tonumber(take(buf, 4096)) or 0
+    if n <= 0 then return nil end
+    local events = {}
+    local raw = ffi.string(buf, n)
+    -- Records are "page:kind:wid[:value]".  The page id may contain a colon
+    -- ("script.lua:local_id"), but kind/wid/value never do (native-side
+    -- contract), so anchor on the known kinds and split the tail twice.
+    for record in raw:gmatch("[^%z]+") do
+        local page, kind, tail = record:match("^(.-):(check|slider|combo|click):(.+)$")
+        if page then
+            local widget, value = tail:match("^([^:]+):?(.*)$")
+            events[#events + 1] = { page = page, kind = kind, widget = widget,
+                value = value ~= "" and value or nil }
+        end
+    end
+    return events
+end
+
+-- Scope (ImPlot) data channel: seconds x, value y, 1-based channel.
+function M:scope_push(channel, x, y)
+    local push = optional_export("xcom_imgui_scope_push")
+    if push then return push(channel, x, y) end
+end
+
+-- Reset every scope channel's ring buffer (offset/count -> 0, last_x -> 0,
+-- has_data -> false).  Thin wrapper over xcom_imgui_scope_clear(void); a no-op
+-- on an older DLL that lacks the export.
+function M:scope_clear()
+    local clear = optional_export("xcom_imgui_scope_clear")
+    if clear then clear() end
+end
+
+-- Per-channel visibility.  opts = { channel = <1-based int>, visible = <bool> }
+-- (channel defaults to 1; visible defaults to true — the C-side ScopeChannel
+-- default, so a channel is drawn until a script explicitly hides it).  Thin
+-- wrapper over xcom_imgui_scope_configure(channel, visible); out-of-range
+-- channels are ignored by the native side, and this is a no-op on an older DLL.
+function M:scope_configure(opts)
+    local configure = optional_export("xcom_imgui_scope_configure")
+    if not configure then return end
+    opts = opts or {}
+    local channel = tonumber(opts.channel) or 1
+    local visible = opts.visible
+    if visible == nil then visible = true end
+    configure(channel, visible and 1 or 0)
+end
+
+-- Toggle the whole scope panel.  Accepts a bool or an int (0/1); the C-side
+-- default is hidden (scope_visible_ = false) until the header "Scope" chip or a
+-- script opens it.  Same export as set_scope_visible, provided under the
+-- scope_* name for symmetry with scope_push/scope_clear/scope_configure; a
+-- no-op on an older DLL.
+function M:scope_set_visible(visible)
+    local push = optional_export("xcom_imgui_scope_set_visible")
+    if push then push(visible and 1 or 0) end
+end
+
+-- Drain queued console events into a plain Lua array of {type, index}.
+function M:take_script_events()
+    local take = optional_export("xcom_imgui_take_script_events")
+    if not take then return nil end
+    local buf = self._event_buf
+    if not buf then
+        buf = ffi.new("int[?]", 16)
+        self._event_buf = buf
+    end
+    local n = tonumber(take(buf, 16)) or 0
+    if n <= 0 then return nil end
+    local events = {}
+    for i = 0, n - 1 do
+        local packed = tonumber(buf[i])
+        events[#events + 1] = {
+            type = bit.rshift(packed, 8),
+            index = bit.band(packed, 0xFF),
+            flag = bit.band(packed, 0x40) ~= 0,
+        }
+    end
+    return events
+end
+
+-- One-line REPL: returns the submitted command, or nil.
+function M:take_script_command()
+    local take = optional_export("xcom_imgui_script_take_command")
+    if not take then return nil end
+    local buf = self._command_buf
+    if not buf then
+        buf = ffi.new("char[?]", 512)
+        self._command_buf = buf
+    end
+    if take(buf, 512) == 0 then return nil end
+    return ffi.string(buf)
+end
+
+-- Editor content push (Lua -> C++).
+function M:script_load_editor(path, text)
+    local push = optional_export("xcom_imgui_script_load_editor")
+    if not push then return end
+    push(path or "", text or "", #text or 0)
+end
+
+function M:script_select(index)
+    local select = optional_export("xcom_imgui_script_select")
+    if select then select(index or -1) end
+end
+
+-- Editor save event (C++ -> Lua): returns path, text or nil.
+function M:take_editor_save()
+    local take = optional_export("xcom_imgui_script_take_editor_save")
+    if not take then return nil end
+    local path_buf = self._save_path_buf
+    local text_buf = self._save_text_buf
+    if not path_buf then
+        path_buf = ffi.new("char[?]", 512)
+        text_buf = ffi.new("char[?]", 65536)
+        self._save_path_buf = path_buf
+        self._save_text_buf = text_buf
+    end
+    if take(path_buf, 512, text_buf, 65536) == 0 then return nil end
+    return ffi.string(path_buf), ffi.string(text_buf)
 end
 
 function M:set_status(text)
@@ -143,6 +414,17 @@ function M:send_text()
 end
 
 function M:serial_config()
+    -- A non-zero Custom value overrides the preset combo (clamped to the
+    -- Win32 DCB-reasonable range; the core passes baud_rate straight through).
+    if self.baud_custom then
+        local custom = tonumber(self.baud_custom[0]) or 0
+        if custom >= 300 then
+            custom = math.min(custom, 3000000)
+            return custom, self.data_bits[0] + 5,
+                self.stop_bits[0], self.parity[0], self.flow[0],
+                self.dtr[0] ~= 0, self.rts[0] ~= 0
+        end
+    end
     return BAUD[self.baud[0] + 1] or 115200, self.data_bits[0] + 5,
         self.stop_bits[0], self.parity[0], self.flow[0], self.dtr[0] ~= 0, self.rts[0] ~= 0
 end

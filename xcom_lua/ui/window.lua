@@ -30,6 +30,10 @@ local view_model = require("view_model")
 local config = require("config")
 local xcom = require("xcom_ffi")
 local imgui_bridge = require("imgui_bridge")
+local script_engine = require("script_engine")
+local waveform = require("waveform")
+local charset = require("charset")
+local serial_sim = require("serial_sim")
 
 -- Serial-config combo text -> ABI-int maps and helpers (declared up-front so
 -- every method below closes over the same upvalues regardless of where in
@@ -46,17 +50,18 @@ local function flow_index(t) return FLOW_MAP[t] or 0 end
 -- reachable for the whole process lifetime (never GC'd).
 local Active = nil
 
--- Siemens light palette (Win32 COLORREF).
+-- Reference-tool light palette (Win32 COLORREF).  Keep in sync with the
+-- ImGui bridge palette (native/xcom_imgui/xcom_imgui_bridge.cpp).
 local PAL = {
-    page    = w.rgb(0xee, 0xf1, 0xf4),  -- background #EEF1F4
+    page    = w.rgb(0xee, 0xee, 0xf0),  -- background #EEEEF0 (light gray card)
     surface = w.rgb(0xff, 0xff, 0xff),  -- input/panel white
-    text    = w.rgb(0x26, 0x32, 0x38),
-    accent  = w.rgb(0x00, 0x78, 0xd7),  -- industrial blue
+    text    = w.rgb(0x1b, 0x1b, 0x1b),
+    accent  = w.rgb(0x00, 0x5a, 0x9e),  -- reference deep blue
     trigger = w.rgb(0x00, 0x99, 0x99),  -- cyan-teal
-    dark    = w.rgb(0x00, 0x5a, 0x9e),  -- deep blue
+    dark    = w.rgb(0x00, 0x42, 0x75),  -- reference darker blue
     online  = w.rgb(0x00, 0x80, 0x00),  -- status green
-    danger  = w.rgb(0xc4, 0x00, 0x00),  -- close/red
-    header  = w.rgb(0x00, 0x5a, 0x9e),  -- title bar bg
+    danger  = w.rgb(0xc5, 0x05, 0x00),  -- reference red
+    header  = w.rgb(0x1e, 0x1e, 0x1e),  -- title bar bg (matches ImGui header)
     btnface = w.rgb(0xf0, 0xf0, 0xf0),
 }
 
@@ -66,6 +71,9 @@ local PAL = {
 -- STATUS_FATAL_USER_CALLBACK_EXCEPTION / exit code 0xC000041D, with no
 -- diagnostic).  On error we print the offending message + error to stderr and
 -- return 0 so the window can keep pumping messages during bring-up.
+-- page_brush: GDI solid brush matching PAL.page, reused as the WNDCLASS
+-- background brush so the pre-first-frame client area paints gray (not white).
+local page_brush
 local wndproc_callback = function(hwnd, msg, wparam, lparam)
     local win = Active
     if not win then
@@ -114,6 +122,10 @@ local IMGUI_ACTION = {
     send_slot_5 = 16777216,
     send_slot_6 = 33554432,
     send_slot_7 = 67108864,
+    scripts_window = 134217728,   -- 1 << 27 (Phase 4 C++ bridge; header "Lua")
+    run_sequence = 268435456,     -- 1 << 28 (Phase 4 C++ bridge; Multi "Run")
+    scope_window = 536870912,     -- 1 << 29 (header "Scope" chip)
+    settings_window = 1073741824, -- 1 << 30 (header "Set" chip)
 }
 
 local IMGUI_COMMANDS = {
@@ -144,6 +156,10 @@ local IMGUI_COMMANDS = {
     { IMGUI_ACTION.send_slot_5, "_imgui_send_slot", 5 },
     { IMGUI_ACTION.send_slot_6, "_imgui_send_slot", 6 },
     { IMGUI_ACTION.send_slot_7, "_imgui_send_slot", 7 },
+    { IMGUI_ACTION.scripts_window, "_imgui_scripts_toggle" },
+    { IMGUI_ACTION.run_sequence, "_imgui_run_sequence" },
+    { IMGUI_ACTION.scope_window, "_imgui_scope_toggle" },
+    { IMGUI_ACTION.settings_window, "_imgui_settings_toggle" },
 }
 
 local STATUS_TEXT = {
@@ -162,6 +178,16 @@ local PANEL_GAP = 0
 -- tested in on_nchittest / _header_button_at — keep these three in sync.
 local HEADER_BUTTON_W = 40
 local HEADER_BUTTONS_W = HEADER_BUTTON_W * 3
+-- ImGui header interactive cluster width.  The C++ bridge renders the
+-- min/max/close window buttons AND the three toggle chips (Settings/Scope/Lua)
+-- as right-aligned ImGui::InvisibleButton controls starting at
+-- `button_group_start - 144` = `window_width - 108 - 144` = `width - 252`
+-- (xcom_imgui_bridge.cpp Header(): button_group_start = width - 108, the
+-- Settings chip is offset -144).  When the ImGui bridge is active, the
+-- NCHITTEST caption zone must NOT swallow those six controls, so this whole
+-- right strip is reserved as HTCLIENT and the left/middle header remains
+-- HTCAPTION for window dragging.
+local IMGUI_HEADER_CLUSTER_W = 252
 
 -- Read the full text of a RICHEDIT/edit control as a Lua string.
 local function receive_text(hwnd)
@@ -202,11 +228,50 @@ function M.new(cfg, cfg_data, config_path)
     -- at _init_imgui so both sides trim the same tail.
     self._receive_window = imgui_bridge.clamp_receive_window(
         cfg.receive_window_bytes)
+    -- Display-side charset (ASCII/UTF-8 passthrough by default).  The
+    -- _charset_active flag keeps the drain funnel's fast path free of any
+    -- function call when no conversion is configured.
+    self._charset_name = cfg.charset or "ASCII"
+    self._charset_active = false
+    charset.set(self._charset_name)
     self._imgui_receive = ""
     self._imgui_receive_chunks = {}
     self._imgui_receive_cursor = 1
     self._imgui_receive_chunk_bytes = 0
     self._imgui_receive_dirty = false
+    -- Lifetime byte counter of the display stream (every byte that ever went
+    -- through _append_imgui_receive since the last clear).  The visible
+    -- buffer is only a sliding tail window; the native selection is stored
+    -- in these absolute coordinates (pushed with each set_receive_text) so
+    -- a shaded range keeps tracking its own text while the window slides.
+    self._imgui_receive_total = 0
+    -- Display-side enforcement state for [display] auto_clear_bytes and
+    -- frame_gap_ms.  Neither feature is enforced by the core or the ImGui
+    -- DLL: xcom_set_options stores only hex/timestamp/pause (xcom_abi.cpp),
+    -- and the DLL merely renders the two widgets against Lua-owned int
+    -- buffers (see _push_display_options).  The cache below is refreshed on
+    -- every ActionSyncDisplay and seeded from cfg so the receive path can
+    -- consult plain Lua numbers at drain cadence without FFI reads.
+    self._auto_clear_bytes = 0
+    self._frame_gap_en = false
+    self._frame_gap_ms = 0
+    local cfg_gap = tonumber(cfg.frame_gap_ms) or 0
+    if cfg_gap > 0 then
+        self._frame_gap_en = true
+        self._frame_gap_ms = cfg_gap
+    end
+    local cfg_clear = tonumber(cfg.auto_clear_bytes) or 0
+    if cfg_clear > 0 then
+        self._auto_clear_bytes = cfg_clear
+    end
+    -- uv.now() of the last drained batch (nil = none yet) and whether the
+    -- view tail currently ends mid-line (the auto frame-break anchor).
+    self._rx_last_batch_ms = nil
+    self._view_tail_open = false
+    -- TX echo ([display] tx_echo): sent payloads appear in the receive view
+    -- and the auto-save log as "TX: " lines (see Window:_echo_tx).  Default
+    -- on; the config round-trips it so the user can silence the transcript.
+    self._tx_echo = cfg.tx_echo ~= false
     -- P2 layer of run_message_loop: high-priority deferred jobs.  Handlers
     -- that must not run inside a WndProc/timer callback (re-entrancy or
     -- ordering) push closures here; the loop drains the whole queue between
@@ -251,6 +316,24 @@ function Window:init_window()
     end
     self:build_ui(tw, th)
     self:_init_imgui()
+    -- Warm the first frame BEFORE the window is shown.  ShowWindow exposes the
+    -- window immediately, but the DX11 swapchain presents nothing until the
+    -- first render pass completes (~0.3-1 s while the font atlas bakes on the
+    -- first NewFrame); that gap is the "startup flash" where the client area
+    -- shows the class brush/whatever is behind instead of the dashboard
+    -- (measured: capture at t=0.98 s has no client content; t=1.31 s does).
+    -- Drawing one full frame into the still-hidden swapchain makes the first
+    -- visible moment already show the complete dashboard.  All bridge buffers
+    -- were allocated (defaults) by imgui_bridge.new, so an empty dashboard
+    -- draw is safe before Window:start() wires the core handle.
+    if self.imgui then
+        pcall(function()
+            if self.imgui:frame() then
+                pcall(self.imgui.draw, self.imgui, false, 0, 0)
+                self.imgui:render()
+            end
+        end)
+    end
     w.user32.ShowWindow(self.hwnd, w.style.SW_SHOW)
     w.user32.UpdateWindow(self.hwnd)
     if self.cfg.always_on_top then
@@ -300,20 +383,47 @@ end
 
 function Window:_refresh_imgui_ports()
     if not self.imgui then return end
-    self.imgui:set_ports(xcom.list_ports() or {})
+    local ports = xcom.list_ports() or {}
+    -- SIM: hardware-free generators live here (see core/serial_sim.lua).
+    -- Only ever when the sim flag is on — machines with real ports keep the
+    -- exact registry-only list (sim:available() gates on #list_ports()==0).
+    if self._sim_active then
+        for _, p in ipairs(self.sim:ports()) do
+            ports[#ports + 1] = p
+        end
+    end
+    self.imgui:set_ports(ports)
 end
+
+-- SIM helper: did the just-issued open target one of the simulator's virtual
+-- port names?  Reads _sim_open_port (stamped in core_open).  Never called
+-- unless _sim_active, so it is a no-op on hardware machines.
+function Window:_sim_port_selected()
+    local port = self._sim_open_port
+    if not port or port == "" then return false end
+    if not self.sim then return false end
+    return self.sim.is_sim_port(port) and true or false
+end
+
 
 create_class = function(hinst)
     local wc = ffi.new("WNDCLASSA")
     wc.lpfnWndProc = WndProc
     wc.lpszClassName = "XComSerialLua"
     wc.hInstance = hinst
-    -- Background brush: (HBRUSH)(COLOR_WINDOW+1) requests the system window
-    -- color, so the client area is never transparent/desktop-passthrough even
-    -- before the first WM_PAINT.  A NULL hbrBackground leaves the client area
-    -- un-painted (transparent) and makes WM_ERASEBKGND pointless.
+    -- Background brush: color the client area with the SAME page gray the
+    -- dashboard paints (PAL.page #EEEEF0) instead of the white COLOR_WINDOW.
+    -- Before the first DX11 present, Windows erases the just-shown window with
+    -- this brush, so a white brush is exactly the "large white flash" seen on
+    -- startup.  A gray brush removes the flash without any ShowWindow-timing
+    -- refactor (see the startup-flicker note).  The handle is held at module
+    -- scope for the window-class lifetime; WNDCLASS copies the value, so it
+    -- must not be deleted before the last window is destroyed.
+    if not page_brush then
+        page_brush = w.gdi32.CreateSolidBrush(PAL.page)
+    end
     wc.style = 0x0020  -- CS_OWNDC keeps the DX11 swap-chain target stable.
-    wc.hbrBackground = ffi.cast("HBRUSH", 6)  -- COLOR_WINDOW + 1 = 6
+    wc.hbrBackground = ffi.cast("HBRUSH", page_brush)
     wc.hIcon = ffi.cast("HICON", w.user32.LoadImageA(
         nil, "runtime\\xcom.ico", w.image.ICON, 0, 0,
         w.image.LOAD_FROM_FILE + w.image.DEFAULT_SIZE))
@@ -570,9 +680,22 @@ function Window:on_nchittest(lparam)
     if cy >= client_h - edge then return w.ht.HTBOTTOM end
     if cy <= edge then return w.ht.HTTOP end
 
-    -- header => caption for drag (unless on a window button).
+    -- header => caption for drag (unless on an interactive control).
     if cy < HEADER_H then
-        -- Skip the right 3 button boxes (avoid dragging when pressing them).
+        -- When the ImGui bridge owns the header, it renders the window
+        -- buttons AND the Settings/Scope/Lua toggle chips as InvisibleButtons
+        -- in the rightmost IMGUI_HEADER_CLUSTER_W px.  Reserve that whole
+        -- strip as HTCLIENT so clicks reach ImGui; the window buttons are
+        -- dispatched inside the bridge (they are NOT the legacy GDI strip
+        -- handled by _header_button_at).  Only the left/middle header stays
+        -- HTCAPTION for dragging.
+        if self.imgui then
+            if cx >= client_w - IMGUI_HEADER_CLUSTER_W then
+                return w.ht.HTCLIENT
+            end
+            return w.ht.HTCAPTION
+        end
+        -- Legacy GDI path: skip only the right 3 window-button boxes.
         -- Must match on_paint's `bx0 = body_w - HEADER_BUTTONS_W` exactly, or
         -- clicking near a button would instead start a caption drag.
         local bx = client_w - HEADER_BUTTONS_W
@@ -662,7 +785,7 @@ function Window:_final_drain()
         if rc ~= xcom.ok or not text or #text == 0 then
             break
         end
-        self:_append_imgui_receive(text)
+        self:_process_rx_batch(text)
         if self._log_active then
             xcom.log_append(self.core, text, #text)
         end
@@ -686,6 +809,12 @@ function Window:on_close()
     if self._multi_timer then self._multi_timer:stop() end
     if self._display_timer then self._display_timer:stop() end
     if self._status_timer then self._status_timer:stop() end
+    if self._script_timer then self._script_timer:stop() end
+    if self._sequence_timer then self:_stop_sequence() end
+    -- SIM: disarm the pump before the drain/close (its uv handle must not
+    -- survive past the core session; stop() is cheap and idempotent).
+    if self._sim_active then self.sim:stop() end
+    if self.scripts then self.scripts:shutdown() end
     self:_final_drain()
     self:_save_config()
     if self.core then
@@ -755,6 +884,17 @@ function Window:_save_config()
     -- Persist the effective receive-tail window so a hand-edited config.ini
     -- survives round-trips (clamped value is what both sides actually use).
     config.set(data, "display", "receive_window_bytes", self._receive_window)
+    config.set(data, "display", "charset", self._charset_name or "ASCII")
+    config.set(data, "display", "tx_echo", self._tx_echo and true or false)
+    -- Script engine state: enabled list + console visibility + auto-reload.
+    if self.scripts then
+        config.set(data, "script", "enabled",
+            table.concat(self.scripts:enabled_list() or {}, ","))
+        config.set(data, "script", "autorun_console",
+            self._scripts_console_open and true or false)
+        config.set(data, "script", "auto_reload",
+            self.cfg.script_auto_reload and true or false)
+    end
     if self.imgui then
         config.set(data, "send", "hex", self.imgui.send_hex[0] ~= 0)
         config.set(data, "send", "crlf", self.imgui.send_crlf[0] ~= 0)
@@ -855,6 +995,12 @@ function Window:core_open()
         return
     end
     if self.imgui then self.imgui:set_status("Opening " .. serial.port .. " ...") end
+    -- SIM: remember the requested port so the connected edge (in
+    -- _render_ui_state, where port_state is confirmed OPEN) can decide
+    -- whether to arm the simulator pump.  Only ever consulted while
+    -- _sim_active.  Recorded here (not in _imgui_open) because the native
+    -- on_btn_open path reaches the same core_open.
+    self._sim_open_port = serial.port
     local rc = xcom.open_async(self.core, serial.port, serial.baud_rate,
         serial.data_bits, serial.stop_bits, serial.parity, serial.flow_control,
         serial.dtr, serial.rts)
@@ -885,15 +1031,84 @@ end
 
 function Window:core_send(data_bytes, flags)
     if not self.core then
-        return
+        return false, xcom.err_not_open
     end
     if data_bytes and #data_bytes > 0 then
+        -- Send-convert hook (on.send): a script may transform the payload or
+        -- cancel the send by returning nil.  Errors fall back to the original
+        -- payload (a broken script must not block transmission).
+        if self.scripts then
+            local ok, hooked = pcall(self.scripts.dispatch_send, self.scripts,
+                data_bytes)
+            if ok then
+                if hooked == nil then return false, nil end
+                if type(hooked) == "string" then data_bytes = hooked end
+            else
+                io.stderr:write("[scripts] send funnel: " .. tostring(hooked) .. "\n")
+            end
+        end
         local rc = tonumber(xcom.send(self.core, data_bytes, flags or xcom.send_text))
-        if rc ~= xcom.ok and self.status and self.status.labels then
-            c.set_text(self.status.labels[3],
-                       "send failed: " .. (STATUS_TEXT[rc] or tostring(rc)))
+        if rc ~= xcom.ok then
+            if self.status and self.status.labels then
+                c.set_text(self.status.labels[3],
+                           "send failed: " .. (STATUS_TEXT[rc] or tostring(rc)))
+            end
+            -- Return the status so a streaming caller (send_file) can
+            -- distinguish "buffer full" (back off and retry) from "not open"
+            -- / "io error" (abort).  errcode is the ABI status (e.g. -5 full).
+            return false, rc
+        else
+            self:_echo_tx(data_bytes)
+            if self._sim_active and self.sim:is_running() then
+                -- SIM: a successful TX on a virtual session lets the echo /
+                -- at-modem profiles queue their reply.  Only reached while
+                -- the pump owns the session, so a real-port send never
+                -- touches it.
+                self.sim:tx_observe(data_bytes)
+            end
         end
     end
+    return true, nil
+end
+
+-- Echo a transmitted payload into the SAME view and log the receive path
+-- uses ([display] tx_echo, default on — llcom's showSend semantics: the
+-- user types a command and sees it land in the receive window, and the
+-- auto-save capture keeps it so the log reads like a session transcript).
+-- Display side goes through _append_imgui_receive (so auto_clear/frame-gap
+-- bookkeeping applies and the tail trims identically), with a "TX: " prefix
+-- on its own row; the log gets the same line RAW (byte-faithful contract:
+-- CRLF payloads keep their CR on disk, while the view folds it to LF like
+-- every RX line).  Runs only on the success path of core_send: a failed
+-- write never pollutes the transcript.
+function Window:_echo_tx(payload)
+    if not self._tx_echo or not payload or payload == "" then
+        return
+    end
+    -- Open a fresh row when the view tail sits mid-line (RX fragment or a
+    -- previous echo without its own newline — the same anchor the frame-gap
+    -- breaker consults).
+    if self._view_tail_open then
+        self:_append_imgui_receive("\n")
+    end
+    local line = "TX: " .. payload
+    if self._log_active and self.core then
+        -- Raw copy keeps the payload's own bytes (a CRLF payload stays CRLF on
+        -- disk); only close the row when the payload did not end with one —
+        -- an unconditional "\n" here used to double-terminate CRLF payloads.
+        local raw = line
+        if raw:sub(-1) ~= "\n" then
+            raw = raw .. "\n"
+        end
+        xcom.log_append(self.core, raw, #raw)
+    end
+    -- Display copy: guarantee the row closes even for payloads that lack a
+    -- terminator, and fold CRLF the way the receive text view does.
+    local display = line:gsub("\r\n", "\n")
+    if display:sub(-1) ~= "\n" then
+        display = display .. "\n"
+    end
+    self:_append_imgui_receive(display)
 end
 
 function Window:core_set_options(opts)
@@ -915,6 +1130,30 @@ function Window:_push_display_options()
     local opts = self:_display_options()
     recv.hex_view = opts.receive_hex
     recv.timestamp = opts.timestamp
+    -- Display-side enforcement cache for the two options the core/DLL never
+    -- act on (see the _append_imgui_receive decision comments).  Refreshed
+    -- here because this runs on every ActionSyncDisplay (widget edits write
+    -- straight into the Lua-owned int buffers) and on every connect edge.
+    self._auto_clear_bytes = opts.auto_clear_bytes or 0
+    if self.imgui and self.imgui.frame_gap_enabled and self.imgui.frame_gap_ms then
+        local en = self.imgui.frame_gap_enabled[0] ~= 0
+        local ms = self.imgui.frame_gap_ms[0]
+        if not (ms > 0) then ms = 0 end
+        self._frame_gap_en = en and ms > 0
+        self._frame_gap_ms = ms
+    end
+    if self.imgui and self.imgui.charset then
+        -- Charset selection: the C++ combo (Phase 4) writes the index into
+        -- imgui.charset; resolve it back to a name here.  Hex view is
+        -- byte-faithful "AA BB" text, so conversion is suspended while active.
+        local name = imgui_bridge.CHARSET_ITEMS[self.imgui.charset[0] + 1]
+        if name and name ~= self._charset_name then
+            self._charset_name = name
+            charset.set(name)
+        end
+    end
+    self._charset_active = not opts.receive_hex and
+        (self._charset_name ~= "ASCII" and self._charset_name ~= "UTF-8")
     self:core_set_options({
         hex_view = opts.receive_hex,
         timestamp = opts.timestamp,
@@ -985,10 +1224,13 @@ function Window:poll_display()
         end
         drained_any = true
         -- Log first (persistence), then the display tail (trimmable).
+        -- The log always records the RAW batch: display-side transforms
+        -- (charset conversion, script hooks, line filter) must never alter
+        -- the byte-faithful capture.
         if self._log_active then
             xcom.log_append(self.core, text, #text)
         end
-        self:_append_imgui_receive(text)
+        self:_process_rx_batch(text)
         -- The native RICHEDIT is hidden while the ImGui dashboard is active;
         -- feeding it is invisible work that still walks the whole batch
         -- through EM_REPLACESEL + colouring.  Only feed when visible.
@@ -1004,6 +1246,56 @@ function Window:poll_display()
 end
 jit.off(Window.poll_display)
 
+-- Display-side receive funnel.  Runs the RAW drained batch through the
+-- user-script engine (charset convert -> on.receive hooks -> line filter —
+-- the engine itself is a no-op passthrough when no script is enabled) and
+-- appends the result to the ImGui tail.  nil result = the batch was consumed
+-- by a script or filtered out entirely; nothing reaches the viewport.
+-- Perf note: this sits on the 10 ms drain path, so the engine's fast paths
+-- (no scripts -> single boolean check; no filter rules -> single table scan)
+-- are the budget-critical ones (see MEMORY.md receive-chain rules).
+function Window:_process_rx_batch(text)
+    -- Auto frame-break ([display] frame_gap_ms, "自动断帧").  NEITHER the
+    -- core nor the ImGui DLL acts on it (the DLL only renders the toggle +
+    -- ms field against Lua-owned int buffers; the core ABI has no gap
+    -- concept), so it is enforced here, display-side: when this drained
+    -- batch lands more than N ms after the previous one AND the view tail
+    -- ends mid-line, force a chunk boundary + newline first so a half frame
+    -- never sits open across an idle gap.  The auto-save log written by
+    -- poll_display carries the raw batch untouched — this is a pure display
+    -- transform.  uv.now() is the loop-cached monotonic clock, so the
+    -- several batches drained inside ONE poll never fake a gap.
+    if self._frame_gap_en then
+        local now = uv.now()
+        local last = self._rx_last_batch_ms
+        if last and now - last > self._frame_gap_ms and self._view_tail_open then
+            self:_append_imgui_receive("\n")
+        end
+        self._rx_last_batch_ms = now
+    else
+        -- While off, keep the anchor unarmed so re-enabling never breaks on
+        -- a stale timestamp from the previous enabled stretch.
+        self._rx_last_batch_ms = nil
+    end
+    -- Charset conversion (display only; GB2312/BIG5/SJIS/UTF-16 -> UTF-8).
+    -- Passthrough returns the same string reference at zero cost.
+    if self._charset_active then
+        text = charset.convert(text) or text
+    end
+    if self.scripts then
+        local ok, processed = pcall(self.scripts.process_rx, self.scripts, text)
+        if not ok then
+            io.stderr:write("[scripts] rx funnel: " .. tostring(processed) .. "\n")
+            return
+        end
+        if processed == nil or processed == "" then
+            return
+        end
+        text = processed
+    end
+    self:_append_imgui_receive(text)
+end
+
 -- Append a receive batch to the tail window.  Chunks beyond the configured
 -- window are retired by advancing a start cursor — no table.remove (which
 -- shifts the whole array per pop) and no per-append string copies.  The
@@ -1011,6 +1303,7 @@ jit.off(Window.poll_display)
 -- cursor, or a single :sub when the tail outgrew one chunk).
 function Window:_append_imgui_receive(text)
     if not text or #text == 0 then return end
+    self._imgui_receive_total = (self._imgui_receive_total or 0) + #text
     local window = self._receive_window or 65535
     local chunks = self._imgui_receive_chunks
     chunks[#chunks + 1] = text
@@ -1028,6 +1321,28 @@ function Window:_append_imgui_receive(text)
     end
     self._imgui_receive_cursor = cursor
     self._imgui_receive_dirty = true
+    -- Auto frame-break anchor: the view ends mid-line unless this chunk's
+    -- last byte is '\n' (the DLL line model — see xcom_imgui_bridge.cpp's
+    -- receive_line_offsets_ rescan: only '\n' opens a new row).
+    self._view_tail_open = text:byte(-1) ~= 10
+    -- Auto-clear enforcement ([display] auto_clear_bytes, "自动清空").  The
+    -- core ABI stores this field in XcomDisplayOptions but never acts on it
+    -- (xcom_set_options only keeps hex/timestamp/pause — xcom_abi.cpp), and
+    -- the ImGui DLL only renders the widget, so the threshold lives HERE.
+    -- Anchor decision: at the end of every append, because
+    -- _imgui_receive_total is exactly "bytes shown since the last clear" and
+    -- the append is the single funnel all display bytes flow through
+    -- (charset/script transforms already applied, so the byte count matches
+    -- what the user actually sees).  Semantics mirror SSCOM's: once the
+    -- accumulated view since the last clear REACHES the threshold, the whole
+    -- view resets — including the batch that crossed the line — and display
+    -- continues from empty.  The reset touches view state only: the
+    -- auto-save log was already written from the RAW batch in poll_display
+    -- (data-loss contract) and the core counters stay untouched.
+    local limit = self._auto_clear_bytes or 0
+    if limit > 0 and self._imgui_receive_total >= limit then
+        self:_clear_imgui_view()
+    end
 end
 
 function Window:_flush_imgui_receive()
@@ -1049,13 +1364,37 @@ function Window:_flush_imgui_receive()
     else
         combined = (self._imgui_receive or "") .. table.concat(chunks, "", cursor)
     end
-    local tail = #combined > window and combined:sub(-window) or combined
+    -- Keep the tail one byte under the window size: the native buffer is
+    -- sized capacity-1 (NUL) and TRUNCATES PREFIX-FIRST, so pushing exactly
+    -- `window` bytes would silently drop the freshest byte at saturation.
+    local tail = #combined >= window and combined:sub(-(window - 1)) or combined
     self._imgui_receive = tail
     self._imgui_receive_chunks = {}
     self._imgui_receive_cursor = 1
     self._imgui_receive_chunk_bytes = 0
     self._imgui_receive_dirty = false
     return true
+end
+
+-- Reset the receive VIEW only (ImGui tail buffer + absolute coordinate
+-- space).  Shared by the manual Clear action and the auto_clear_bytes
+-- threshold hit in _append_imgui_receive.  Deliberately NOT part of this:
+-- the auto-save log (byte-faithful, written from the raw batch in
+-- poll_display) and the core rx/tx counters — an auto clear must never
+-- touch either, per the data-loss contract documented on poll_display.
+function Window:_clear_imgui_view()
+    self._imgui_receive = ""
+    self._imgui_receive_chunks = {}
+    self._imgui_receive_cursor = 1
+    self._imgui_receive_chunk_bytes = 0
+    self._imgui_receive_dirty = false
+    -- Restart the absolute coordinate space with the buffer: the native side
+    -- drops any selection on the empty push, base resets there too.
+    self._imgui_receive_total = 0
+    self._view_tail_open = false
+    if self.imgui then
+        self.imgui:set_receive_text("")
+    end
 end
 
 -- jit.off: this is the ImGui frame driver — it calls into the xcom_imgui C
@@ -1080,6 +1419,11 @@ function Window:request_frame(interval_ms)
     if not self._imgui_next_frame or next_frame < self._imgui_next_frame then
         self._imgui_next_frame = next_frame
     end
+    -- Demand latch: any producer that pulls a frame means real screen content
+    -- may have changed.  render_imgui drains this; when it is zero it skips the
+    -- expensive idle-heartbeat redraw (below).  Only a request here (input,
+    -- receive, status, data-loss, script, timer) lifts the frame off the floor.
+    self._frame_demand = (self._frame_demand or 0) + 1
 end
 
 -- Queue a closure for the P2 layer of run_message_loop.  Use this instead of
@@ -1113,6 +1457,19 @@ function Window:render_imgui()
         self._imgui_next_frame = now + FRAME_INTERVAL_IDLE_MS
         return
     end
+    -- Demand-gated idle suppression.  A WARP (software) frame costs ~45-60 ms of
+    -- CPU, so redrawing twice a second while the app sits quiet (no input, no
+    -- receive, no status change) is pure burn.  Only render when a producer has
+    -- asked for a frame (request_frame/set_status_deferred/input/receive bump
+    -- self._frame_demand) since the last render.  Otherwise we do NOT call the
+    -- expensive frame(); we merely re-arm a conservative probe so a missed
+    -- producer can never leave the screen permanently stale.  A nil
+    -- _imgui_next_frame (startup, expose, resize) always forces a frame.
+    if self._imgui_next_frame ~= nil and (self._frame_demand or 0) == 0 then
+        self._imgui_next_frame = now + FRAME_INTERVAL_IDLE_MS
+        return
+    end
+    self._frame_demand = 0
     self._imgui_next_frame = now + FRAME_INTERVAL_IDLE_MS
     if not self.imgui:frame() then return end
     -- P3 commit: the deferred status text (set_status_deferred) lands in this
@@ -1121,10 +1478,26 @@ function Window:render_imgui()
         self.imgui:set_status(self._status_dirty)
         self._status_dirty = nil
     end
+    -- P3 commit: highlight rules from the script engine (coalesced the same
+    -- way — one packed push per frame at most; no-op on pre-Phase-4 DLLs
+    -- where set_highlight_rules is nil).
+    if self._script_rules_dirty and self.imgui.set_highlight_rules then
+        self._script_rules_dirty = false
+        self.imgui:set_highlight_rules(self._script_rules or {})
+    end
+    -- P3 commit: script console log tail (ring snapshot, only when the
+    -- engine logged something new since the last frame).
+    if self.scripts and self.imgui.set_script_log then
+        local log_text, dirty = self.scripts:log_lines()
+        if dirty then self.imgui:set_script_log(log_text) end
+    end
+    self:_pump_script_console()
+    self:_pump_plugin_pages()
     local receive_changed = self:_flush_imgui_receive()
     local rx = self._imgui_receive or ""
     if receive_changed then
-        self.imgui:set_receive_text(rx)
+        -- Window start in absolute bytes: total minus what the tail keeps.
+        self.imgui:set_receive_text(rx, (self._imgui_receive_total or 0) - #rx)
     end
     local actions = self.imgui:draw(
         self.connected, self._rx_bytes or 0, self._tx_bytes or 0)
@@ -1274,6 +1647,306 @@ function Window:_sync_imgui_autosave()
         self:_log_close_deferred()
     end
 end
+
+-- ---- script console (Phase 4 C++ widgets; handlers exist now so the
+-- action bits map before the DLL ships) --------------------------------------
+
+function Window:_imgui_scripts_toggle()
+    -- The C++ side owns the open/close state (scripts_visible_); Lua only
+    -- mirrors it for config persistence.
+    self._scripts_console_open = not self._scripts_console_open
+    self:request_frame()
+end
+
+function Window:_imgui_scope_toggle()
+    self._scope_open = not self._scope_open
+    self:request_frame()
+end
+
+function Window:_imgui_settings_toggle()
+    self._settings_open = not self._settings_open
+    self:request_frame()
+end
+
+-- ---------------------------------------------------------------------------
+-- Headless UI smoke hooks (automated screenshot verification).
+--
+-- Synthetic mouse input cannot reach the ImGui backend, so a verification
+-- script forces the floating windows open through env vars instead of
+-- clicks.  Both branches are strict no-ops unless the env var equals "1",
+-- so normal runs see zero behavior change.  Called once from Window:start()
+-- after the imgui bridge and the _scope_open/_settings_open mirrors exist.
+-- ---------------------------------------------------------------------------
+
+function Window:_smoke_env_hooks()
+    if not self.imgui then return end
+    if os.getenv("XCOM_SMOKE_SETTINGS") == "1" then
+        -- Mirror the header gear chip: the Lua flag drives config
+        -- persistence; the DLL owns the real visibility (settings_visible_)
+        -- through the imgui_bridge wrapper over xcom_imgui_set_settings_visible.
+        self._settings_open = true
+        if self.imgui.set_settings_visible then
+            self.imgui:set_settings_visible(true)
+        end
+    end
+    if os.getenv("XCOM_SMOKE_SCOPE") == "1" then
+        -- The Lua->DLL scope-visible route exists (cdef in
+        -- ui/imgui_bridge.lua: xcom_imgui_scope_set_visible; wrappers
+        -- M:set_scope_visible and the alias M:scope_set_visible), so no
+        -- new C export is needed.  Data is fed separately by
+        -- scripts/smoke_ui.lua via wave.push.
+        self._scope_open = true
+        if self.imgui.set_scope_visible then
+            self.imgui:set_scope_visible(true)
+        elseif self.imgui.scope_set_visible then
+            self.imgui:scope_set_visible(true)
+        end
+    end
+    if os.getenv("XCOM_SMOKE_OPEN") == "1" and self._sim_active then
+        -- Synthetic clicks cannot reach ImGui, so the end-to-end simulator
+        -- check opens the VIRTUAL session programmatically: stamp the combo
+        -- selection exactly like a user pick would (_serial_config reads
+        -- _imgui_port first) and issue the same core_open the "打开" button
+        -- routes through.  The connected edge in _render_ui_state then arms
+        -- the sim pump as usual.  Strictly gated: hardware machines and
+        -- plain runs never enter this branch.
+        self._imgui_port = "VIRTUAL"
+        -- Optional profile override for the E2E check (e.g. "wave" feeds the
+        -- Scope window); unknown names are rejected by the sim itself.
+        local want_profile = os.getenv("XCOM_SMOKE_SIM_PROFILE")
+        if want_profile and want_profile ~= "" then
+            self.sim:profile(want_profile)
+        end
+        self:core_open()
+    end
+    self:request_frame()
+end
+
+-- Plugin settings pages (C++ spec-rendered widgets -> Lua callbacks):
+-- diff the engine's ui.page() declarations against what the DLL currently
+-- holds, push additions/changes (removals as spec=nil), then drain queued
+-- interactions back into the owning script's ui.event callback.
+function Window:_pump_plugin_pages()
+    if not self.scripts or not self.imgui then return end
+    if not self.imgui.set_plugin_page then return end   -- pre-settings DLL
+    self._plugin_pushed = self._plugin_pushed or {}
+    local pages = self.scripts:collect_ui_pages()
+    local seen = {}
+    for _, page in ipairs(pages) do
+        seen[page.id] = true
+        local signature = page.title .. "\1" .. page.spec
+        if self._plugin_pushed[page.id] ~= signature then
+            self._plugin_pushed[page.id] = signature
+            self.imgui:set_plugin_page(page.id, page.title, page.spec)
+        end
+    end
+    for id in pairs(self._plugin_pushed) do
+        if not seen[id] then
+            self._plugin_pushed[id] = nil
+            self.imgui:set_plugin_page(id, id, nil)   -- remove stale tab
+        end
+    end
+    local events = self.imgui:take_plugin_events()
+    if events then
+        for _, event in ipairs(events) do
+            pcall(function() self.scripts:dispatch_ui_event(
+                event.page, event.kind, event.widget, event.value) end)
+        end
+    end
+end
+
+-- Script Console event pump (one batch per rendered frame):
+--   * push the script list + sync enable checkboxes (engine <-> C++ buffer);
+--   * drain C++ events (select/reload/new/folder/clear) into the engine;
+--   * drain the REPL command and the editor Ctrl+S save event.
+-- All no-ops on a pre-Phase-4 DLL (symbol probes return nil).
+function Window:_pump_script_console()
+    if not self.scripts or not self.imgui then return end
+    -- 1) Keep the list + enable buffer in sync (cheap: only when the set of
+    --    scripts changed OR enable states diverge — compare the packed list
+    --    signature).
+    if self.imgui.set_scripts then
+        local names = self.scripts:script_names()
+        local signature = table.concat(names, ",")
+        if signature ~= self._script_list_signature then
+            self._script_list_signature = signature
+            self.imgui:set_scripts(names)
+        end
+        -- Copy enable state engine -> C++ checkbox buffer once per frame
+        -- only when the console is open (the checkboxes write back through
+        -- the same buffer the engine reads below).
+        if self._scripts_console_open and self.imgui._script_enabled_buf then
+            local buf = self.imgui._script_enabled_buf
+            for i, name in ipairs(names) do
+                buf[i - 1] = self.scripts:is_enabled(name) and 1 or 0
+            end
+        end
+    end
+    -- 2) Editor save event (Ctrl+S): write the file, reload the script.
+    if self.imgui.take_editor_save then
+        local path, text = self.imgui:take_editor_save()
+        if path then
+            local f = io.open(path, "wb")
+            if f then
+                f:write(text)
+                f:close()
+                if self.scripts then
+                    for i, name in ipairs(self.scripts:script_names()) do
+                        if self.scripts.scripts[name] and
+                            self.scripts.scripts[name].path == path then
+                            self.scripts:reload(name)
+                            break
+                        end
+                    end
+                end
+            else
+                io.stderr:write("[scripts] cannot save " .. tostring(path) .. "\n")
+            end
+        end
+    end
+    -- 3) Console events.
+    if self.imgui.take_script_events then
+        local events = self.imgui:take_script_events()
+        if events then
+            local names = self.scripts:script_names()
+            for _, event in ipairs(events) do
+                local name = names[event.index + 1]
+                if event.type == 1 then       -- Edit / select
+                    if event.flag then
+                        -- Ctrl+S save marker: consumed by take_editor_save.
+                    elseif name then
+                        self._script_edit_name = name
+                        self.imgui:script_select(event.index)
+                        local record = self.scripts.scripts[name]
+                        if record then
+                            local f = io.open(record.path, "rb")
+                            if f then
+                                local text = f:read("*a")
+                                f:close()
+                                self.imgui:script_load_editor(record.path, text or "")
+                            end
+                        end
+                    end
+                elseif event.type == 2 then   -- Reload
+                    if name then self.scripts:reload(name) end
+                elseif event.type == 3 then   -- Open folder (shell-execute)
+                    local dir = (self.config_path and
+                        self.config_path:match("^(.*)[/\\]") or ".") .. "/scripts"
+                    os.execute('start "" "' .. dir:gsub("/", "\\") .. '"')
+                elseif event.type == 4 then   -- Clear log
+                    self.scripts:clear_log()
+                elseif event.type == 5 then   -- New script
+                    self:_script_create_new()
+                end
+            end
+        end
+    end
+    -- 4) Enable-state feedback: C++ checkboxes -> engine (the buffer is
+    --    Lua-owned; compare against the engine state and apply deltas).
+    if self._scripts_console_open and self.imgui._script_enabled_buf then
+        local names = self.scripts:script_names()
+        local buf = self.imgui._script_enabled_buf
+        for i, name in ipairs(names) do
+            local want = buf[i - 1] ~= 0
+            if want ~= self.scripts:is_enabled(name) then
+                self.scripts:enable(name, want)
+            end
+        end
+    end
+    -- 5) REPL command.
+    if self.imgui.take_script_command then
+        local command = self.imgui:take_script_command()
+        if command and command ~= "" then
+            self.scripts:eval_command(command)
+        end
+    end
+end
+
+-- Create a new script file with a starter template (unique numbered name).
+function Window:_script_create_new()
+    local dir = (self.config_path and
+        self.config_path:match("^(.*)[/\\]") or ".") .. "/scripts"
+    local n = 1
+    while self.scripts.scripts[string.format("new_%d.lua", n)] or
+          io.open(dir .. string.format("/new_%d.lua", n), "rb") do
+        n = n + 1
+    end
+    local name = string.format("new_%d.lua", n)
+    local path = dir .. "/" .. name
+    local f = io.open(path, "wb")
+    if not f then
+        io.stderr:write("[scripts] cannot create " .. path .. "\n")
+        return
+    end
+    f:write("-- " .. name .. "\n-- TODO: your script here.\n\n")
+    f:close()
+    self.scripts:load_all()
+    self._script_list_signature = nil  -- force list re-push next frame
+    self.scripts:enable(name, true)
+    self.scripts:log(3, name, "created")
+end
+
+-- ---- sequential multi-send ("Run" command list) ------------------------------
+-- Sends every ENABLED entry on the current page, one per gap interval, via a
+-- self-rearming one-shot uv timer (not a period timer: entries can be
+-- disabled/skipped, and a period timer would drift and double-fire across a
+-- stop/restart).  Run doubles as Stop while a sequence is in flight.
+function Window:_imgui_run_sequence()
+    if self._sequence_timer then
+        self:_stop_sequence()
+        return
+    end
+    if not self.imgui then return end
+    local entries = {}
+    for index = 0, 7 do
+        local text, enabled = self.imgui:multi_entry(index)
+        if enabled and text ~= "" then entries[#entries + 1] = text end
+    end
+    if #entries == 0 then
+        self:set_status_deferred("sequence: no enabled entries on this page")
+        return
+    end
+    local gap = 100
+    if self.imgui.multi_gap then
+        gap = math.max(0, tonumber(self.imgui.multi_gap[0]) or 100)
+    end
+    self._sequence_entries = entries
+    self._sequence_index = 0
+    self._sequence_timer = uv.new_timer()
+    local step
+    step = function()
+        self._sequence_index = self._sequence_index + 1
+        local index = self._sequence_index
+        if index > #entries or not self.imgui then
+            self:_stop_sequence()
+            return
+        end
+        local ok, err = pcall(function()
+            local payload = xcom.build_send_payload(entries[index],
+                self.imgui.multi_hex[0] ~= 0, self.imgui.multi_crlf[0] ~= 0)
+            if payload then self:core_send(payload, xcom.send_text) end
+        end)
+        if not ok then io.stderr:write("[sequence] " .. tostring(err) .. "\n") end
+        if index >= #entries then
+            self:_stop_sequence()
+            return
+        end
+        self:set_status_deferred(string.format("sequence %d/%d", index, #entries))
+    end
+    jit.off(step, true)
+    self._sequence_timer:start(0, gap, step)
+end
+
+function Window:_stop_sequence()
+    if self._sequence_timer then
+        self._sequence_timer:stop()
+        self._sequence_timer:close()
+        self._sequence_timer = nil
+    end
+    self._sequence_entries = nil
+    self:set_status_deferred("sequence done")
+end
+
 
 -- Close the log with a bounded retry.  The core's log_close(timeout_ms) is a
 -- SYNCHRONOUS wait for the writer to drain; calling it four times back-to-
@@ -1499,6 +2172,19 @@ function Window:_render_ui_state()
         elseif self._autosend_on then
             self:_set_autosend_enabled(true)
         end
+        -- SIM: the port reached OPEN.  If the selected port is one of the
+        -- simulator's virtual names, arm the pump (injects on a 20 ms timer).
+        -- Guarded by _sim_active, so real-port machines never reach this.
+        if self._sim_active and self:_sim_port_selected() then
+            self.sim:start(self._sim_open_port)
+        end
+    end
+    if was_connected and not state.connected then
+        -- SIM: session went OFFLINE (Close / fault) — disarm the pump so no
+        -- uv timer keeps injecting into a closed core.
+        if self._sim_active and self.sim:is_running() then
+            self.sim:stop()
+        end
     end
     if self.recv and self.recv.set_monitor_connected then
         self.recv.set_monitor_connected(state.connected)
@@ -1652,6 +2338,85 @@ function Window:start()
     end
     self.core = h
 
+    -- SIM: hardware-free serial data simulator (core/serial_sim.lua).  It
+    -- auto-activates ONLY when the registry enumeration sees no real ports
+    -- (sim:available() == #list_ports()==0), so machines with hardware keep
+    -- bit-identical behaviour: every call site below is gated on _sim_active.
+    -- The sim feeds bytes through xcom.test_inject_rx into the REAL display
+    -- pipeline once a VIRTUAL/TEST* session is opened.
+    self.sim = serial_sim.new({
+        xcom = xcom, win = self, uv = uv,
+        -- Low-frequency lifecycle diagnostics (arm/stop/overflow) -> stderr.
+        log = function(tag, msg) io.stderr:write("[" .. tag .. "] " .. msg .. "\n") end,
+    })
+    self._sim_active = self.sim:available() and true or false
+    if self._sim_active then
+        -- Re-publish the port combo so the SIM entries appear (the bridge was
+        -- populated during init_window, before the core handle existed).
+        self:_refresh_imgui_ports()
+    end
+
+    -- User script engine (scripts/ directory beside the app).  Enabled
+    -- names come from config [script] enabled (comma-separated).  The
+    -- engine no-ops everywhere when no script is enabled.
+    local script_dir = (self.config_path and
+        self.config_path:match("^(.*)[/\\]") or ".") .. "/scripts"
+    self.scripts = script_engine.new({
+        script_dir = script_dir,
+        send = function(payload) return self:core_send(payload, xcom.send_text) end,
+        is_open = function() return self.connected end,
+        on_rules_changed = function(rules)
+            self._script_rules = rules
+            self._script_rules_dirty = true
+        end,
+        wave = waveform,
+        charset = charset,
+        open_file = function() return self:_open_file_dialog("Send file") end,
+        sim = self._sim_active and self.sim or nil,
+        auto_reload = self.cfg.script_auto_reload and true or false,
+    })
+    local ok_scripts, err_scripts = pcall(function()
+        self.scripts:load_all()
+        for _, name in ipairs(self.cfg.script_enabled or {}) do
+            self.scripts:enable(name, true)
+        end
+    end)
+    if not ok_scripts then
+        io.stderr:write("[scripts] init: " .. tostring(err_scripts) .. "\n")
+    end
+    -- Script console visibility (config [script] autorun_console).  The C++
+    -- state mirrors this through set_scripts_visible; the header "Lua" button
+    -- toggles it later through the action bit.
+    self._scripts_console_open = self.cfg.script_autorun_console and true or false
+    -- Scope/settings mirrors start explicit-false: the flags are only flipped
+    -- by the C++ action bits, and `not nil` would read true on the first
+    -- toggle and desync from the (false-initial) native visibility.
+    self._scope_open = false
+    self._settings_open = false
+    if self._scripts_console_open and self.imgui and self.imgui.set_scripts_visible then
+        self.imgui:set_scripts_visible(true)
+    end
+    -- Env-driven smoke hooks (no-ops unless XCOM_SMOKE_* is set); the bridge
+    -- already exists because _init_imgui ran during construction.
+    self:_smoke_env_hooks()
+    -- One-shot rules push so the C++ highlighter starts warm.
+    local rules = self.scripts:take_rules_if_dirty()
+    if rules then
+        self._script_rules = rules
+        self._script_rules_dirty = true
+    end
+    -- 1 Hz housekeeping: pending partial-line idle flush + optional mtime
+    -- hot-reload.  (poll() itself is cheap; the timer stays alive for the
+    -- whole session and does nothing when the engine is idle.)
+    self._script_timer = uv.new_timer()
+    local script_poll_callback = function()
+        local ok, err = pcall(self.scripts.poll, self.scripts)
+        if not ok then io.stderr:write("[scripts] poll: " .. tostring(err) .. "\n") end
+    end
+    jit.off(script_poll_callback, true)
+    self._script_poll_callback = script_poll_callback
+    self._script_timer:start(1000, 1000, script_poll_callback)
+
     -- Wire connection-panel buttons / combos to handlers by control id.
     self:bind_handler(self.conn.open.id, "on_btn_open")
     self:bind_handler(self.conn.close.id, "on_btn_close")
@@ -1792,7 +2557,12 @@ function Window:run()
     run_message_loop(self)
     -- Close the libuv timer handles (they are no longer advanced once the
     -- message loop has returned; libuv requires explicit close to release).
-    for _, t in ipairs({ self._display_timer, self._status_timer, self._multi_timer }) do
+    -- SIM: idempotent defensive stop (on_close already armed this); ensures
+    -- the pump's uv handle is released even if the loop exited via a path
+    -- that skipped on_close.
+    if self._sim_active then self.sim:stop() end
+    for _, t in ipairs({ self._display_timer, self._status_timer,
+                         self._multi_timer, self._script_timer }) do
         if t then
             t:stop()
             t:close()
@@ -1838,14 +2608,9 @@ function Window:on_btn_close()
 end
 
 function Window:on_btn_clear()
-    self._imgui_receive = ""
-    self._imgui_receive_chunks = {}
-    self._imgui_receive_cursor = 1
-    self._imgui_receive_chunk_bytes = 0
-    self._imgui_receive_dirty = false
-    if self.imgui then
-        self.imgui:set_receive_text("")
-    end
+    -- Manual Clear: same view reset as the auto_clear threshold path (which
+    -- deliberately skips the RICHEDIT fallback below).
+    self:_clear_imgui_view()
     if self.recv and self.recv.clear then
         self.recv.clear(self.recv)
     end
@@ -1882,6 +2647,31 @@ function Window:_save_file_dialog(default_name)
     ofn.nMaxFile = buf_len
 
     if w.comdlg32.GetSaveFileNameW(ofn) == 0 then
+        return nil  -- cancelled or error
+    end
+    return w.utf16_to_utf8(ofn.lpstrFile, buf_len)
+end
+
+-- Open-picker mirroring _save_file_dialog (GetOpenFileNameW): returns a
+-- UTF-8 path string or nil on cancel.  Script plugins reach it through the
+-- engine's sys.open_file hook injected below; the settings UI has no text
+-- field, so a native dialog is the only path entry.
+function Window:_open_file_dialog(title)
+    local ofn = ffi.new("OPENFILENAMEW")
+    ofn.lStructSize = ffi.sizeof("OPENFILENAMEW")
+    ofn.hwndOwner = self.hwnd
+    ofn.lpstrFilter = w.utf8_to_utf16("All files (*.*)\0*.*\0")
+    ofn.lpstrTitle = w.utf8_to_utf16(title or "Open file")
+    ofn.Flags = w.ofn.OFN_FILEMUSTEXIST + w.ofn.OFN_PATHMUSTEXIST +
+                w.ofn.OFN_HIDEREADONLY + w.ofn.OFN_EXPLORER
+
+    local buf_len = 1024
+    local buf = ffi.new("unsigned short[?]", buf_len)
+    buf[0] = 0
+    ofn.lpstrFile = buf
+    ofn.nMaxFile = buf_len
+
+    if w.comdlg32.GetOpenFileNameW(ofn) == 0 then
         return nil  -- cancelled or error
     end
     return w.utf16_to_utf8(ofn.lpstrFile, buf_len)

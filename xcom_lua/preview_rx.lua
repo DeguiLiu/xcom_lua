@@ -45,11 +45,14 @@ if USE_ANSI then
     end
 else
     -- Readable pseudo-packet dump (resembles a real AT / binary-log tail).
+    -- Every 6th line carries a keyword the highlight/filter demo scripts
+    -- match (ERROR / WARN / OK) so the Phase-4 render can be reviewed.
+    local levels = { "INFO", "WARN", "ERROR", "INFO", "INFO", "OK" }
     for i = 1, 6 do
         lines[i] = string.format(
-            "[%02d:%02d:%02d.%03d] RX %04d B  dst=0x%02X  seq=%03d\n",
+            "[%02d:%02d:%02d.%03d] %-5s RX %04d B  dst=0x%02X  seq=%03d\n",
             (i * 3) % 24, (i * 7) % 60, (i * 11) % 60, (i * 977) % 1000,
-            (i * 137) % 4096, (i * 51) % 256, i)
+            levels[i], (i * 137) % 4096, (i * 51) % 256, i)
     end
 end
 
@@ -76,6 +79,16 @@ local cfg = {
     send_hex = false, send_crlf = false, autosend_period_ms = 0,
     quick_pages = { { text = {}, enabled = {} } },
     quick = { text = {}, enabled = {} },
+    -- Phase 3/4 funnel fields (must match main.lua's cfg surface; the
+    -- preview previously died silently without them because window.lua's
+    -- funnel pushed a nil charset through charset.set).
+    script_enabled = {},
+    script_auto_reload = false,
+    script_autorun_console = false,
+    baud_custom = 0,
+    multi_gap_ms = 100,
+    charset = "ASCII",
+    frame_gap_ms = 0,
 }
 
 local ok, win = pcall(window.new, cfg, cfg_data, APP .. "/config.ini")
@@ -89,6 +102,29 @@ if not win:init_window() then
 end
 -- Do not try to open a real port in preview; the dashboard renders offline.
 -- win:start() would create an xcom handle + poll timers against empty core.
+-- BUT start() also constructs the script engine; replicate just that part so
+-- highlight/filter/wave scripts participate in the offline preview.
+local script_engine = require("script_engine")
+local waveform = require("waveform")
+win.scripts = script_engine.new({
+    script_dir = APP .. "/scripts",
+    send = function() end,
+    is_open = function() return false end,
+    wave = waveform,
+})
+pcall(function()
+    win.scripts:load_all()
+    for _, name in ipairs(win.cfg.script_enabled or {}) do
+        win.scripts:enable(name, true)
+    end
+end)
+local rules = win.scripts:take_rules_if_dirty()
+if rules then
+    win._script_rules = rules
+    win._script_rules_dirty = true
+end
+-- The rules flush happens in render_imgui (set_highlight_rules); nothing else
+-- to wire — the funnel in _process_rx_batch already consults win.scripts.
 
 -- ---- stream mock data into the same receive buffer ----------------------
 -- Each tick appends ~REPEAT lines (a few KiB).  Bigger still lands under the
@@ -98,7 +134,9 @@ local REPEAT = 60           -- mock "line" per tick (bytes read shape)
 local append_all = function()
     local buf = {}
     for _ = 1, REPEAT do buf[#buf + 1] = mock_chunk() end
-    win:_append_imgui_receive(table.concat(buf))
+    -- Route through the full receive funnel (charset -> script hooks ->
+    -- line filter) so highlight/filter/wave demos are reviewable offline.
+    win:_process_rx_batch(table.concat(buf))
     -- poll_display normally requests the frame; the preview bypasses the
     -- poller, so pull the data-cadence frame explicitly (otherwise the
     -- stream only advances on the 500 ms idle heartbeat).

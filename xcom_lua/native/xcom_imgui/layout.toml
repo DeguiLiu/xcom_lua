@@ -4,12 +4,32 @@ sidebar_width = 180
 compact_threshold = 760
 receive_height = 0
 # send_height drives the receive log size: receive_height==0 means the log
-# panel takes everything the send workspace does not.  Keep send compact so
-# the log dominates the viewport (the transmit area scrolls if needed).
+# panel takes everything the send workspace does not.  196 is the measured
+# minimum that fits the Multi tab without scrolling (tab strip + HEX/NEWLINE
+# row + 4x2 slot grid + paging row, per the 5.png multi-send layout).
 send_height = 196
-header_height = 36
+# 30 matches the 1.png header band (measured hairline at logical y=30) and the
+# kHeaderHeight default in the bridge.
+header_height = 30
 panel_gap = 0
 window_padding = 1
 item_spacing = 7
 frame_padding_y = 4
 section_gap = 4
+
+# UI language for the bridge label tables (Lang/kLangZh/kLangEn in
+# xcom_imgui_bridge.cpp). "zh" (default) | "en"; applied at init only.
+# This file is the build source: CMake POST_BUILD copies it over
+# runtime/assets/layout.toml, so the language line lives HERE (not only in
+# the runtime copy) or every rebuild silently drops it.
+[ui]
+language = "zh"
+
+# [font] switches.
+# show_chinese_in_receive (default false): merge the CJK glyph set into the
+# mono receive-log font so converted UTF-8 (GB2312/BIG5/SJIS) renders as hanzi.
+# When false the receive log shows '?' for CJK bytes and the ~26 MB CJK bitmap
+# is not baked (memory-first default).  This maps to the settings-page
+# "Show Chinese in receive" checkbox and the bridge's font_mono_cjk_ flag.
+[font]
+show_chinese_in_receive = false

@@ -20,6 +20,17 @@ if arg and arg[0] and arg[0]:sub(1, 1) ~= "@" then
     end
     package.path = dir .. "/core/?.ljbc;" .. dir .. "/ui/?.ljbc;" ..
                    dir .. "/core/?.lua;" .. dir .. "/ui/?.lua;" .. package.path
+    -- Vendored pure-Lua libraries (docs/lua-libs-value-and-recommendations.md
+    -- section 5): one injection point here, not per-script path munging.
+    -- A-tier only; stdlib-ext (mutates built-ins) is deliberately excluded.
+    -- Copies live inside the project (libs/, vendored per-project — the
+    -- ../third_party tree is a scratch source, not a runtime dependency).
+    package.path = dir .. "/libs/protocol/?.lua;" ..
+                   dir .. "/libs/lua51/?.lua;" ..
+                   dir .. "/libs/lua51/?/init.lua;" ..
+                   dir .. "/libs/lua51/penlight/?.lua;" ..
+                   dir .. "/libs/openresty/?.lua;" ..
+                   package.path
 end
 
 local config = require("config")
@@ -31,12 +42,17 @@ local xcom = require("xcom_ffi")
 -- also calls this defensively, but geometry normalization happens first.
 w.load()
 
--- LuaJIT must not trace any frame that can be re-entered by Win32 or ImGui's
--- C callbacks.  A single missed child trace causes the process-level
--- ``bad callback`` panic when a combo/button is clicked.  The UI is I/O
--- bound, so interpreted Lua has negligible impact and keeps every callback
--- path deterministic; native ImGui/core code remains optimized C++.
-if jit and jit.off then jit.off() end
+-- LuaJIT stays ON by default (docs/lua_coding_guidelines.md §6: a global
+-- jit.off() is forbidden — interpreter mode is far slower).  The C-re-entry
+-- hazard it used to guard against (``bad callback`` panic when traced Lua is
+-- re-entered by Win32/ImGui) is handled at the correct scope instead: every
+-- closure C can re-enter — the WndProc FFI callback, the message pump, the
+-- ImGui render driver and every luv timer callback — carries its own
+-- jit.off(fn[, true]); the recursive flag also switches off statically
+-- nested protos so no trace can start on a re-entry path.  FFI calls that do
+-- NOT re-enter Lua (xcom core, Win32, ImGui pulls) stay traceable and get the
+-- full JIT speedup.  New C callbacks MUST follow the same rule or the panic
+-- can return.
 
 local APP_DIR = (arg and arg[0] and arg[0]:match("^(.*)[/\\]")) or "."
 local CONFIG_PATH = APP_DIR .. "/config.ini"
@@ -88,6 +104,24 @@ local cfg = {
     send_hex = config.get(cfg_data, "send", "hex", false),
     send_crlf = config.get(cfg_data, "send", "crlf", false),
     autosend_period_ms = config.get(cfg_data, "send", "autosend_period_ms", 0),
+    -- Script engine settings ([script] section).
+    script_enabled = (function()
+        local raw = config.get(cfg_data, "script", "enabled", "")
+        local names = {}
+        for name in tostring(raw):gmatch("[^,%s]+") do
+            names[#names + 1] = name
+        end
+        return names
+    end)(),
+    script_auto_reload = config.get(cfg_data, "script", "auto_reload", false),
+    script_autorun_console = config.get(cfg_data, "script", "autorun_console", false),
+    -- Feature-extension settings (consumed once the Phase 4/5 widgets ship;
+    -- kept in cfg from day one so config round-trips preserve them).
+    baud_custom = config.get(cfg_data, "serial", "baud_custom", 0),
+    multi_gap_ms = config.get(cfg_data, "send", "multi_gap_ms", 100),
+    charset = config.get(cfg_data, "display", "charset", "ASCII"),
+    frame_gap_ms = config.get(cfg_data, "display", "frame_gap_ms", 0),
+    tx_echo = config.get(cfg_data, "display", "tx_echo", true),
 }
 local page_count = math.max(1, math.min(config.get(cfg_data, "multipage", "page_count", 1), 50))
 cfg.quick_pages = {}

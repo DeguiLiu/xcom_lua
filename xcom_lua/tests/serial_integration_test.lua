@@ -1,5 +1,15 @@
--- Real serial integration test. Usage:
---   runtime\luajit.exe tests\serial_integration_test.lua COM4
+-- Integration test for the open -> send -> rx-pipeline -> close contract.
+-- Usage:
+--   runtime\luajit.exe tests\serial_integration_test.lua            (VIRTUAL)
+--   runtime\luajit.exe tests\serial_integration_test.lua COM4       (hardware)
+--
+-- Default port is the hardware-free VIRTUAL session (xcom_abi.cpp
+-- is_virtual_port): it opens in-process with no serial backend.  TX semantics
+-- on VIRTUAL are acceptance-only (xcom_core.cpp owner_write: the payload is
+-- consumed, tx_bytes counts; nothing reaches a wire and nothing echoes back),
+-- so the display assertion below is fed by xcom_test_inject_rx -- the very
+-- seam the real rx callback shares.  Pass a COM name to run the same checks
+-- against physical hardware.
 
 local ffi = require("ffi")
 ffi.cdef[[void Sleep(unsigned long ms);]]
@@ -9,7 +19,7 @@ local root = tests_dir:gsub("[/\\]$", "") .. "/.."
 package.path = root .. "/core/?.lua;" .. package.path
 local xcom = require("xcom_ffi")
 
-local port = (arg and arg[1]) or "COM4"
+local port = (arg and arg[1]) or "VIRTUAL"
 local handle, err = xcom.create()
 assert(handle, err)
 local function finish(code)

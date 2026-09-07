@@ -80,10 +80,11 @@ local function run_scenario(chunk_size, raw, label)
     local handle, err = xcom.create()
     if not handle then error(err) end
 
-    -- open: no real port needed... but test_inject_rx requires OPEN state.
-    -- Reuse the loopback trick: open COM3 if present, else fail politely.
-    -- (The core treats injected bytes exactly like serial bytes.)
-    local rc = tonumber(xcom.open_async(handle, "COM3", 115200, 8, 0, 0, 0, false, false))
+    -- open: VIRTUAL session (xcom_abi.cpp is_virtual_port) -- hardware-free.
+    -- test_inject_rx requires an OPEN port; VIRTUAL reaches OPEN in-process
+    -- with no serial backend, and the core treats injected bytes exactly like
+    -- real serial bytes, so the formatting pipeline under test is identical.
+    local rc = tonumber(xcom.open_async(handle, "VIRTUAL", 115200, 8, 0, 0, 0, false, false))
     local opened = false
     for _ = 1, 40 do
         local s = xcom.get_snapshot(handle)
@@ -93,7 +94,7 @@ local function run_scenario(chunk_size, raw, label)
         ffi.C.Sleep(50)
     end
     if not opened then
-        print("  SKIP (COM3 not openable)")
+        print("  SKIP (VIRTUAL session did not reach open)")
         xcom.destroy(handle)
         return
     end

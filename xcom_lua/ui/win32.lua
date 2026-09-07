@@ -45,7 +45,9 @@ M.CP_ACP = 0
 
 M.ofn = {
     OFN_OVERWRITEPROMPT = 0x00000002,
+    OFN_HIDEREADONLY = 0x00000004,
     OFN_PATHMUSTEXIST = 0x00000800,
+    OFN_FILEMUSTEXIST = 0x00001000,
     OFN_EXPLORER = 0x00080000,
 }
 
@@ -142,6 +144,7 @@ M.wm = {
     WM_PAINT = 0x000F,
     WM_CLOSE = 0x0010,
     WM_ERASEBKGND = 0x0014,
+    WM_MOUSEHWHEEL = 0x020E,
     WM_SETCURSOR = 0x0020,
     WM_GETMINMAXINFO = 0x0024,
     WM_SIZE = 0x0005,
@@ -270,6 +273,15 @@ M.clipPrecision = { CLIP_DEFAULT_PRECIS = 0 }
 M.outputPrecision = { OUT_DEFAULT_PRECIS = 0 }
 
 M.textAlign = { TA_LEFT = 0, TA_CENTER = 1, TA_RIGHT = 2, TA_TOP = 0, TA_BOTTOM = 8 }
+
+-- GDI constants for the waveform popup (wingdi.h).
+M.gdi = {
+    PS_SOLID = 0,
+    SRCCOPY = 0x00CC0020,
+    BI_RGB = 0,
+    DIB_RGB_COLORS = 0,
+    IDC_ARROW = 32512,
+}
 
 -- ---------------------------------------------------------------------------
 -- FFI declarations (definitions only; resolved lazily by load()).
@@ -536,7 +548,44 @@ typedef struct {
     LPCWSTR lpTemplateName;
 } OPENFILENAMEW;
 BOOL GetSaveFileNameW(OPENFILENAMEW* lpofn);
+BOOL GetOpenFileNameW(OPENFILENAMEW* lpofn);
 BOOL InitCommonControlsEx(const INITCOMMONCONTROLSEX* picce);
+
+/* ---- GDI drawing (waveform popup, core/waveform.lua) ---- */
+DWORD GetPixel(HDC hdc, int x, int y);
+BOOL MoveToEx(HDC hdc, int x, int y, POINT* lpPoint);
+BOOL LineTo(HDC hdc, int x, int y);
+BOOL Polyline(HDC hdc, const POINT* lppt, int cPoints);
+HPEN CreatePen(int iPenStyle, int cWidth, COLORREF color);
+BOOL BitBlt(HDC hdcDest, int xDest, int yDest, int wDest, int hDest,
+            HDC hdcSrc, int xSrc, int ySrc, DWORD rop);
+typedef struct {
+    DWORD biSize;
+    LONG  biWidth;
+    LONG  biHeight;
+    WORD  biPlanes;
+    WORD  biBitCount;
+    DWORD biCompression;
+    DWORD biSizeImage;
+    LONG  biXPelsPerMeter;
+    LONG  biYPelsPerMeter;
+    DWORD biClrUsed;
+    DWORD biClrImportant;
+} BITMAPINFOHEADER;
+typedef struct { BYTE rgbBlue; BYTE rgbGreen; BYTE rgbRed; BYTE rgbReserved; } RGBQUAD;
+typedef struct {
+    BITMAPINFOHEADER bmiHeader;
+    RGBQUAD bmiColors[1];
+} BITMAPINFO;
+int GetDIBits(HDC hdc, HBITMAP hbm, UINT start, UINT lines, void* bits,
+              BITMAPINFO* lpbi, UINT usage);
+
+/* ---- waveform popup window helpers ---- */
+HCURSOR LoadCursorA(HINSTANCE hInstance, LPCSTR lpCursorName);
+BOOL SetCapture(HWND hWnd);
+BOOL ReleaseCapture(void);
+BOOL SetForegroundWindow(HWND hWnd);
+/* PS_SOLID = 0; SRCCOPY = 0x00CC0020 (constants below, in M.gdi). */
 ]] 
 
 -- ---------------------------------------------------------------------------

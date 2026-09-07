@@ -8,6 +8,9 @@
 --   and a mid-line command echo should NOT get a timestamp glued to it.
 --
 -- Usage: runtime\luajit.exe tests\test_ts_midline.lua [COMport]
+--        no port arg -> VIRTUAL (hardware-free in-process session,
+--        xcom_abi.cpp is_virtual_port); the test only feeds bytes through
+--        xcom_test_inject_rx, so no physical endpoint is required.
 
 local ffi = require("ffi")
 ffi.cdef[[void Sleep(unsigned long ms);]]
@@ -22,7 +25,7 @@ end
 package.path = root .. "/core/?.lua;" .. package.path
 local xcom = require("xcom_ffi")
 
-local port = (arg and arg[1]) or "COM4"
+local port = (arg and arg[1]) or "VIRTUAL"
 local handle, err = xcom.create()
 assert(handle, err)
 local function finish(code)
