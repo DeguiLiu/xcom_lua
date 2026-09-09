@@ -113,6 +113,14 @@ function M.build(parent, x, y, w)
         c.move(panel.save, px + 10 + button_width, row_y, button_width, 30)
     end
     panel.layout(x, y, col_w)
+    -- bad-callback discipline (see ui/window.lua): layout drives c.move →
+    -- MoveWindow (synchronous WndProc re-entry); closures live in this
+    -- record, so pin them here.
+    if jit and jit.off then
+        for _, fn in pairs(panel) do
+            if type(fn) == "function" then pcall(jit.off, fn) end
+        end
+    end
     return panel
 end
 

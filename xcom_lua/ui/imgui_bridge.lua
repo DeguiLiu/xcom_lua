@@ -69,6 +69,9 @@ M.CHARSET_ITEMS = { "ASCII", "UTF-8", "GB2312", "BIG5", "SHIFT-JIS", "UTF-16" }
 
 local PORT_CAPACITY = 128
 local SEND_CAPACITY = 4096
+-- Cached once at load: per-call os.getenv on the 10 ms drain / render path is
+-- wasteful, and the debug flag never changes during a session.
+local _DEBUG = os.getenv("XCOM_DEBUG") == "1"
 local MULTI_SLOTS = 8
 local MULTI_SLOT_CAPACITY = 512
 -- Receive-tail window.  Default matches the historical fixed 64 KiB view;
@@ -405,12 +408,29 @@ function M:draw(connected, rx_bytes, tx_bytes)
     return actions
 end
 
+-- Read a C string from a fixed ffi char[N] buffer SAFELY: bounded (never
+-- scans past the allocation, which is what crashed the app when ImGui left
+-- the buffer unterminated at capacity) AND trimmed at the first NUL, because
+-- ffi.string(buf, N) with an explicit length returns ALL N bytes including
+-- the trailing padding -- sending "help\0\0\0..." to the wire.
+local function cstr(buf, capacity)
+    local s = ffi.string(buf, capacity)
+    local z = s:find("\0", 1, true)
+    if z then return s:sub(1, z - 1) end
+    return s
+end
+
 function M:port_name()
-    return ffi.string(self.port)
+    return cstr(self.port, PORT_CAPACITY)
 end
 
 function M:send_text()
-    return ffi.string(self.send)
+    local s = cstr(self.send, SEND_CAPACITY)
+    if _DEBUG then
+        io.stderr:write(string.format("[dbg] send_text len=%d head=%q\n",
+            #s, s:sub(1, 40)))
+    end
+    return s
 end
 
 function M:serial_config()
@@ -437,13 +457,15 @@ end
 
 function M:multi_entry(index)
     local offset = index * MULTI_SLOT_CAPACITY
-    return ffi.string(self.multi_text + offset), self.multi_enabled[index] ~= 0
+    return cstr(self.multi_text + offset, MULTI_SLOT_CAPACITY),
+        self.multi_enabled[index] ~= 0
 end
 
 function M:_store_page()
     local page = self.pages[self.multi_page[0] + 1]
     for index = 0, 7 do
-        page.text[index + 1] = ffi.string(self.multi_text + index * MULTI_SLOT_CAPACITY)
+        page.text[index + 1] = cstr(self.multi_text + index * MULTI_SLOT_CAPACITY,
+                                    MULTI_SLOT_CAPACITY)
         page.enabled[index + 1] = self.multi_enabled[index] ~= 0
     end
 end
@@ -518,6 +540,16 @@ end
 
 function M:close()
     self.lib.xcom_imgui_shutdown()
+end
+
+-- The WndProc dispatch tree reaches this module's methods dynamically
+-- (self.imgui:port_name() etc.), so per-method jit.off at the call sites in
+-- window.lua cannot cover them; pin the whole method table off JIT here (see
+-- the bad-callback analysis at the bottom of ui/window.lua).
+if jit and jit.off then
+    for _, fn in pairs(M) do
+        if type(fn) == "function" then pcall(jit.off, fn) end
+    end
 end
 
 return M

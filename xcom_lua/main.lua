@@ -53,6 +53,23 @@ w.load()
 -- NOT re-enter Lua (xcom core, Win32, ImGui pulls) stay traceable and get the
 -- full JIT speedup.  New C callbacks MUST follow the same rule or the panic
 -- can return.
+--
+-- XCOM_DEBUG=1 additionally attaches a trace compiler log: every compiled
+-- trace number + bytecode address lands on stderr.  A "bad callback" PANIC
+-- means a trace was live when an FFI callback re-entered; the last compiled
+-- traces bracket the culprit so it can be pinned with jit.off.
+if jit and jit.attach and os.getenv("XCOM_DEBUG") == "1" then
+    jit.attach(function(what, traceno, entry)
+        local where = "?"
+        local info = entry and type(entry) == "function"
+            and debug.getinfo(entry, "S") or nil
+        if info then
+            where = (info.short_src or "?") .. ":" .. tostring(info.linedefined or "?")
+        end
+        io.stderr:write(string.format("[jit] %s trace#%s entry=%s\n",
+            tostring(what), tostring(traceno), where))
+    end, "trace")
+end
 
 local APP_DIR = (arg and arg[0] and arg[0]:match("^(.*)[/\\]")) or "."
 local CONFIG_PATH = APP_DIR .. "/config.ini"

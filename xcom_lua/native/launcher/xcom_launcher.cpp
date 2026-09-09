@@ -12,13 +12,21 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     const std::size_t slash = runtime_dir.find_last_of(L"\\/");
     if (slash == std::wstring::npos) return ERROR_PATH_NOT_FOUND;
     runtime_dir.resize(slash);
-    std::wstring working_dir = runtime_dir;
-    const std::size_t parent_slash = working_dir.find_last_of(L"\\/");
+    // xcom.exe lives in <root>/runtime/.  luvjit.exe sits beside it in the
+    // same runtime/ dir; main.ljbc/main.lua live in the app root (one level up).
+    std::wstring app_root = runtime_dir;
+    const std::size_t parent_slash = app_root.find_last_of(L"\\/");
     if (parent_slash == std::wstring::npos) return ERROR_PATH_NOT_FOUND;
-    working_dir.resize(parent_slash);
+    app_root.resize(parent_slash);
 
     const std::wstring child = runtime_dir + L"\\luvjit.exe";
-    std::wstring command = L"\"" + child + L"\" \"" + working_dir + L"\\main.lua\"";
+    // Prefer the byte-code entry (release ships main.ljbc, no source), falling
+    // back to main.lua for a source checkout run directly via the launcher.
+    std::wstring entry = app_root + L"\\main.ljbc";
+    if (GetFileAttributesW(entry.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        entry = app_root + L"\\main.lua";
+    }
+    std::wstring command = L"\"" + child + L"\" \"" + entry + L"\"";
     std::vector<wchar_t> command_buffer(command.begin(), command.end());
     command_buffer.push_back(L'\0');
 
@@ -30,7 +38,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     startup.wShowWindow = SW_HIDE;
     PROCESS_INFORMATION process{};
     if (!CreateProcessW(child.c_str(), command_buffer.data(), nullptr, nullptr,
-                        FALSE, CREATE_NO_WINDOW, nullptr, working_dir.c_str(), &startup,
+                        FALSE, CREATE_NO_WINDOW, nullptr, app_root.c_str(), &startup,
                         &process)) {
         return static_cast<int>(GetLastError());
     }

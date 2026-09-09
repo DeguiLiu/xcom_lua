@@ -258,4 +258,16 @@ M._vmerge = vmerge
 M.new = create
 M.alloc_id = alloc_id
 
+-- bad-callback discipline (see the analysis at the bottom of ui/window.lua):
+-- every setter here (set_text/combo_*/checkbox/move/...) drives a Win32 call
+-- (SetWindowTextA/SendMessageA/MoveWindow) that synchronously re-enters the
+-- owning window's WndProc FFI callback; a trace-compiled setter on that path
+-- PANICs "bad callback".  These are low-frequency UI setters — pin the whole
+-- module surface once instead of chasing each call site.
+if jit and jit.off then
+    for _, fn in pairs(M) do
+        if type(fn) == "function" then pcall(jit.off, fn) end
+    end
+end
+
 return M

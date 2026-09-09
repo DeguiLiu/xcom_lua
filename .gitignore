@@ -27,6 +27,15 @@ openresty-1.29.2.1-win64.zip
 ref/
 _review_*/
 luajit2/
+luajit2-2.1-agentzh/
+luajit2-2.1-agentzh.zip
+
+# Release packages and archived trees (rebuilt by build_release.ps1)
+dist/
+_archived/
+
+# Local debug-run capture (run_debug.ps1 output)
+xcom_lua/xcom_debug.log
 
 # Python reference application is maintained in the parent project
 xcom_client/

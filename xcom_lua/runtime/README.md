@@ -1,16 +1,34 @@
 # xcom_lua runtime bundle
 
-This directory contains the generated/downloaded Windows runtime bundle for
-the LuaJIT client. These files are not hand-edited source: they are a
-convenience bundle for running a clean checkout on Windows. A developer can
-delete this directory and rebuild/download the same components locally.
+This directory contains the Windows runtime bundle for the LuaJIT client.
+These files are not hand-edited source: they are build outputs or vendored
+dependencies. A developer can delete this directory and rebuild them from the
+sources documented below.
 
 | File | Provenance |
 | --- | --- |
-| `luvjit.exe`, `lua51.dll`, `luv.dll` | Downloaded LuaJIT + libuv runtime |
-| `xcom_imgui.dll` | Generated from `native/xcom_imgui` and vendored Dear ImGui |
-| `xcom_core.dll` | Generated from the project `xcom_core` CMake target |
+| `luajit.exe`, `lua51.dll` | LuaJIT 2.1, built with MSVC from the **openresty/luajit2** checkout at `../luajit2-2.1-agentzh`. Build with `../luajit2-2.1-agentzh/build_msvc.cmd`. |
+| `luvjit.exe`, `luv.dll` | LuaJIT + libuv (luv) runtime, used by the packaged launcher |
+| `xcom_imgui.dll` | Generated from `native/xcom_imgui` and vendored Dear ImGui (MSVC) |
+| `xcom_core.dll` | Generated from the project `xcom_core` CMake target (MSVC) |
 | `xcom.exe` | Small Win32 launcher with an embedded application icon |
+
+## LuaJIT dependency
+
+We depend on **[openresty/luajit2](https://github.com/openresty/luajit2)** —
+the OpenResty-maintained LuaJIT 2.1 branch (agentzh). The vendored source
+checkout lives at `../luajit2-2.1-agentzh` and is built with MSVC:
+
+```cmd
+cd D:\workspace\SSCOM_lua\luajit2-2.1-agentzh
+build_msvc.cmd
+```
+
+This produces `luajit.exe` and `lua51.dll` and copies them here. The build
+uses `/MD` (dynamic Universal CRT), so the resulting `lua51.dll` depends on
+`VCRUNTIME140.dll` and the Universal CRT (`api-ms-win-crt-*.dll`). Target
+machines need the VS 2015-2022 x64 Redistributable, or the release package
+must bundle `vcruntime140.dll` / `msvcp140.dll` alongside the runtime.
 
 Launch `xcom.exe` for the packaged client. It starts `luvjit.exe` from the
 same directory with the parent `main.lua`, preserving the existing runtime

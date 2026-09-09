@@ -74,10 +74,38 @@ local PAL = {
 -- page_brush: GDI solid brush matching PAL.page, reused as the WNDCLASS
 -- background brush so the pre-first-frame client area paints gray (not white).
 local page_brush
+-- Diagnostics: with XCOM_DEBUG=1 every line below lands on stderr, which the
+-- 诊断模式 launcher script redirects to xcom_debug.log (stderr is unbuffered,
+-- so the last lines before a hard crash -- including LuaJIT's own panic text,
+-- which bypasses Lua entirely -- survive in the file).  The wndproc stream is
+-- filtered to INPUT messages only (keys, IME, clicks, WM_INPUT raw-input that
+-- ImGui_ImplWin32 registers for): logging every message would emit thousands
+-- of paint/hit-test lines per second and bury the smoking gun.
+local DEBUG_MODE = os.getenv("XCOM_DEBUG") == "1"
+local function dbg(fmt, ...)
+    if DEBUG_MODE then
+        io.stderr:write(string.format(fmt, ...) .. "\n")
+    end
+end
+local DBG_MSGS = {
+    [0x00F5] = "NCHITTEST", [0x0201] = "LBUTTONDOWN", [0x0202] = "LBUTTONUP",
+    [0x0203] = "LBUTTONDBLCLK", [0x0100] = "KEYDOWN", [0x0101] = "KEYUP",
+    [0x0102] = "CHAR", [0x0109] = "SYSCHAR",
+    [0x010D] = "IME_STARTCOMP", [0x010E] = "IME_ENDCOMP", [0x010F] = "IME_COMP",
+    [0x0281] = "IME_SETCTX", [0x0282] = "IME_NOTIFY", [0x0285] = "IME_SELECT",
+    [0x00FF] = "INPUT", [0x0111] = "COMMAND", [0x0005] = "SIZE",
+    [0x0007] = "SETFOCUS", [0x0008] = "KILLFOCUS",
+}
 local wndproc_callback = function(hwnd, msg, wparam, lparam)
     local win = Active
     if not win then
         return 0
+    end
+    local m = tonumber(msg) or 0
+    local name = DBG_MSGS[m]
+    if name then
+        dbg("[dbg] wndproc %s(0x%04X) wp=0x%X lp=0x%X", name, m,
+            tonumber(wparam) or 0, tonumber(lparam) or 0)
     end
     local ok, result = pcall(win.dispatch, win, hwnd, msg, wparam, lparam)
     if not ok then
@@ -1030,6 +1058,10 @@ function Window:core_close(timeout)
 end
 
 function Window:core_send(data_bytes, flags)
+    if DEBUG_MODE then
+        dbg("[dbg] core_send len=%d flags=%d",
+            data_bytes and #data_bytes or -1, tonumber(flags) or -1)
+    end
     if not self.core then
         return false, xcom.err_not_open
     end
@@ -1590,7 +1622,10 @@ function Window:_sync_imgui_autosend()
         xcom.set_auto_template(self.core, "", 0, xcom.send_text)
         return
     end
-    local text = ffi.string(self.imgui.send)
+    -- Bounded read via the bridge (ffi.string(self.imgui.send) would keep
+    -- scanning past the SEND_CAPACITY buffer until a '\0' if ImGui ever left
+    -- the input unterminated at capacity -- the over-read crashes the process).
+    local text = self.imgui:send_text()
     local payload, err = xcom.build_send_payload(text,
         self.imgui.send_hex[0] ~= 0, self.imgui.send_crlf[0] ~= 0)
     if not payload then
@@ -2505,7 +2540,6 @@ local run_message_loop = function(self)
 
         -- P1: run due luv timers (display drain / status snapshot / multi).
         uv.run("nowait")
-
         -- P2: drain the deferred high-priority task queue fully.
         local queue = self._defer_queue
         if queue and #queue > 0 then
@@ -2835,6 +2869,52 @@ function Window:_refresh_status()
         c.set_text(self.status.labels[1],
                    self.connected and "ONLINE" or "OFFLINE")
     end
+end
+
+-- ---------------------------------------------------------------------------
+-- Hard guarantee: NO Lua function reachable from the WndProc callback may
+-- ever be trace-compiled.  Why jit.off(wndproc_callback, true) is not enough:
+--   * the recursive flag only walks LEXICALLY nested protos; Window methods
+--     attach to the metatable at file scope, so the whole dispatch tree stays
+--     individually traceable; and
+--   * any function that is hot enough gets a trace (window.lua on_nchittest
+--     ran compiled -- "start trace#54 entry=window.lua:685" in the JIT log --
+--     while Windows synchronously dispatched ANOTHER message into the same
+--     WndProc; lj_ccallback_enter saw jit_base live -> PANIC: bad callback ->
+--     exit(1)).
+-- Enumerate every reachable function directly and pin it off.  Costs nothing:
+-- the WndProc path is event-paced, never a throughput hot spot; the RX drain
+-- and file-I/O hot loops live in luv timer callbacks (pinned at their own
+-- scope) and C code.
+local function jit_off_deep(fn, seen)
+    if type(fn) ~= "function" or seen[fn] then return end
+    seen[fn] = true
+    local ok = pcall(jit.off, fn)
+    if not ok then
+        io.stderr:write("[init] jit.off failed for " .. tostring(fn) .. "\n")
+    end
+    local info = debug.getinfo(fn, "u")
+    if info then
+        for i = 1, info.nups do
+            local name = debug.getupvalue(fn, i)
+            local value = select(2, debug.getupvalue(fn, i))
+            -- Only descend into plain Lua functions; C functions and
+            -- metatables/stdlib come through as other kinds and stay
+            -- untouched (the "(" prefix marks for/pcall/C control upvalues).
+            if name:sub(1, 1) ~= "(" and type(value) == "function" then
+                jit_off_deep(value, seen)
+            end
+        end
+    end
+end
+
+-- wndproc_callback + everything it lexically reaches (Active/pcall chain).
+jit_off_deep(wndproc_callback, {})
+-- The dynamic half: Window methods dispatch via the metatable, invisible to
+-- the upvalue walk; enumerate the method table itself (all methods are
+-- defined by this point in the file).
+for _, fn in pairs(Window) do
+    if type(fn) == "function" then jit_off_deep(fn, {}) end
 end
 
 return M

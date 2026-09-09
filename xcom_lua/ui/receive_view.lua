@@ -204,6 +204,16 @@ function M.build(panel, x, y, w_, h, row_h)
     end
 
     view.layout(x, y, w_, h)
+
+    -- bad-callback discipline (see ui/window.lua's analysis): feed/insert
+    -- SendMessageA the richedit, which can synchronously re-enter our WndProc;
+    -- the closures live inside the view record so no module-level walker
+    -- reaches them.  Pin the record's callable fields.
+    if jit and jit.off then
+        for _, fn in pairs(view) do
+            if type(fn) == "function" then pcall(jit.off, fn) end
+        end
+    end
     return view
 end
 

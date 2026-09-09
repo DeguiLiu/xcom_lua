@@ -682,4 +682,20 @@ function M.snapshot(path)
     return result_path
 end
 
+-- ---------------------------------------------------------------------------
+-- bad-callback discipline (see the analysis at the bottom of ui/window.lua):
+-- the waveform WndProc callback dispatches into `dispatch`, which calls
+-- BeginPaint/EndPaint -- EndPaint can synchronously re-enter our WndProc.
+-- A trace-compiled handler on that path PANICs "bad callback".  jit.off(cb)
+-- does NOT reach `dispatch` (a file-scope function) nor the M._paint / M._pan
+-- methods (dynamic M.* lookup), so pin the whole reachable set explicitly.
+-- The paint loops stay fast enough: 30 FPS over a few thousand points.
+-- ---------------------------------------------------------------------------
+if jit and jit.off then
+    jit.off(dispatch)
+    for _, fn in pairs(M) do
+        if type(fn) == "function" then pcall(jit.off, fn) end
+    end
+end
+
 return M

@@ -502,4 +502,20 @@ M._GENERATORS = GENERATORS       -- test hook
 M.PENDING_MAX_BYTES = PENDING_MAX_BYTES
 M.TICK_MS = DEFAULT_TICK_MS
 
+-- The sim pump runs from a luv timer callback (C -> Lua).  When reached it
+-- calls xcom.test_inject_rx through self.xcom (an FFI C function); if any of
+-- these methods gets JIT-traced, that FFI call happens in a C re-entry context
+-- and LuaJIT PANICs with "bad callback" (the whole process exits — exactly the
+-- "open port then crash" symptom).  jit.off(cb, true) in start() only protects
+-- the outer closure; self.method dispatch is dynamic so the recursive flag does
+-- NOT reach M:pump et al.  Pin the whole reachable chain off JIT explicitly.
+-- (See the "bad callback" fix notes in main.lua / window.lua.)
+if jit and jit.off then
+    jit.off(M.pump, true)
+    jit.off(M._inject, true)
+    jit.off(M._stream, true)
+    jit.off(M._queue, true)
+    jit.off(M.tx_observe, true)
+end
+
 return M

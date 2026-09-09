@@ -28,3 +28,12 @@ add_executable(xcom WIN32
 set_target_properties(xcom PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/xcom_lua/runtime"
 )
+# Inject the version from project() into the launcher's VS_VERSION_INFO.
+set_target_properties(xcom PROPERTIES
+    VERSION "${PROJECT_VERSION}"
+)
+target_compile_definitions(xcom PRIVATE
+    XCOM_VERSION_MAJOR=${PROJECT_VERSION_MAJOR}
+    XCOM_VERSION_MINOR=${PROJECT_VERSION_MINOR}
+    XCOM_VERSION_PATCH=${PROJECT_VERSION_PATCH}
+)

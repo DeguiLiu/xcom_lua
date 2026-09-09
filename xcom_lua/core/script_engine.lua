@@ -1177,4 +1177,17 @@ function M:eval_command(line)
     end
 end
 
+-- Hook dispatch reaches user-script closures that may call FFI (uart.send ->
+-- core_send -> xcom.send).  These methods are invoked via the dynamic
+-- self.scripts.process_rx / .dispatch_send dispatch, so a recursive jit.off on
+-- the caller (poll_display) does NOT protect them.  Pin the whole dispatch
+-- chain off JIT so a traced hook never causes the "bad callback" PANIC (same
+-- discipline documented for serial_sim and window.lua).
+if jit and jit.off then
+    jit.off(M.process_rx, true)
+    jit.off(M.dispatch_receive, true)
+    jit.off(M.dispatch_send, true)
+    jit.off(M.dispatch_ui_event, true)
+end
+
 return M

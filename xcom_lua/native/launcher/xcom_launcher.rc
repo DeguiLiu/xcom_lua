@@ -1,1 +1,49 @@
+#include <windows.h>
+
+// Application icon
 IDI_APP ICON "xcom.ico"
+
+// Version resource.  XCOM_VERSION_MAJOR/MINOR/PATCH are pre-defined by CMake
+// (target_compile_definitions) from the project() VERSION; fall back to 1.2.0
+// when the resource is compiled standalone (generic rc.exe without the macros).
+#ifndef XCOM_VERSION_MAJOR
+#define XCOM_VERSION_MAJOR 1
+#endif
+#ifndef XCOM_VERSION_MINOR
+#define XCOM_VERSION_MINOR 2
+#endif
+#ifndef XCOM_VERSION_PATCH
+#define XCOM_VERSION_PATCH 0
+#endif
+
+#define XCOM_STR2(x) #x
+#define XCOM_STR(x) XCOM_STR2(x)
+#define XCOM_VERSION_STR \
+    XCOM_STR(XCOM_VERSION_MAJOR) "." XCOM_STR(XCOM_VERSION_MINOR) "." XCOM_STR(XCOM_VERSION_PATCH)
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION    XCOM_VERSION_MAJOR, XCOM_VERSION_MINOR, XCOM_VERSION_PATCH, 0
+ PRODUCTVERSION XCOM_VERSION_MAJOR, XCOM_VERSION_MINOR, XCOM_VERSION_PATCH, 0
+ FILEFLAGSMASK  VS_FFI_FILEFLAGSMASK
+ FILEFLAGS      0x0L
+ FILEOS         VOS_NT_WINDOWS32
+ FILETYPE       VFT_APP
+ FILESUBTYPE    0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "080404B0"   // neutral, Unicode
+        BEGIN
+            VALUE "FileDescription", "XCOM Serial Tool\0"
+            VALUE "FileVersion", XCOM_VERSION_STR
+            VALUE "InternalName", "xcom\0"
+            VALUE "OriginalFilename", "xcom.exe\0"
+            VALUE "ProductName", "XCOM Serial Tool\0"
+            VALUE "ProductVersion", XCOM_VERSION_STR
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0804, 1200
+    END
+END

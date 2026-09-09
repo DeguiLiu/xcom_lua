@@ -118,6 +118,10 @@ function M.build(panel, x, y, panel_w, h)
         set_visible(multi_group, true)
     end
 
+    -- set_visible loops ShowWindow (synchronous WndProc re-entry); as a bare
+    -- local it stays trace-linkable even with sp.show_* pinned, so pin it too.
+    if jit and jit.off then jit.off(set_visible) end
+
     sp.state = {
         pages = { { text = {}, enabled = {} } },
         page_index = 1,
@@ -140,6 +144,19 @@ function M.build(panel, x, y, panel_w, h)
     function sp.entry_enabled(i)
         local p = sp.current_page()
         return p.enabled[i] == true
+    end
+
+    -- bad-callback discipline (see the analysis at the bottom of ui/window.lua):
+    -- show_single/show_multi are reached from WndProc-dispatched Window methods
+    -- and loop over ShowWindow, which synchronously re-enters the WndProc FFI
+    -- callback (WM_SHOWWINDOW) — a trace-compiled set_visible on that path
+    -- PANICs "bad callback".  These closures live only inside sp, so no module
+    -- walker can reach them; pin the panel record's callable fields here.
+    -- (ui/controls.lua's setters are pinned at the module level.)
+    if jit and jit.off then
+        for key, fn in pairs(sp) do
+            if type(fn) == "function" then pcall(jit.off, fn) end
+        end
     end
 
     return sp

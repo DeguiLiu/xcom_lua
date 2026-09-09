@@ -63,6 +63,14 @@ function M.create(parent, opts)
         end
     end
 
+    -- bad-callback discipline (see ui/window.lua): set_* setters reach
+    -- controls' SetWindowTextA (synchronous WndProc re-entry); the closures
+    -- live in this record, so pin them here.
+    if jit and jit.off then
+        for _, fn in pairs(bar) do
+            if type(fn) == "function" then pcall(jit.off, fn) end
+        end
+    end
     return bar
 end
 
