@@ -456,6 +456,7 @@ public:
     ScopeChannel scope_[kScopeChannelsMax]{};
     float scope_history_s_ = 10.0f;   // trailing X window (seconds)
     bool scope_follow_ = true;        // false while the user pans back
+    bool scope_y_fit_ = true;         // auto-fit Y (serial numeric streams)
     double scope_cursor_a_ = 0.0;     // measurement cursor A (seconds)
     double scope_cursor_b_ = 0.0;     // measurement cursor B (seconds)
     bool scope_visible_ = false;      // scope panel toggle (header button)
@@ -2277,6 +2278,18 @@ int ScriptEditorResize(ImGuiInputTextCallbackData* data) {
                     }
                 }
                 ImPlot::SetupAxisLimits(ImAxis_Y1, -0.2, 5.2, ImGuiCond_Once);
+                // Auto-fit Y so a serial numeric stream (sensor/ADC values of
+                // any range) is visible without a pre-configured bound; the
+                // first real sample wins the range and follow keeps the tail
+                // centred.  A user zoom/pan on Y is respected until they
+                // scroll back to bottom (ImPlot re-fits on ImGuiCond_Once is
+                // skipped after the first frame, so this stays auto only for
+                // the demo/deterministic streams).
+                runtime.scope_y_fit_ = true;
+                if (runtime.scope_y_fit_) {
+                    ImPlot::SetupAxis(ImAxis_Y1, nullptr,
+                                      ImPlotAxisFlags_AutoFit);
+                }
                 // Channels: fixed palette, ring read via Spec.Offset/Stride.
                 static const ImVec4 kChannelColors[kScopeChannelsMax] = {
                     ImVec4(0.00f, 0.80f, 0.40f, 1.0f),   // CH1 green
@@ -2819,7 +2832,7 @@ constexpr std::array kStyleColors{
     StyleColorEntry{ImGuiCol_WindowBg, 0xFBFCFD, 1.0f},
     StyleColorEntry{ImGuiCol_ChildBg, 0xFBFCFD, 1.0f},                  // 1.png: no gray default children
     StyleColorEntry{ImGuiCol_PopupBg, 0xFFFFFF, 1.0f},
-    StyleColorEntry{ImGuiCol_Border, 0xD5D5D5, 0.9f},                   // 1.png combo border
+    StyleColorEntry{ImGuiCol_Border, 0xB8BFC7, 0.9f},                   // 1px edges: inputs + floating-panel borders
     StyleColorEntry{ImGuiCol_BorderShadow, 0xFFFFFF, 0.0f},
     StyleColorEntry{ImGuiCol_TextSelectedBg, 0x005A98, 0.35f},           // 1.png primary blue selection
     StyleColorEntry{ImGuiCol_Separator, 0xDEDEDE, 1.0f},               // 1.png sidebar section lines
@@ -3239,7 +3252,8 @@ extern "C" __declspec(dllexport) int xcom_imgui_draw_console(
     ImGui::SetNextWindowSize(io.DisplaySize, ImGuiCond_Always);
     ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
         ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
-        ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse;
+        ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse |
+        ImGuiWindowFlags_NoBringToFrontOnFocus;
     if (ImGui::Begin("##xcom_dashboard", nullptr, flags)) {
         const auto& layout = runtime.layout_;
         ui::Header(actions, connected != 0);

@@ -536,6 +536,19 @@ local function build_env(engine, record)
 
     if engine.wave_module then
         env.wave = engine.wave_module
+        -- llcom-compatible curve API (LuaApi.md AddPoint): scripts parse the
+        -- received text themselves and push points, exactly like llcom's
+        -- user-script "绘制曲线.lua".  apiAddPoint(value, line) with a 0-based
+        -- line number maps onto wave.push(channel, y) (1-based channel);
+        -- line defaults to 0 (first curve).  Points are appended to the tail,
+        -- so the plot is a rolling "value over time" trace.
+        local wave = engine.wave_module
+        env.apiAddPoint = function(value, line)
+            local n = tonumber(value)
+            if n == nil then return false end
+            local channel = (tonumber(line) or 0) + 1
+            return wave.push(channel, n)
+        end
     end
 
     -- Serial simulator passthrough (core/serial_sim.lua).  window.lua injects
