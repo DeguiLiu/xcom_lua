@@ -1328,31 +1328,38 @@ function Window:_process_rx_batch(text)
     self:_append_imgui_receive(text)
 end
 
--- Append a receive batch to the tail window.  Chunks beyond the configured
--- window are retired by advancing a start cursor — no table.remove (which
--- shifts the whole array per pop) and no per-append string copies.  The
--- retired prefix is dropped in one place at flush time (table.concat from the
--- cursor, or a single :sub when the tail outgrew one chunk).
+-- Append a receive batch to the tail window.  With an incremental-capable
+-- ImGui DLL the bytes are handed straight to C++ (which owns the sliding
+-- window, the line-offset index AND the absolute base across trims), so Lua
+-- keeps NO copy of the view text: no chunk table, no per-frame concat/trim,
+-- one FFI call per drained batch.  Legacy path (old DLL, or the fake bridge
+-- in tests): retain chunks and rebuild the tail in _flush_imgui_receive.
 function Window:_append_imgui_receive(text)
     if not text or #text == 0 then return end
     self._imgui_receive_total = (self._imgui_receive_total or 0) + #text
     local window = self._receive_window or 65535
-    local chunks = self._imgui_receive_chunks
-    chunks[#chunks + 1] = text
-    self._imgui_receive_chunk_bytes = self._imgui_receive_chunk_bytes + #text
-    -- Retire whole exhausted chunks by advancing the cursor; their bytes
-    -- leave the accounting immediately so the next append starts clean.
-    -- A chunk is only retired when what REMAINS after retiring it still
-    -- exceeds the window — otherwise a huge middle chunk would be dropped
-    -- whole and the flush's :sub(-window) tail-trim handles it instead.
-    local cursor = self._imgui_receive_cursor or 1
-    while cursor < #chunks and
-          self._imgui_receive_chunk_bytes - #chunks[cursor] > window do
-        self._imgui_receive_chunk_bytes = self._imgui_receive_chunk_bytes - #chunks[cursor]
-        cursor = cursor + 1
+    local incremental = self.imgui and self.imgui.can_append_receive
+        and self.imgui:can_append_receive()
+    if incremental then
+        self.imgui:append_receive(text)
+    else
+        local chunks = self._imgui_receive_chunks
+        chunks[#chunks + 1] = text
+        self._imgui_receive_chunk_bytes = self._imgui_receive_chunk_bytes + #text
+        -- Retire whole exhausted chunks by advancing the cursor; their bytes
+        -- leave the accounting immediately so the next append starts clean.
+        -- A chunk is only retired when what REMAINS after retiring it still
+        -- exceeds the window — otherwise a huge middle chunk would be dropped
+        -- whole and the flush's :sub(-window) tail-trim handles it instead.
+        local cursor = self._imgui_receive_cursor or 1
+        while cursor < #chunks and
+              self._imgui_receive_chunk_bytes - #chunks[cursor] > window do
+            self._imgui_receive_chunk_bytes = self._imgui_receive_chunk_bytes - #chunks[cursor]
+            cursor = cursor + 1
+        end
+        self._imgui_receive_cursor = cursor
+        self._imgui_receive_dirty = true
     end
-    self._imgui_receive_cursor = cursor
-    self._imgui_receive_dirty = true
     -- Auto frame-break anchor: the view ends mid-line unless this chunk's
     -- last byte is '\n' (the DLL line model — see xcom_imgui_bridge.cpp's
     -- receive_line_offsets_ rescan: only '\n' opens a new row).
@@ -1752,6 +1759,16 @@ function Window:_smoke_env_hooks()
         if want_profile and want_profile ~= "" then
             self.sim:profile(want_profile)
         end
+        self:core_open()
+    end
+    local hw_port = os.getenv("XCOM_SMOKE_HW_PORT")
+    if hw_port and hw_port ~= "" then
+        -- Real-hardware E2E: open an actual COM port through the exact same
+        -- core_open path the "打开" button uses.  The name is not VIRTUAL/TEST
+        -- so the connected edge never arms the sim pump — bytes come from the
+        -- physical read thread, exercising the full C-read -> ring -> drain ->
+        -- incremental append -> ImGui render chain on production data.
+        self._imgui_port = hw_port
         self:core_open()
     end
     self:request_frame()
@@ -2724,9 +2741,19 @@ function Window:on_btn_save()
         return
     end
     -- ImGui owns the visible receive buffer; the native RichEdit is hidden and
-    -- intentionally not fed in that mode.
-    local data = self.imgui and (self._imgui_receive or "") or
-        receive_text(self.recv.richedit.hwnd)
+    -- intentionally not fed in that mode.  With the incremental DLL the Lua
+    -- side keeps no tail copy at all — read the native window back (rare,
+    -- user-triggered path; the copy is bounded by the window size).
+    local data
+    if self.imgui then
+        if self.imgui.get_receive_text then
+            data = (self.imgui:get_receive_text()) or ""
+        else
+            data = self._imgui_receive or ""
+        end
+    else
+        data = receive_text(self.recv.richedit.hwnd)
+    end
     if data and #data > 0 then
         -- Explicit status comparisons: ABI codes are cdata ints (0 is truthy
         -- in Lua), so `not rc` would misread success as failure.

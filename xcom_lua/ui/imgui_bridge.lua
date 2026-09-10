@@ -7,6 +7,8 @@ void xcom_imgui_set_ports(const char* const* names, int count);
 int xcom_imgui_new_frame(void);
 int xcom_imgui_render(void);
 void xcom_imgui_set_receive_text(const char* text, size_t length);
+void xcom_imgui_receive_append(const char* delta, size_t length);
+size_t xcom_imgui_get_receive_text(char* out, size_t capacity, size_t* base_out);
 void xcom_imgui_set_receive_window(size_t bytes);
 void xcom_imgui_set_receive_base(size_t absolute_offset);
 void xcom_imgui_set_status(const char* text);
@@ -191,6 +193,42 @@ function M:set_receive_text(text, base)
     local push_base = optional_export("xcom_imgui_set_receive_base")
     if push_base then push_base(math.floor(base or 0)) end
     self.lib.xcom_imgui_set_receive_text(text, n)
+end
+
+-- Incremental tail push (zero-rebuild path).  The DLL owns the sliding
+-- receive window: appending a batch costs O(batch) there, whereas
+-- set_receive_text re-copies + re-scans the whole tail on every flush.
+-- Returns true when the append path exists (fresh DLL), false on an old one
+-- (caller falls back to the full replace).
+local append_export = optional_export("xcom_imgui_receive_append")
+local get_export = optional_export("xcom_imgui_get_receive_text")
+
+function M:append_receive(delta)
+    if not append_export then return false end
+    append_export(delta, #delta)
+    return true
+end
+
+function M:can_append_receive()
+    return append_export ~= nil
+end
+
+-- Read back the native tail (for the "save visible" action).  Returns the
+-- window text or nil when the export is missing / buffer empty.
+function M:get_receive_text()
+    if not get_export then return nil end
+    local cap = (self.receive_capacity or DEFAULT_RECEIVE_CAPACITY)
+    local buf = self._receive_read_buf
+    if not buf or self._receive_read_cap ~= cap then
+        buf = ffi.new("char[?]", cap)
+        self._receive_read_buf = buf
+        self._receive_read_cap = cap
+    end
+    local base_out = self._receive_read_base or ffi.new("size_t[1]")
+    self._receive_read_base = base_out
+    local n = get_export(buf, cap, base_out)
+    if n == 0 then return "", tonumber(base_out[0]) or 0 end
+    return ffi.string(buf, tonumber(n) or 0), tonumber(base_out[0]) or 0
 end
 
 -- Push highlight rules ({pattern, color, style} tables, color = 0xRRGGBB)

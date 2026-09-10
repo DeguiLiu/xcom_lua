@@ -3439,6 +3439,81 @@ extern "C" __declspec(dllexport) void xcom_imgui_set_receive_text(
     // the text view only ever receives '\n' terminated lines now.
 }
 
+// Incremental append: add `delta` (a fresh receive batch) to the tail and
+// extend the line-offset index only over the newly appended bytes, then drop
+// an over-long prefix.  This is the zero-copy/low-churn counterpart to
+// xcom_imgui_set_receive_text: Lua pushes each drained batch ONCE and never
+// rebuilds or re-scans the whole tail, so a steady stream costs O(delta) per
+// push instead of O(window) per flush.  receive_base_ (the absolute offset of
+// receive_text_[0]) is advanced by the trimmed prefix so the Lua-owned
+// absolute selection keeps tracking its text across slides.
+extern "C" __declspec(dllexport) void xcom_imgui_receive_append(
+    const char* delta, size_t length) {
+    auto& runtime = ImGuiRuntime::instance();
+    if (!runtime.initialized_ || GetCurrentThreadId() != runtime.owner_thread_) return;
+    if (!delta || length == 0) return;
+
+    std::string& text = runtime.receive_text_;
+    std::vector<std::size_t>& offsets = runtime.receive_line_offsets_;
+
+    // Offset-index invariant (shared by ALL mutation paths: set_receive_text,
+    // set_receive_window trim, this append): front()==0, every entry is a
+    // line start, and the LAST entry is the start of the possibly-partial
+    // final line == would equal text.size() when the tail ends at '\n'.
+    // Therefore appending only creates new entries for '\n' inside the delta
+    // and the scan starts exactly at the old size -- no boundary seeding.
+    const std::size_t scan_from = text.size();
+    text.append(delta, length);
+    // Reserve up front so the ~dozen pushes for a 64 KiB batch never pay a
+    // geometric realloc of the whole index vector.
+    offsets.reserve(offsets.size() + length / 32U + 2U);
+    const char* const data = text.data();
+    const char* scan = data + scan_from;
+    const char* const data_end = data + text.size();
+    while (const char* const nl = static_cast<const char*>(
+               std::memchr(scan, '\n', static_cast<size_t>(data_end - scan)))) {
+        offsets.push_back(static_cast<std::size_t>(nl - data) + 1U);
+        scan = nl + 1;
+    }
+
+    // Prefix-trim to the window limit, mirroring xcom_imgui_set_receive_window
+    // (retained-suffix offsets stay valid after subtracting the erased length,
+    // so the index is shifted, never rebuilt).  receive_base_ advances with
+    // the window head so the absolute selection keeps tracking its text.
+    // follow_tail_ is deliberately untouched: scrolling to the bottom stays a
+    // render-time decision (was_at_bottom), so incoming data never yanks a
+    // user who is reading history.
+    if (text.size() > runtime.receive_limit_) {
+        const std::size_t erase_n = text.size() - runtime.receive_limit_;
+        text.erase(0, erase_n);
+        runtime.receive_base_ += erase_n;
+        offsets.erase(offsets.begin(),
+                      std::lower_bound(offsets.begin(), offsets.end(), erase_n));
+        for (std::size_t& off : offsets) off -= erase_n;
+        if (offsets.empty() || offsets.front() != 0U) {
+            offsets.insert(offsets.begin(), 0U);
+        }
+    }
+}
+
+// Copy the current tail into `out` (up to `capacity` bytes, NUL-terminated)
+// and report its absolute base + length.  Lets Lua read back the native view
+// for the rare "Save visible" path without keeping a shadow copy per batch.
+extern "C" __declspec(dllexport) size_t xcom_imgui_get_receive_text(
+    char* out, size_t capacity, size_t* base_out) {
+    auto& runtime = ImGuiRuntime::instance();
+    if (!runtime.initialized_ || GetCurrentThreadId() != runtime.owner_thread_) return 0;
+    const std::size_t n = runtime.receive_text_.size();
+    if (base_out) *base_out = runtime.receive_base_;
+    if (out && capacity > 0) {
+        const std::size_t copy = (std::min)(n, capacity - 1U);
+        std::memcpy(out, runtime.receive_text_.data(), copy);
+        out[copy] = '\0';
+        return copy;
+    }
+    return n;
+}
+
 // Publish where the current receive window sits in the lifetime stream.
 // Lua owns the sliding tail (it concatenates/retires chunks in
 // Window:_flush_imgui_receive), so only it can say how many bytes precede
