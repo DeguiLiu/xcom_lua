@@ -46,7 +46,13 @@ M.SUPER_ONLINE = "online"
 -- the user reconnects manually.  Owned by the UI layer on purpose: the core
 -- has no timer the app can verify on this host, and the HSM is the single
 -- place every interlock (send/params/close) is derived from.
-M.RECONNECT_GRACE_MS = 3000
+--
+-- 8 s rather than 3: the devices this is built for reboot into a ROM
+-- bootloader, which is a full USB detach and re-enumeration. Windows plays the
+-- unplug/replug chime and the port takes several seconds to come back, so a
+-- 3 s window expired just before the device returned and every ROM-mode switch
+-- ended in FAULT. Override with [serial] reconnect_grace_ms.
+M.RECONNECT_GRACE_MS = 8000
 
 local CORE_TO_UI = {
     [CORE_CLOSED] = M.STATE_CLOSED,

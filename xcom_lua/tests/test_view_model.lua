@@ -126,7 +126,11 @@ ok("grace: params editable", gs.params_enabled)
 ok("grace: reconnecting flag set", gs.reconnecting)
 ok("grace: faulted flag clear", not gs.faulted)
 eq("grace: port_state_code reports core FAULT", gs.port_state_code, 4)
-eq("grace: banner timeout constant", gs.reconnect_timeout_ms, 3000)
+-- 8 s, not 3: the target devices reboot into a ROM bootloader, which is a full
+-- USB detach/re-enumerate that takes several seconds to come back. A 3 s window
+-- expired just before the device returned, so every ROM-mode switch ended in
+-- FAULT. [serial] reconnect_grace_ms overrides it (see Window:new).
+eq("grace: banner timeout constant", gs.reconnect_timeout_ms, 8000)
 ok("enter_reconnecting is not re-entrant", not g:enter_reconnecting(2))
 
 -- 10) Grace window never loses the FAULT: a FAULT snapshot inside the window

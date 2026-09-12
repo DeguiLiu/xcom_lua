@@ -313,6 +313,17 @@ function M.new(cfg, cfg_data, config_path)
     -- HSM mirror of the native port state (design: interlock parity with the
     -- Python client's ViewModel — see core/view_model.lua).
     self.vm = view_model.new()
+    -- How long a faulted session is given to come back before the UI declares
+    -- it dead. Configurable because the right value is a property of the
+    -- target device, not of the tool: a board that reboots into a ROM
+    -- bootloader detaches the USB device and needs seconds to re-enumerate,
+    -- while a plain cable glitch recovers in well under one. Clamped to a sane
+    -- floor so a typo cannot disable recovery entirely.
+    local grace = tonumber(config.get(cfg_data, "serial", "reconnect_grace_ms",
+                                      self.vm.RECONNECT_GRACE_MS))
+    if grace and grace >= 1000 and grace <= 60000 then
+        self.vm.RECONNECT_GRACE_MS = grace
+    end
     Active = self
     return self
 end
@@ -2463,6 +2474,18 @@ function Window:poll_status()
                     self._reconnect_port_desc = nil
                     if self.vm:settle_recovering() then
                         if self.imgui then
+                            -- Mark the boundary in the view. After a ROM-mode
+                            -- switch the device re-enumerates, so everything
+                            -- the bootloader prints arrives in a NEW session;
+                            -- without a visible separator mixed into the old
+                            -- transcript it reads as "the reconnect worked but
+                            -- no output came back". The banner is prefixed so
+                            -- it cannot be mistaken for device data, and a
+                            -- blank line keeps it off the tail of the last
+                            -- pre-reset line.
+                            self:_append_imgui_receive("\n[XCOM] reconnected to " ..
+                                (self._imgui_port or "serial port") ..
+                                " - device output resumes below\n")
                             self.imgui:set_status("Reconnected: " ..
                                 (self._imgui_port or "serial port"))
                         end
