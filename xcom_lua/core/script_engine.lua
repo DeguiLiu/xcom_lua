@@ -83,6 +83,42 @@ local PENDING_MAX = 8 * 1024
 local PENDING_IDLE_MS = 200
 -- Highlight rule caps shared with the C++ renderer (see bridge).
 local MAX_RULES = 32
+
+-- Instruction budget per script hook invocation. pcall() cannot interrupt a
+-- running function, so a user script containing `while true do end` used to
+-- freeze the message loop (and therefore the whole UI) with no way out short
+-- of killing the process. A debug.sethook count hook can raise from inside the
+-- loop, which turns "the script never returns" into "the script is disabled" —
+-- the same 3-strikes path a script that throws already takes.
+--
+-- The hook only fires for INTERPRETED code. A JIT-compiled loop runs as native
+-- machine code and never reaches the VM's instruction counter, so the hook
+-- silently never runs — measured here: a bare count hook against
+-- `while true do end` hangs, and jit.off(fn) alone does not help either,
+-- because the loop body's own closures are still compiled. jit.off(fn, true)
+-- (the recursive flag) is what makes the hook fire.
+--
+-- The budget is generous for real parsing work while still cutting a runaway
+-- loop off within a frame or two. It counts VM instructions, so a slow machine
+-- gets proportionally more of them rather than being judged for being slow.
+local HOOK_INSTRUCTION_BUDGET = 2000000
+
+-- Run fn(...) under the instruction budget. Returns pcall's (ok, result) plus a
+-- third flag that is true when the budget — not the script — was the cause, so
+-- the caller can report the two distinctly.
+local function call_budgeted(fn, ...)
+    local expired = false
+    if jit and jit.off then
+        jit.off(fn, true)
+    end
+    debug.sethook(function()
+        expired = true
+        error("script exceeded execution budget", 2)
+    end, "", HOOK_INSTRUCTION_BUDGET)
+    local ok, result = pcall(fn, ...)
+    debug.sethook()   -- always disarm, including on the error path
+    return ok, result, expired
+end
 local FILE_READ_MAX = 32 * 1024 * 1024   -- sys.file_read cap (bytes)
 -- Streamed file window for sys.file_open/file_seek_read (send-file flow):
 -- a chunk this big bounds resident file data to a few MiB no matter how
@@ -1139,7 +1175,7 @@ function M:dispatch_receive(text)
         local record = self.scripts[name]
         if record and record.enabled then
             if record.recv_hook then
-                local ok, result = pcall(record.recv_hook, text)
+                local ok, result, expired = call_budgeted(record.recv_hook, text)
                 if ok then
                     record.strikes_recv = 0
                     if result == nil or result == false then
@@ -1150,7 +1186,9 @@ function M:dispatch_receive(text)
                     -- non-string truthy result: keep text unchanged
                 else
                     record.strikes_recv = record.strikes_recv + 1
-                    self:log(5, name, "on.receive error: " .. tostring(result))
+                    self:log(5, name, expired and
+                        "on.receive exceeded its execution budget (runaway loop?)"
+                        or ("on.receive error: " .. tostring(result)))
                     if record.strikes_recv >= HOOK_STRIKES then
                         record.recv_hook = nil
                         record.strikes_recv = 0
@@ -1159,13 +1197,15 @@ function M:dispatch_receive(text)
                     end
                 end
             end
-            -- Legacy LLCOM `uartReceive` global (observe-only, pcall-wrapped
-            -- with the same 3-strikes policy).
+            -- Legacy LLCOM `uartReceive` global (observe-only, same 3-strikes
+            -- policy and the same execution budget).
             if record.env and type(record.env.uartReceive) == "function" then
-                local ok, err = pcall(record.env.uartReceive, text)
+                local ok, err, expired = call_budgeted(record.env.uartReceive, text)
                 if not ok then
                     record.strikes_recv = record.strikes_recv + 1
-                    self:log(5, name, "uartReceive error: " .. tostring(err))
+                    self:log(5, name, expired and
+                        "uartReceive exceeded its execution budget (runaway loop?)"
+                        or ("uartReceive error: " .. tostring(err)))
                     if record.strikes_recv >= HOOK_STRIKES then
                         record.env.uartReceive = nil
                         record.strikes_recv = 0
@@ -1184,7 +1224,7 @@ function M:dispatch_send(payload)
     for _, name in ipairs(self.order) do
         local record = self.scripts[name]
         if record and record.enabled and record.send_hook then
-            local ok, result = pcall(record.send_hook, payload)
+            local ok, result, expired = call_budgeted(record.send_hook, payload)
             if ok then
                 record.strikes_send = 0
                 if result == nil or result == false then
@@ -1194,7 +1234,9 @@ function M:dispatch_send(payload)
                 end
             else
                 record.strikes_send = record.strikes_send + 1
-                self:log(5, name, "on.send error: " .. tostring(result))
+                self:log(5, name, expired and
+                    "on.send exceeded its execution budget (runaway loop?)"
+                    or ("on.send error: " .. tostring(result)))
                 if record.strikes_send >= HOOK_STRIKES then
                     record.send_hook = nil
                     record.strikes_send = 0
