@@ -746,4 +746,51 @@ function M.open_folder(path)
     return result > 32
 end
 
+-- Run a program without blocking the message pump.
+--
+-- This is the replacement for os.execute/io.popen on every path that can run
+-- on the UI thread.  libuv forks and reaps the child off the main thread, so
+-- the loop keeps pumping and on_exit lands in the normal P1 timer pass;
+-- os.execute instead blocks the calling thread until the child exits, and on
+-- this app that thread is the one drawing the window.
+--
+-- `argv` is an array of arguments, not a command line: each element reaches
+-- the child as exactly one argument, so a path containing a quote or a space
+-- needs no escaping and cannot turn into shell syntax.  To run a batch file,
+-- name cmd.exe explicitly and pass {"/c", script, args...}.
+--
+-- stdio follows luv's contract: a 3-element array of nil (use the parent's),
+-- an integer file descriptor, or a uv_stream_t.  Passing a stream for
+-- stdout/stderr and reading it is the async equivalent of io.popen.
+--
+-- Returns the uv process handle plus its pid on success, or nil, err.  The
+-- caller may keep the handle to call :kill(); it is unref'd so a still-running
+-- child never by itself keeps the loop alive.
+function M.spawn_async(argv, opts)
+    if type(argv) ~= "table" or argv[1] == nil then
+        return nil, "argv required"
+    end
+    local ok, uv = pcall(require, "luv")
+    if not ok or uv == nil then
+        return nil, "luv unavailable"
+    end
+    opts = opts or {}
+    local args = { unpack(argv, 2) }
+    -- luv expects stdio positionally; a hole means "inherit from the parent".
+    local stdio = opts.stdio or { nil, nil, nil }
+    local handle, pid_or_err = uv.spawn(argv[1], {
+        args = args,
+        cwd = opts.cwd,
+        env = opts.env,
+        stdio = stdio,
+        detached = opts.detached or false,
+        hide = opts.hide ~= false,
+    }, opts.on_exit)
+    if not handle then
+        return nil, pid_or_err
+    end
+    handle:unref()
+    return handle, pid_or_err
+end
+
 return M

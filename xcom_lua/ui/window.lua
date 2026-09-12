@@ -1174,8 +1174,19 @@ function Window:core_open()
     self:poll_status()
 end
 
--- Close intent: mirrors Python MainWindow._on_close_clicked — allowed from
--- OPEN/OPENING/FAULT only; a close already in flight cannot be re-issued.
+-- Close intent: allowed from OPEN/OPENING/FAULT only; a close already in
+-- flight cannot be re-issued.
+--
+-- The wait budget is deliberately small.  xcom_close is synchronous, so every
+-- millisecond of it is a millisecond the message pump is not running — on a
+-- click that reads as the window locking up.  A healthy teardown confirms
+-- CLOSED on the first poll (the ABI loop exits as soon as the state flips), so
+-- the budget only matters when the port is genuinely wedged, and that case is
+-- already handled: poll_status's CLOSING watchdog force-faults after
+-- CLOSING_TIMEOUT_MS and restores the reconnect route.  Waiting the full
+-- budget here just freezes the UI before the watchdog would have acted anyway.
+local CLOSE_WAIT_MS = 200
+
 function Window:core_close(timeout)
     if not self.core then
         return
@@ -1184,7 +1195,7 @@ function Window:core_close(timeout)
         return
     end
     self:_render_ui_state()
-    xcom.close(self.core, timeout or 2000)
+    xcom.close(self.core, timeout or CLOSE_WAIT_MS)
     self:poll_status()
 end
 
@@ -1607,10 +1618,10 @@ local FRAME_INTERVAL_IDLE_MS = 500
 -- user can retry.
 local OPENING_TIMEOUT_MS = 5000
 
--- Close-side counterpart. The ABI close waits up to 2 s for its own teardown,
--- so a healthy close resolves inside this with room to spare; the timeout only
--- fires when the core never confirms, which is the case that would otherwise
--- strand the session in CLOSING permanently.
+-- Close-side counterpart. The ABI close is synchronous, so the caller gives it
+-- only CLOSE_WAIT_MS: a healthy teardown confirms CLOSED on the first poll,
+-- and this watchdog is what catches one that never does — the case that would
+-- otherwise strand the session in CLOSING permanently.
 local CLOSING_TIMEOUT_MS = 5000
 
 function Window:request_frame(interval_ms)
@@ -2775,8 +2786,12 @@ function Window:_drive_reconnect(generation)
     -- description-matched replacement only when one is unambiguously found.
     local have_port = serial.port and serial.port ~= ""
     if self._reconnect_phase == nil then
-        -- Kick off the core reset for this attempt.
-        xcom.close(self.core, 500)
+        -- Kick off the core reset for this attempt.  This runs inside the
+        -- status poll, so keep the synchronous wait short for the same reason
+        -- core_close does: a long block here stalls the pump mid-reconnect,
+        -- and the CLOSING watchdog is what covers a teardown that does not
+        -- confirm.
+        xcom.close(self.core, CLOSE_WAIT_MS)
         self._reconnect_phase = "open"
     elseif self._reconnect_phase == "open" then
         if not self._reconnect_pending and have_port then
