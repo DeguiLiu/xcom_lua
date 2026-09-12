@@ -2410,27 +2410,41 @@ function Window:poll_status()
             return self:_poll_errors()
         end
         if self._reconnect_deadline then
-            -- Inside the window only OPEN/OPENING counts as recovery. A CLOSED
-            -- snapshot is our OWN xcom_close() reset (driving FAULT -> CLOSED
-            -- before the reopen) and must not be mistaken for "port is back",
-            -- so it is swallowed here rather than reaching on_snapshot.
-            if snap.port_state == xcom.port_open or snap.port_state == xcom.port_opening then
-                -- Latch the fresh core state into the HSM (it stays RECONNECTING
-                -- until settle), then commit the recovery.
-                self.vm.hsm:on_port_state(snap.port_state, snap.generation)
-                self._reconnect_deadline = nil
-                self._reconnect_pending = false
-                self._reconnect_phase = nil
-                self._reconnect_port_desc = nil
-                if self.vm:settle_recovering() then
-                    if self.imgui then
-                        self.imgui:set_status("Reconnected: " .. (self._imgui_port or "serial port"))
+            -- Inside the grace window. The recovery probe must keep running on
+            -- every poll, not only when the snapshot already looks healthy: the
+            -- first thing _drive_reconnect does is issue xcom_close, which is
+            -- synchronous, so the next several snapshots report CLOSED — our
+            -- OWN reset rather than a recovery. Treating CLOSED as "nothing to
+            -- do, return" left the reopen request unissued forever and the HSM
+            -- parked in RECONNECTING (a Close click in that state was likewise
+            -- swallowed, wedging the session in CLOSING with no way out).
+            self:_drive_reconnect(snap.generation)
+            -- _drive_reconnect clears the deadline when the window expires, so
+            -- re-read it rather than assuming the window is still open.
+            if self._reconnect_deadline then
+                -- Only OPEN/OPENING counts as recovery. A CLOSED snapshot at
+                -- this point is our own close succeeding; it must not reach
+                -- on_snapshot, which would latch it as a real state change.
+                if snap.port_state == xcom.port_open or
+                   snap.port_state == xcom.port_opening then
+                    self.vm.hsm:on_port_state(snap.port_state, snap.generation)
+                    self._reconnect_deadline = nil
+                    self._reconnect_pending = false
+                    self._reconnect_phase = nil
+                    self._reconnect_port_desc = nil
+                    if self.vm:settle_recovering() then
+                        if self.imgui then
+                            self.imgui:set_status("Reconnected: " ..
+                                (self._imgui_port or "serial port"))
+                        end
+                        self:_render_ui_state()
                     end
-                    self:_render_ui_state()
                 end
+                self:_poll_errors()
+                return
             end
-            self:_poll_errors()
-            return
+            -- The window just expired inside _drive_reconnect: fall through so
+            -- on_snapshot lands the session in FAULT for a manual reconnect.
         end
         -- Window elapsed with no recovery: the FAULT branch above already ran
         -- _drive_reconnect (which times out to FAULT and clears the deadline),

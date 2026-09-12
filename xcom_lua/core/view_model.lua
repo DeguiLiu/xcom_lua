@@ -202,6 +202,13 @@ end
 
 -- Apply an authoritative core notification, rejecting stale generations.
 function Hsm:on_port_state(core_state, generation)
+    -- Reject unparseable input as a no-op instead of raising: this runs inside
+    -- the 250 ms status poller, and a Lua error there would abort the whole
+    -- interlock refresh for that tick.  The core always supplies a numeric
+    -- generation; a script/UI caller might not.
+    if type(generation) ~= "number" then
+        return false
+    end
     if generation < self.generation then
         return false
     end
@@ -220,6 +227,20 @@ function Hsm:on_port_state(core_state, generation)
         -- commits it once recovery is confirmed.  Clearing `faulted` here is
         -- what lets a genuinely-fresh non-fault state through later.
         if state ~= M.STATE_RECONNECTING then
+            -- A recovery candidate (OPENING/OPEN) must come from a *newer*
+            -- generation than the one the grace window was armed at.  The core
+            -- does not advance the generation on a fault, so the pre-fault
+            -- session has the same generation as the window; a stale OPEN/open
+            -- notification from that session must not be mistaken for recovery.
+            -- The driver's own recovery always bumps the generation twice
+            -- (its close() then open() each advance it), so a real recovery is
+            -- never rejected here.  Same-generation CLOSED/CLOSING is still
+            -- latched: it is the driver's own reset-in-progress, and settle
+            -- refuses it anyway.
+            if (state == M.STATE_OPENING or state == M.STATE_OPEN) and
+               generation <= self.generation then
+                return false
+            end
             if state == M.STATE_OPENING or state == M.STATE_OPEN or
                state == M.STATE_CLOSING then
                 self.faulted = false
@@ -256,6 +277,24 @@ M.ui_to_core = UI_TO_CORE
 -- ---------------------------------------------------------------------------
 local ViewModel = {}
 ViewModel.__index = ViewModel
+
+-- Mirror the state names and timings onto the class so an INSTANCE exposes
+-- them. They live on the module table, and `ViewModel.__index = ViewModel`
+-- means `vm.new().STATE_OPENING` resolves here — but only if the value is
+-- present. Without these, every `self.vm.STATE_OPEN` style read in window.lua
+-- returned nil, so comparisons like `self.vm.hsm.state == self.vm.STATE_OPEN`
+-- were silently always false: the OPENING watchdog never armed, DTR/RTS live
+-- switching never ran, and the reconnect grace window never opened. Keep this
+-- list in step with the module-level constants above.
+ViewModel.STATE_CLOSED = M.STATE_CLOSED
+ViewModel.STATE_OPENING = M.STATE_OPENING
+ViewModel.STATE_OPEN = M.STATE_OPEN
+ViewModel.STATE_CLOSING = M.STATE_CLOSING
+ViewModel.STATE_FAULT = M.STATE_FAULT
+ViewModel.STATE_RECONNECTING = M.STATE_RECONNECTING
+ViewModel.RECONNECT_GRACE_MS = M.RECONNECT_GRACE_MS
+-- OPENING_TIMEOUT_MS is deliberately NOT mirrored: it belongs to the UI driver
+-- (window.lua's own local), not to the state model.
 
 function M.new()
     return setmetatable({
@@ -294,6 +333,12 @@ end
 -- Consume a full core snapshot table (fields: port_state, generation, ...).
 -- Returns true if anything changed (caller should re-render).
 function ViewModel:on_snapshot(snap)
+    -- A malformed snapshot (nil, or missing the numeric generation) is a
+    -- rejected no-op rather than a crash: this is called from the status
+    -- poller, and the HSM already treats an unknown port_state as a no-op.
+    if type(snap) ~= "table" or type(snap.generation) ~= "number" then
+        return false
+    end
     if snap.generation < self.hsm.generation then
         return false
     end

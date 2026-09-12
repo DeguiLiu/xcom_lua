@@ -287,5 +287,70 @@ ok("open refused while closing during grace", not c3:intent_open())
 ok("reject_close during grace restores RECONNECTING", c3:reject_close())
 eq("RECONNECTING restored", c3.hsm.state, vm_mod.STATE_RECONNECTING)
 
+-- 23) Grace window generation hole: the session generation does NOT advance on
+--     a core fault (xcom_ao.cpp serial_do_fault), so enter_reconnecting() is
+--     armed at the *same* generation as the pre-fault OPEN.  A stale OPEN
+--     notification from that session (async signal / re-delivered snapshot)
+--     must NOT be mistaken for recovery.  Only a strictly newer generation --
+--     which is what the driver's own close()+open() produces (each bumps the
+--     generation) -- may latch a recovery candidate.
+local f = vm_mod.new()
+f:intent_open(); f:on_port_state(2, 7)   -- OPEN, session generation 7
+ok("grace armed at the fault's own generation", f:enter_reconnecting(7))
+eq("grace generation preserved", f.hsm.generation, 7)
+ok("stale same-gen OPEN is rejected while recovering", not f:on_port_state(2, 7))
+eq("still RECONNECTING after stale same-gen OPEN", f.hsm.state, vm_mod.STATE_RECONNECTING)
+ok("stale same-gen OPEN cannot settle recovery", not f:settle_recovering())
+eq("still RECONNECTING after refused settle", f.hsm.state, vm_mod.STATE_RECONNECTING)
+-- Same-generation OPENING is equally stale (the pre-fault session never
+-- re-emits it; a real reopen is a fresh generation).
+ok("stale same-gen OPENING is rejected", not f:on_port_state(1, 7))
+eq("still RECONNECTING after stale OPENING", f.hsm.state, vm_mod.STATE_RECONNECTING)
+-- A genuinely newer generation (the driver's close->open sequence) recovers.
+ok("newer-generation OPEN is accepted", f:on_port_state(2, 9))
+ok("newer-generation OPEN settles", f:settle_recovering())
+eq("OPEN after newer-generation settle", f.hsm.state, vm_mod.STATE_OPEN)
+ok("send re-enabled after generation-guarded recovery", f:ui_state().send_enabled)
+
+-- A same-generation CLOSED is still our own reset-in-progress (it latches but
+-- must never settle), preserving the reset semantics of test 19.
+local f2 = vm_mod.new()
+f2:intent_open(); f2:on_port_state(2, 4); f2:enter_reconnecting(4)
+ok("same-gen CLOSED during grace still latches (reset)", f2:on_port_state(0, 4))
+eq("reset CLOSED does not tear down grace", f2.hsm.state, vm_mod.STATE_RECONNECTING)
+ok("reset CLOSED never settles", not f2:settle_recovering())
+
+-- 24) Malformed inputs must never raise: a nil/string generation, an unknown
+--     core state code, or a nil/mis-shaped snapshot is a rejected no-op, not a
+--     Lua error (an error inside the 250 ms status poller would break the
+--     interlock refresh for that tick).
+do
+    local m = vm_mod.new()
+    local okc, res = pcall(function() return m.hsm:on_port_state(2, nil) end)
+    ok("nil generation rejected without error", okc and res == false)
+    okc, res = pcall(function() return m.hsm:on_port_state(2, "3") end)
+    ok("string generation rejected without error", okc and res == false)
+    okc, res = pcall(function() return m.hsm:on_port_state(99, 1) end)
+    ok("unknown core state code ignored without error", okc and res == false)
+    okc, res = pcall(function() return m:on_port_state(2, nil) end)
+    ok("ViewModel:on_port_state nil generation rejected", okc and res == false)
+    okc, res = pcall(function() return m:on_snapshot({ port_state = 2 }) end)
+    ok("snapshot without generation rejected without error", okc and res == false)
+    okc, res = pcall(function() return m:on_snapshot(nil) end)
+    ok("nil snapshot rejected without error", okc and res == false)
+    eq("malformed inputs left state CLOSED", m.hsm.state, vm_mod.STATE_CLOSED)
+end
+
+-- NOTE (UI-side, unfixed here): window.lua reads state constants and the grace
+-- timeout off a ViewModel *instance* (self.vm.STATE_OPENING / self.vm.STATE_OPEN
+-- / self.vm.RECONNECT_GRACE_MS).  They live on the module table only, so on an
+-- instance they are nil today: the OPENING watchdog and the reconnect grace
+-- window silently never arm.  Exposing them here is NOT sufficient on its own --
+-- once the grace window arms, poll_status() wedges (see report): its
+-- `_reconnect_deadline` branch never calls _drive_reconnect and never times out,
+-- so a successful reset-close leaves the HSM stuck in RECONNECTING (or CLOSING
+-- after a user close).  Fix both in window.lua together, then expose the
+-- constants here.
+
 print(string.format("\nview_model tests: %d passed, %d failed", passed, failed))
 os.exit(failed == 0 and 0 or 1)
