@@ -2,21 +2,18 @@
 
 | 项 | 值 |
 | --- | --- |
-| 文档状态 | 现行（取代旧版 PySide6/ctypes 架构描述） |
 | 适用版本 | 客户端 `xcom_lua` + 核心 `xcom_core` C ABI v1.5 |
 | 平台 | Windows 10/11 x64、MSVC、C++17、LuaJIT 2.1 |
 | 前端技术栈 | LuaJIT + Dear ImGui（DirectX 11，WARP 软件兜底） |
 | 后端技术栈 | C++17 + coact（AO/HSM/有界队列/固定池）+ Win32 OVERLAPPED 串口 |
 
-## 结论与定位
+## 概述
 
 本工具是一个 Windows 串口调试客户端，由三层组成：LuaJIT 前端负责全部 UI
 与业务逻辑，两个原生 DLL 分别承担串口核心与渲染，一个 Win32 启动器负责
 打包入口。核心事实：
 
-- 前端不是 Python，也不是 PySide6 + ctypes。UI、业务逻辑、脚本引擎**全部由
-  Lua 编写**，通过 LuaJIT FFI 调用两个 DLL。`xcom_client`（旧 PySide6 版）
-  已废弃，仅作参考保留。
+- UI、业务逻辑、脚本引擎**全部由 Lua 编写**，通过 LuaJIT FFI 调用两个 DLL。
 - 串口与事件运行时**全部在 `xcom_core.dll`**（C++17 + coact），Lua 不直接
   触碰 Win32 串口 API。
 - 渲染**全部在 `xcom_imgui.dll`**（Dear ImGui + ImPlot + D3D11）。Lua 不持有
@@ -313,11 +310,5 @@ flowchart LR
 - **单一 ABI 调用线程**：任何新增后台线程不得直接进入 ABI。
 - **ABI 兼容**：只追加不插队；结构体尺寸钉扎是 CI 门禁。
 - 已发现并保留（以代码为准，供后续修正）：
-  1. `xcom.h` 文件头注释仍写"PySide6 client … via ctypes / CoreWorker QThread"，
-     与现行 LuaJIT 客户端不符（注释陈旧，ABI 本身有效）。
-  2. 根 `CMakeLists.txt` 的 `project(XCOM VERSION 1.2.0)` 与 launcher 版本
+  1. 根 `CMakeLists.txt` 的 `project(XCOM VERSION 1.2.0)` 与 launcher 版本
      `1.2.0`，同 `xcom.h` 的 ABI `1.5.0` 属不同版本命名空间，未对齐。
-  3. `core/xcom_ffi.lua` 的文件头注释与 `M.version_minor/patch` 仍是 `1.2`，
-     但其 `ffi.cdef` 已包含 v1.5 字段（`framing_errors` 等）且尺寸钉扎按 v1.5
-     校验。版本常量滞后，若以 `xcom_ffi.version_minor` 判断 DLL 能力会误判，
-     应以 `xcom.h`/`xcom_version()` 为准。

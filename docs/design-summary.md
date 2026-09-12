@@ -2,7 +2,6 @@
 
 | 项 | 值 |
 | --- | --- |
-| 文档状态 | 现行 |
 | 对应架构 | `docs/architecture.md` |
 | 平台 | Windows x64、LuaJIT 2.1、C++17、Dear ImGui + D3D11 |
 | 读者 | 维护前端 Lua 模块、原生桥或扩展脚本的开发者 |

@@ -1,6 +1,6 @@
 # 编码规约
 
-本文档合并原《coact C++ 编码规约（中文版）》与《Lua 编码准则》，按主题组织：同一主题下 C++ 与 Lua 条目相邻，一次评审即可同时覆盖两侧。适用对象为 `xcom_lua` 仓库的 C++17 核心与 LuaJIT 前端代码。
+本文档按主题组织：同一主题下 C++ 与 Lua 条目相邻，一次评审即可同时覆盖两侧。适用对象为 `xcom_lua` 仓库的 C++17 核心与 LuaJIT 前端代码。
 
 ## 适用范围与阅读约定
 
@@ -40,7 +40,7 @@ C++：
 - 减少裸指针：传参用 `const T&`，跨线程可空句柄用值语义 id（`TargetId`，config.hpp）；`reinterpret_cast` 只允许出现在原始内存槽位 ↔ 对象的 launder 桥两侧。
 - 栈是零堆下唯一的运行期伸缩空间：定容线程栈是硬预算（`kDispatcherStackBytes = 4096U`，config.hpp；RT-Thread 侧 `RtThreadResources<StackBytes, ContextSlots>` 的静态 `stack[]` 数组，pal_rtthread.hpp）；MB 级池存储/帧缓冲/查找表放静态或调用方存储，不入栈帧；大结构按引用、小 POD 按值；事件只带描述符不带数据；新增路径须可核验“最深帧 × 单帧上限 ≤ 栈预算”。
 - move 语义即所有权：跨线程/跨槽位交接用 `T&&` + `std::move`，对象须 `is_nothrow_move_constructible`；失败路径不得消费调用者的值（先查容量再 move）。落点：`BoundedMpscQueue::try_push_observed(T&&)`（queue.hpp）；`std::exchange` 仅用于“取旧 + 置新”一体语义，弃返回值处写 `static_cast<void>(std::exchange(...))` 并注释。
-- 内联类型擦除：`FixedFunction<Sig, Capacity = 2U * sizeof(void*)>`（`xcom_core/src/foundation/fixed_function.hpp`）超出容量即 `static_assert` 编译失败而非静默回落堆；`FixedVector` 同族（`xcom_core/src/foundation/fixed_vector.hpp`）。注意：本仓库**不存在** `vocabulary.hpp` 与 `FixedString`，旧文档中的相关锚点已废弃。
+- 内联类型擦除：`FixedFunction<Sig, Capacity = 2U * sizeof(void*)>`（`xcom_core/src/foundation/fixed_function.hpp`）超出容量即 `static_assert` 编译失败而非静默回落堆；`FixedVector` 同族（`xcom_core/src/foundation/fixed_vector.hpp`）。注意：本仓库**不存在** `vocabulary.hpp` 与 `FixedString`。
 
 Lua：
 

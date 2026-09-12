@@ -2,7 +2,6 @@
 
 | 项 | 值 |
 | --- | --- |
-| 版本 | v2.0（按现行 LuaJIT + ImGui 实现复核） |
 | 核心 | `xcom_core.dll`：C++17 + coact + Win32 OVERLAPPED 串口 |
 | 前端 | `xcom_lua`：LuaJIT 2.1 + Dear ImGui/ImPlot（D3D11），全部 UI 与业务逻辑用 Lua |
 | 渲染 DLL | `xcom_imgui.dll`：ImGui + ImPlot + D3D11 |
