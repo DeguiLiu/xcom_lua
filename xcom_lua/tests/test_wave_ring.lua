@@ -70,6 +70,37 @@ eq("clear empties", counts[1], 0)
 ok("bad series rejected", wave.push(99, 1) == false)
 ok("named lookup works", wave.push("B", 7) == true)
 ok("visible false without window", wave.visible() == false)
+
+-- ---- waveform activity (scope auto-show ownership) --------------------------
+-- The scope panel has no header chip: window.lua shows it while
+-- wave.active() is true and hides it once the grace window elapses.  These
+-- tests pin that contract (a script's push is the only visibility signal).
+do
+    -- Fresh module: the earlier block already pushed, so reset for a clean
+    -- "never pushed" baseline.
+    wave.clear()
+    ok("active false before any push", wave.active() == false)
+    ok("idle_ms nil before any push", wave.idle_ms() == nil)
+
+    wave.push("A", 42)
+    ok("active true right after push", wave.active() == true)
+    ok("idle_ms small after push", (wave.idle_ms() or 1e9) < 100)
+    -- A generous window must still report active.
+    ok("active true with explicit window", wave.active(60000) == true)
+
+    -- Grace expiry: busy-wait past a tiny window so the assertion is timing
+    -- independent (os.clock granularity differs across hosts).
+    local t0 = os.clock()
+    while (os.clock() - t0) < 0.05 do end
+    ok("active false after grace elapsed", wave.active(20) == false)
+    ok("idle_ms grows after wait", (wave.idle_ms() or 0) >= 20)
+
+    -- clear() drops ownership: the reconciler hides the panel on the next frame.
+    wave.clear()
+    ok("clear resets active", wave.active() == false)
+    ok("clear resets idle_ms", wave.idle_ms() == nil)
+end
+
 eq("snapshot without window errors", select(2, wave.snapshot()), "waveform window not visible")
 
 print(string.format("wave_ring: %d passed, %d failed", passed, failed))

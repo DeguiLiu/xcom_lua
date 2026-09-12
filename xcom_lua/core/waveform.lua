@@ -26,10 +26,16 @@ Script API (exposed by script_engine as `wave`):
   wave.config{title=..., series={{name=,color=0xRRGGBB,min=,max=},...}}
   wave.push(series, y)          -- series = 1-based index or name; x = now
   wave.push(series, x, y)       -- explicit x (ms)
-  wave.show() / wave.hide() / wave.visible()
+  wave.show() / wave.hide()     -- detached GDI popup (not the ImPlot panel)
+  wave.visible()                -- GDI popup visible?
   wave.clear()                  -- drop all points
   wave.set_follow(bool)         -- auto-scroll to newest (default true)
   wave.snapshot([path]) -> path -- BMP screenshot
+
+Host API (NOT exposed to scripts; window.lua drives the ImPlot panel):
+  wave.active([window_ms]) -> bool   -- pushed within the window (default 2 s)
+  wave.idle_ms() -> ms | nil         -- since the last push
+  wave.set_backend_visible(bool)     -- toggle the ImPlot surface directly
 ------------------------------------------------------------------------]]--
 
 local ffi = require("ffi")
@@ -44,10 +50,16 @@ if not bmp_writer_ok then bmp_writer = nil end
 
 -- ---- ImPlot scope backend (optional dual-render path) -----------------------
 -- When the xcom_imgui DLL exports the scope API, every wave.push ALSO feeds
--- the in-dashboard ImPlot panel (xcom_imgui_scope_push), and show()/hide()
--- toggle that panel.  The GDI popup remains available for a detached window
--- with screenshot; scripts do not need to know which backend is active.
+-- the in-dashboard ImPlot panel (xcom_imgui_scope_push).  Panel visibility is
+-- host-owned: window.lua calls set_backend_visible() from M.active(), so the
+-- panel tracks whether scripts are currently feeding points.  The GDI popup
+-- remains available for a detached window with screenshot via show()/hide();
+-- scripts do not need to know which backend is active.
 local scope_push, scope_clear, scope_set_visible
+-- Set by the host (window.lua) to clear its "user closed the panel" latch.
+-- The panel's visibility is host-owned, so only the host can forget a manual
+-- dismissal; M.reopen() is the script-facing trigger.
+local host_reopen
 do
     local probe_ok, imgui_lib = pcall(function()
         local f = require("ffi")
@@ -438,6 +450,7 @@ function M.config(opts)
             dragging = false, drag_x = 0,
             trace_series = 1,
             dirty = false,
+            last_push_ms = nil,     -- stamped by push(); drives M.active()
             repaint_timer = nil,
             class_registered = false,
         }
@@ -498,6 +511,11 @@ function M.push(key, a, b)
     end
     if y == nil or x == nil then return false end
     ring_push(s.rings[i], x, y)
+    -- Activity stamp: a script-driven push is what makes the scope panel
+    -- worth showing.  window.lua polls active() to auto-show/hide the panel
+    -- (there is no header chip any more — the presence of data, owned by a
+    -- running script, is the only visibility signal).
+    s.last_push_ms = now_ms()
     -- Dual-backend: also feed the ImPlot scope panel (channel = the 1-based
     -- series index, x rescaled to seconds).  No-op when the DLL lacks it.
     if scope_push and i <= 4 then
@@ -517,6 +535,7 @@ function M.clear()
     if not s then return end
     for _, ring in ipairs(s.rings) do ring_clear(ring) end
     if scope_clear then pcall(scope_clear) end
+    s.last_push_ms = nil      -- clear() drops ownership; panel auto-hides
     s.view_end = nil
     if s.hwnd then
         require("win32").user32.InvalidateRect(s.hwnd, nil, 0)
@@ -537,6 +556,47 @@ end
 
 function M.visible()
     return state ~= nil and state.hwnd ~= nil
+end
+
+-- Activity query: true when a push has been received within the last
+-- `window_ms` (default 2000).  The scope panel has no manual toggle any more
+-- — window.lua shows the ImPlot surface while a script is actively feeding
+-- points and hides it after this idle grace period, so the panel's lifetime
+-- is owned by the scripts, not by a header chip.
+function M.active(window_ms)
+    if not state or state.last_push_ms == nil then return false end
+    window_ms = window_ms or 2000
+    return (now_ms() - state.last_push_ms) <= window_ms
+end
+
+-- Milliseconds since the last push, or nil when no push ever landed.
+function M.idle_ms()
+    if not state or state.last_push_ms == nil then return nil end
+    return now_ms() - state.last_push_ms
+end
+
+-- Backend visibility from the host (window.lua's per-frame ownership check).
+-- Toggles the ImPlot panel and the GDI popup stays purely script-driven
+-- (wave.show()/wave.hide()); this is the host-controlled surface only.
+function M.set_backend_visible(visible)
+    if scope_set_visible then pcall(scope_set_visible, visible and 1 or 0) end
+end
+
+-- Host wiring for M.reopen(): window.lua passes a callback that clears
+-- _scope_dismissed so the per-frame ownership check may show the panel again.
+function M.set_host_reopen(fn)
+    host_reopen = type(fn) == "function" and fn or nil
+end
+
+-- Explicit script-side reopen of the in-dashboard ImPlot panel.  Closing the
+-- panel with its title-bar X must stick for the rest of the session (a user
+-- who dismissed the plot does not want the next data burst to pop it back),
+-- so activity alone no longer clears the host's dismissal latch.  This is the
+-- only path that does: it asks the host to forget the dismissal, and the next
+-- per-frame reconcile re-shows the panel if points are still flowing/arrive.
+function M.reopen()
+    if host_reopen then pcall(host_reopen) end
+    return true
 end
 
 -- ---- test/inspection hooks (pure data access; no Win32) ---------------------
@@ -564,8 +624,11 @@ end
 function M.show()
     local s = state
     if not s then M.config({}) s = state end
-    -- ImPlot panel first: it is the primary in-dashboard scope surface.
-    if scope_set_visible then pcall(scope_set_visible, 1) end
+    -- NOTE: this opens the detached GDI popup window only.  The in-dashboard
+    -- ImPlot panel is NOT toggled here — its visibility is owned by activity
+    -- (window.lua shows it while any script is pushing points via M.active(),
+    -- see _reconcile_scope_visibility).  A script that wants the popup calls
+    -- show(); a script that only wants the dashboard chart just pushes points.
     local w = require("win32")
     w.load()
     if not s.hwnd then
