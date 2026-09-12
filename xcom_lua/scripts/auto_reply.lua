@@ -1,4 +1,6 @@
 -- auto_reply.lua - 自动应答示例（LLCOM 自动回复.lua 风格）
+-- @name AT 自动应答
+-- @desc 收到以 AT 结尾的行时自动回复 OK，演示 on.receive 钩子与定时发送。
 -- 收到以 "AT" 结尾的行时自动回复 "OK\r\n"。
 -- on.receive 钩子返回 nil 会把该批从显示中隐藏；这里原样返回文本。
 

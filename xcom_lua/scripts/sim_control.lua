@@ -1,4 +1,6 @@
 -- sim_control.lua - serial DATA simulator control page (plugin UI).
+-- @name 串口模拟器控制
+-- @desc 独立插件窗口控制内置串口数据模拟器：选profile、调速率、启停。无硬件时使用。
 --
 -- Drives core/serial_sim.lua through the host-injected `sys.sim` closure set
 -- (script_engine exposes it ONLY when the simulator auto-activated, i.e. this

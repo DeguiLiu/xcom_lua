@@ -1,12 +1,16 @@
 -- smoke_ui.lua - headless UI smoke driver for the ImPlot scope panel.
+-- @name 示波器自动化冒烟
+-- @desc 自动生成正弦/锯齿两路波形驱动示波器面板，供截图冒烟验证渲染链路。
 --
 -- Automated screenshot verification cannot synthesize mouse clicks into the
 -- ImGui backend, so this script drives the scope from data instead: when
 -- enabled (Lua script console, config [script] enabled, or the XCOM_SMOKE_*
 -- env route in window.lua:_smoke_env_hooks), it pushes a 2-channel signal
 -- every 20 ms through the same wave.push surface wave_demo.lua uses
--- (core/waveform.lua dual-renders each push into xcom_imgui_scope_push and
--- wave.show() flips the native panel visible via xcom_imgui_scope_set_visible).
+-- (core/waveform.lua dual-renders each push into xcom_imgui_scope_push).  The
+-- in-dashboard panel appears purely from this data flow — window.lua watches
+-- wave activity (waveform.active()) and shows/hides the panel, so no show()
+-- call is needed (wave.show() would instead pop the detached GDI window).
 --
 -- Channels: 1 = sine, 2 = ramping sawtooth; x is automatic (sys.now() ms).
 -- A screenshot showing two live traces proves the scope render path works.
@@ -31,5 +35,4 @@ sys.timer_loop_start(20, function()
     wave.push(2, phase * 4.0 - 2.0)
 end)
 
-wave.show()
 log.info("smoke_ui", "scope smoke feed running (2 channels, 20 ms tick)")

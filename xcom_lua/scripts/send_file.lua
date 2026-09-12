@@ -1,4 +1,6 @@
 -- send_file.lua - 发送文件（Lua 插件动态 UI + 纯 Lua 流式分块发送）
+-- @name 分块发送文件
+-- @desc 弹出独立插件窗口选文件，按块现读现发，演示 ui.page 动态界面与流式发送。
 -- 演示方案 A：零 C++ 改动，脚本用 ui.page() 在头部「Set」设置弹窗里声明
 -- "File Send" 页，选文件走系统打开对话框，按块现读现发（1 MiB 内存在窗，
 -- 不再整文件驻留内存，任意大小文件都可发）。
@@ -65,6 +67,14 @@ local function refresh()
         lines[#lines + 1] = "button:stop:Stop"
     else
         lines[#lines + 1] = "button:start:Send"
+        -- Resume only makes sense with a partially-sent file still loaded.
+        -- Stop deliberately KEEPS state.fd/offset (see the stop branch), so a
+        -- multi-MB firmware that aborted at 80% can continue instead of being
+        -- re-sent from byte 0.
+        if state.fd and state.offset > 0 and state.offset < state.size then
+            lines[#lines + 1] = "button:resume:Resume from " ..
+                fmt_size(state.offset)
+        end
     end
     ui.page("file", "File Send", table.concat(lines, "\n"))
 end
@@ -203,8 +213,24 @@ ui.event = function(page, kind, widget, value)
         state.offset = 0
         state.running = true
         schedule(0, step)
+    elseif kind == "click" and widget == "resume" then
+        -- Continue from wherever the previous run stopped. The fd was left
+        -- open by stop_running/stop, and offset already points at the first
+        -- byte the peer has not seen.
+        if not state.fd then
+            log.warn("send_file", "no file loaded")
+            return
+        end
+        if not uart.is_open() then
+            log.warn("send_file", "port not open")
+            return
+        end
+        state.running = true
+        schedule(0, step)
     elseif kind == "click" and widget == "stop" then
-        close_file()
+        -- Keep offset AND fd: a resume needs to read from the same handle, and
+        -- reopening the file would lose the position for files being written
+        -- by another process. close_file() happens on completion or on browse.
         stop_running(nil)
         log.info("send_file", "stopped at " .. state.offset .. "/" ..
                  fmt_size(state.size))

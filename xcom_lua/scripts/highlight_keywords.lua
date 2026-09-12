@@ -1,4 +1,6 @@
 -- highlight_keywords.lua - 高亮示例：关键词着色（文字色 + 背景色两种风格）
+-- @name 关键词高亮
+-- @desc 为 ERROR/WARN/OK/timeout 等关键词着色，演示文字色与背景色两种高亮样式。
 -- 依赖 Phase 4 的 xcom_imgui.dll 高亮渲染；旧 DLL 下规则静默不显示。
 --
 -- highlight.rule(pattern, color, style)
