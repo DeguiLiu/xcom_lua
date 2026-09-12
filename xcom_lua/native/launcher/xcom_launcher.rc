@@ -1,6 +1,13 @@
 #include <windows.h>
 
-// Application icon
+// Application icon. The id is pinned to 1 and must match M.IDI_APP in
+// ui/win32.lua: the Lua side resolves it with MAKEINTRESOURCE(1) through
+// LoadIconA to give the WINDOW its icon, which is what the taskbar, Alt-Tab
+// and the tray actually display. Relying on the .ico being present as a loose
+// file is not enough — a packaged build places it beside xcom.exe while the
+// loader used a source-tree-relative path, so the packaged exe had no icon.
+#define IDI_APP 1
+
 IDI_APP ICON "xcom.ico"
 
 // Version resource.  XCOM_VERSION_MAJOR/MINOR/PATCH are pre-defined by CMake

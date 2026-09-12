@@ -324,6 +324,10 @@ end
 -- resolve to an undefined global and crash on first call. Declare the local
 -- slot here so both functions close over the same upvalue.
 local create_class
+-- Same reason: create_class calls load_window_icon, which is defined further
+-- down (after the class factory it belongs to). Without the declaration the
+-- call resolves to a global nil and init_window crashes on first run.
+local load_window_icon
 
 function Window:init_window()
     local wc = create_class(self.hinst)
@@ -465,12 +469,52 @@ create_class = function(hinst)
     end
     wc.style = 0x0020  -- CS_OWNDC keeps the DX11 swap-chain target stable.
     wc.hbrBackground = ffi.cast("HBRUSH", page_brush)
-    wc.hIcon = ffi.cast("HICON", w.user32.LoadImageA(
-        nil, "runtime\\xcom.ico", w.image.ICON, 0, 0,
-        w.image.LOAD_FROM_FILE + w.image.DEFAULT_SIZE))
+    wc.hIcon = load_window_icon(w)
     return wc
 end
 Window._create_class = create_class
+
+-- Window icon. The tray/Alt-Tab/taskbar image is the WINDOW's icon, not the
+-- executable's, so the .rc resource alone is not enough — the class must carry
+-- a handle. Three sources, most robust first:
+--
+--   1. the icon embedded in the running executable (IDI_APP in the launcher
+--      .rc). Resolved through the module handle, so it is independent of the
+--      working directory — which is what broke the taskbar icon in a packaged
+--      build: the old code loaded "runtime\xcom.ico", a path that exists in the
+--      source tree but not in the release layout, where the .ico sits beside
+--      xcom.exe.
+--   2. <exe dir>\xcom.ico and <exe dir>\runtime\xcom.ico, for a tree that ships
+--      the icon as a loose file. Anchored on the module path rather than the CWD
+--      so a shortcut with a different working directory still resolves it.
+--   3. the predefined IDI_APPLICATION, so the window always shows something
+--      rather than falling back to the generic blank frame.
+load_window_icon = function(w)
+    -- A NULL return is nil in LuaJIT (a null cdata compares equal to nil), so a
+    -- plain truthiness test is the correct "did this load?" check.
+    local module = w.user32.GetModuleHandleA(nil)
+    local icon = w.user32.LoadIconA(module, ffi.cast("const char*", w.IDI_APP))
+    if icon then
+        return icon
+    end
+    -- Loose-file fallbacks. GetModuleFileNameA gives the running exe's path;
+    -- strip the file name to get its directory.
+    local buf = ffi.new("char[?]", 1024)
+    local n = w.kernel32.GetModuleFileNameA(module, buf, 1024)
+    if n and n > 0 then
+        local exe = ffi.string(buf, n)
+        local dir = exe:match("^(.*)[/\\][^/\\]*$") or "."
+        for _, rel in ipairs({ "xcom.ico", "runtime\\xcom.ico" }) do
+            icon = w.user32.LoadImageA(nil, dir .. "\\" .. rel, w.image.ICON,
+                                       0, 0, w.image.LOAD_FROM_FILE +
+                                       w.image.DEFAULT_SIZE)
+            if icon then
+                return icon
+            end
+        end
+    end
+    return w.user32.LoadIconA(nil, ffi.cast("const char*", w.IDI_APPLICATION))
+end
 
 -- ---------------------------------------------------------------------------
 -- UE layout

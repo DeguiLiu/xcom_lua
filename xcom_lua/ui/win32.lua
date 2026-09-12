@@ -99,7 +99,17 @@ M.image = {
     ICON = 1,
     LOAD_FROM_FILE = 0x00000010,
     DEFAULT_SIZE = 0x00000040,
+    -- LR_SHARED: hand back the cached resource image instead of a private
+    -- copy. Required for a resource loaded from the module and never freed.
+    LOAD_SHARED = 0x00008000,
 }
+
+-- Icon resource id in the launcher (.rc: `IDI_APP ICON "xcom.ico"`).
+M.IDI_APP = 1
+
+-- Standard fallback so a window always gets SOME icon: IDI_APPLICATION is a
+-- predefined resource, so LoadIconA resolves it without any file or module.
+M.IDI_APPLICATION = 32512
 
 M.ctrl = {
     Button = "Button",
@@ -416,6 +426,7 @@ typedef struct {
 } INITCOMMONCONTROLSEX;
 
 HINSTANCE GetModuleHandleA(LPCSTR lpModuleName);
+DWORD GetModuleFileNameA(HINSTANCE hModule, char* lpFilename, DWORD nSize);
 HWND CreateWindowExA(DWORD dwExStyle, LPCSTR lpClassName, LPCSTR lpWindowName,
                      DWORD dwStyle, int x, int y, int nWidth, int nHeight,
                      HWND hWndParent, void* hMenu, HINSTANCE hInstance, LPVOID lpParam);
@@ -482,6 +493,7 @@ intptr_t DefWindowProcA(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 ATOM RegisterClassA(WNDCLASSA* pWndClass);
 void* LoadImageA(HINSTANCE hInst, const char* name, UINT type,
                  int cx, int cy, UINT fuLoad);
+HICON LoadIconA(HINSTANCE hInst, const char* name);
 BOOL UnregisterClassA(LPCSTR lpClassName, HINSTANCE hInstance);
 void PostQuitMessage(int nExitCode);
 BOOL TranslateMessage(const MSG* lpMsg);
