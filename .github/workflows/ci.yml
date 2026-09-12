@@ -100,7 +100,10 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Configure
-        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DBUILD_TESTING=ON
+        # No -G/-A: the runner image ships a moving VS version, and pinning
+        # "Visual Studio 17 2022" fails once the image moves on. Let CMake pick
+        # whatever MSVC the image provides.
+        run: cmake -S . -B build -DBUILD_TESTING=ON
 
       # The ImGui front-end DLL has its own CMakeLists and is NOT referenced by
       # the root one, so it would otherwise go untested — and it is where the
@@ -110,7 +113,7 @@ jobs:
       # a missing vendored dep must be visible, not inferred from a green run.
       - name: Configure ImGui front-end (reports the vendored-dep gap)
         continue-on-error: true
-        run: cmake -S xcom_lua/native/xcom_imgui -B build-imgui -G "Visual Studio 17 2022" -A x64
+        run: cmake -S xcom_lua/native/xcom_imgui -B build-imgui
 
       - name: Build
         run: cmake --build build --config Release --parallel
