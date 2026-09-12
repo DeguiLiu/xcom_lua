@@ -15,14 +15,6 @@ namespace {
 
 constexpr std::uint32_t kReadChunkBytes = 4096U;
 
-// Bounded probe window used by close() before joining the read thread. A wedged
-// driver/firmware can leave the pending OVERLAPPED ReadFile neither completing
-// nor honoring CancelIoEx; waiting on this bound first lets close() record the
-// stall (close_stalled()) instead of blocking silently. 1 s is far above the
-// normal sub-millisecond exit. The join itself is intentionally still unbounded
-// — see close() for why detaching is the riskier option.
-constexpr DWORD kReadThreadJoinTimeoutMs = 1000U;
-
 std::wstring utf8_to_wide(std::string_view text)
 {
     if (text.empty()) {
@@ -121,7 +113,6 @@ bool WinSerialBackend::open(const SerialPortOptions& options,
                             std::int32_t& error) noexcept
 {
     close();
-    close_stalled_.store(false, std::memory_order_release);
     error = ERROR_SUCCESS;
     try {
         std::wstring device = utf8_to_wide(options.port_name);
@@ -183,32 +174,23 @@ void WinSerialBackend::close() noexcept
         CancelIoEx(port_.get(), &write_overlapped_);
     }
     if (read_thread_.joinable()) {
-        // Bounded probe rather than an immediate join: a stalled driver can
-        // leave the pending OVERLAPPED ReadFile neither completing nor honoring
-        // CancelIoEx. Waiting a bounded time first distinguishes a slow-but-
-        // recovering close from a wedged one, and the stall is recorded for the
-        // owner (close_stalled()) when the join eventually returns.
+        // Unbounded join. A stalled driver can leave the pending OVERLAPPED
+        // ReadFile neither completing nor honoring CancelIoEx, and then this
+        // blocks until the driver releases the IRP.
         //
-        // We deliberately do NOT detach on timeout. A detached read thread
-        // still holds a raw `this` and would race close()'s handle reset and,
-        // worse, CoreState's destroy/reuse in xcom_handle_destroy (the backend
-        // is a by-value member of a static-slot CoreState) — a use-after-free
-        // that cannot be closed without giving the backend shared ownership.
-        // Stability first: keep the join (behaviour unchanged from before this
-        // change) so no new crash/deadlock is introduced by the mitigation
-        // itself; if the driver is genuinely wedged this still blocks, which is
-        // the pre-existing failure mode, now diagnosable.
-        // Reinterpret through void* rather than static_cast: MSVC defines
-        // native_handle_type as void* (so the cast is an identity), while other
-        // toolchains model it as an integer, where a static_cast to a pointer
-        // is ill-formed. Going through void* is valid on both.
-        const DWORD join_wait = WaitForSingleObject(
-            static_cast<HANDLE>(
-                reinterpret_cast<void*>(read_thread_.native_handle())),
-            kReadThreadJoinTimeoutMs);
-        if (WAIT_OBJECT_0 != join_wait) {
-            close_stalled_.store(true, std::memory_order_release);
-        }
+        // We do NOT detach on timeout. The read loop dereferences port_,
+        // read_event_ and read_overlapped_ on every iteration, so a detached
+        // thread would race the resets below and, because the backend is a
+        // by-value member of a static-slot CoreState that destroy() recycles,
+        // would eventually touch freed memory. Making detach safe needs shared
+        // ownership of the backend, which is a larger change than this fix
+        // warrants — so the pre-existing failure mode stands, unpapered-over.
+        //
+        // A bounded WaitForSingleObject probe used to sit here and then join
+        // anyway, which could not prevent the block and only added a syscall
+        // and a 1 s delay to every close on a wedged port. It is gone: a probe
+        // that cannot change the outcome is worse than no probe, because it
+        // reads like protection.
         read_thread_.join();
     }
     on_read_ = {};

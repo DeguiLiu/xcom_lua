@@ -185,15 +185,6 @@ public:
 
     [[nodiscard]] bool is_open() const noexcept;
 
-    // True when the most recent close() waited past kReadThreadJoinTimeoutMs
-    // for the read thread to exit — i.e. the driver stalled teardown. The owner
-    // reads this after close() to log a one-shot diagnostic; it is cleared by
-    // the next successful open(). The thread is still joined afterwards (see
-    // close()), so this is a detection signal, not an escape from the stall.
-    [[nodiscard]] bool close_stalled() const noexcept
-    {
-        return close_stalled_.load(std::memory_order_acquire);
-    }
 
 private:
     [[nodiscard]] bool configure(const SerialPortOptions& options,
@@ -230,9 +221,6 @@ private:
     // True while the DCB programs fRtsControl = RTS_CONTROL_HANDSHAKE, i.e.
     // RTS/CTS flow control owns the RTS pin and manual set_rts() must defer.
     std::atomic<bool> rts_handshake_{false};
-    // Set by close() when the bounded probe timed out before the join returned;
-    // read by the owner for diagnostics, cleared by open().
-    std::atomic<bool> close_stalled_{false};
     // Read-thread-only edge state for poll_line_status(): the hold bits seen on
     // the previous poll, so a steady CTS/XOFF handshake does not re-report.
     // Arming happens in open() before the read thread starts, so no concurrent

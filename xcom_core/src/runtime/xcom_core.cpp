@@ -861,13 +861,6 @@ struct CoreState {
             }
             if (!core->virtual_port) {
                 st->serial_backend.close();
-                if (st->serial_backend.close_stalled()) {
-                    // The read thread ignored stop_event + CancelIoEx past the
-                    // bounded probe: the driver stalled teardown. Surface it so
-                    // the stall has an explanation instead of a silent freeze.
-                    core->errors.push(XCOM_ERR_TIMEOUT, 3U,
-                                      "Win32 read thread stalled; driver did not honor cancel");
-                }
             }
             if (core->in_callback.load(std::memory_order_acquire) != 0U) {
                 core->errors.push(XCOM_ERR_IO, 2U,
