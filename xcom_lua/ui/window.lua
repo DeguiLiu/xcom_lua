@@ -152,7 +152,13 @@ local IMGUI_ACTION = {
     send_slot_7 = 67108864,
     scripts_window = 134217728,   -- 1 << 27 (Phase 4 C++ bridge; header "Lua")
     run_sequence = 268435456,     -- 1 << 28 (Phase 4 C++ bridge; Multi "Run")
-    scope_window = 536870912,     -- 1 << 29 (header "Scope" chip)
+    -- 1 << 29 is retired as a header chip: the "波形/Scope" chip is gone.  The
+    -- scope panel is owned by the script engine — it appears while a script
+    -- pushes wave points (waveform.active()) and hides after the idle grace
+    -- period.  The bit itself still arrives when the panel's own title-bar X
+    -- closes it (scope_retired_bit below), so Lua can record the dismissal.
+    -- Kept in the table so the value has a name (parity with the C-side mask).
+    scope_retired_bit = 536870912, -- 1 << 29 (scope panel X, no header chip)
     settings_window = 1073741824, -- 1 << 30 (header "Set" chip)
 }
 
@@ -186,7 +192,6 @@ local IMGUI_COMMANDS = {
     { IMGUI_ACTION.send_slot_7, "_imgui_send_slot", 7 },
     { IMGUI_ACTION.scripts_window, "_imgui_scripts_toggle" },
     { IMGUI_ACTION.run_sequence, "_imgui_run_sequence" },
-    { IMGUI_ACTION.scope_window, "_imgui_scope_toggle" },
     { IMGUI_ACTION.settings_window, "_imgui_settings_toggle" },
 }
 
@@ -207,15 +212,15 @@ local PANEL_GAP = 0
 local HEADER_BUTTON_W = 40
 local HEADER_BUTTONS_W = HEADER_BUTTON_W * 3
 -- ImGui header interactive cluster width.  The C++ bridge renders the
--- min/max/close window buttons AND the three toggle chips (Settings/Scope/Lua)
--- as right-aligned ImGui::InvisibleButton controls starting at
--- `button_group_start - 144` = `window_width - 108 - 144` = `width - 252`
+-- min/max/close window buttons AND the two toggle chips (Settings/Lua) as
+-- right-aligned ImGui::InvisibleButton controls starting at
+-- `button_group_start - 96` = `window_width - 108 - 96` = `width - 204`
 -- (xcom_imgui_bridge.cpp Header(): button_group_start = width - 108, the
--- Settings chip is offset -144).  When the ImGui bridge is active, the
--- NCHITTEST caption zone must NOT swallow those six controls, so this whole
--- right strip is reserved as HTCLIENT and the left/middle header remains
--- HTCAPTION for window dragging.
-local IMGUI_HEADER_CLUSTER_W = 252
+-- Settings chip is offset -96; the Scope chip was removed).  When the ImGui
+-- bridge is active, the NCHITTEST caption zone must NOT swallow those five
+-- controls, so this whole right strip is reserved as HTCLIENT and the
+-- left/middle header remains HTCAPTION for window dragging.
+local IMGUI_HEADER_CLUSTER_W = 204
 
 -- Read the full text of a RICHEDIT/edit control as a Lua string.
 local function receive_text(hwnd)
@@ -411,7 +416,15 @@ end
 
 function Window:_refresh_imgui_ports()
     if not self.imgui then return end
-    local ports = xcom.list_ports() or {}
+    local ports, enum_err = xcom.list_ports()
+    ports = ports or {}
+    if enum_err ~= nil then
+        -- Enumeration itself failed (not merely "no ports"): surface the cause
+        -- instead of silently showing an empty list. Never touches device I/O.
+        local msg = (xcom.describe_enum_error and xcom.describe_enum_error(enum_err))
+                    or ("port enumeration failed (error " .. tostring(enum_err) .. ")")
+        self:set_status_deferred(msg)
+    end
     -- SIM: hardware-free generators live here (see core/serial_sim.lua).
     -- Only ever when the sim flag is on — machines with real ports keep the
     -- exact registry-only list (sim:available() gates on #list_ports()==0).
@@ -524,6 +537,12 @@ flow_text = function(i) return FLOW_TEXT[i] or "None" end
 -- ---------------------------------------------------------------------------
 -- WndProc dispatch
 -- ---------------------------------------------------------------------------
+-- System power broadcast (WM_POWERBROADCAST).  Values are Win32 constants kept
+-- local here so ui/win32.lua (shared by other panels) stays untouched.
+local WM_POWERBROADCAST = 0x0218
+local PBT_APMRESUMESUSPEND = 0x0007
+local PBT_APMRESUMEAUTOMATIC = 0x0008
+
 -- jit.off: entered from the WndProc FFI callback (C re-entry).  Must never be
 -- JIT-compiled — see the LuaJIT FFI callback rule in run_message_loop's note.
 function Window:dispatch(hwnd, msg, wparam, lparam)
@@ -635,6 +654,13 @@ function Window:dispatch(hwnd, msg, wparam, lparam)
         self:on_lbuttonup(lparam)
         return 0
     end
+    if m == WM_POWERBROADCAST then
+        -- Handled resume returns TRUE (1); anything else falls through to the
+        -- default handler so Windows state bookkeeping is untouched.
+        if self:_on_power_broadcast(tonumber(wparam) or 0) then
+            return 1
+        end
+    end
 
     if imgui_handled then
         return 0
@@ -643,6 +669,34 @@ function Window:dispatch(hwnd, msg, wparam, lparam)
     return w.user32.DefWindowProcA(hwnd, msg, wparam, lparam)
 end
 jit.off(Window.dispatch)
+
+-- Resume-from-sleep handler.  A suspended/reset USB serial adapter can leave
+-- the session holding a stale handle: reads stall and writes fail with no
+-- local cause.  We deliberately issue NO port I/O from a WndProc (it would
+-- race the owner thread and the backend's overlapped handle); instead the
+-- event is made visible and the authoritative status poll is pulled forward,
+-- so a dead/vanished port surfaces through the existing status/FAULT/reconnect
+-- path on the next frame.  A clearCommError-style active probe is a possible
+-- follow-up but needs a new ABI entry point and real hardware to validate.
+function Window:_on_power_broadcast(event)
+    if event ~= PBT_APMRESUMESUSPEND and event ~= PBT_APMRESUMEAUTOMATIC then
+        return false
+    end
+    if self.core and self.connected then
+        self:set_status_deferred(
+            "System resumed from sleep - verify the serial connection")
+        -- Re-arm the 250 ms status timer to fire on the next loop iteration, so
+        -- a port that faulted during sleep is reflected immediately rather than
+        -- up to 250 ms later.  luv's start() is safe to call from a WndProc:
+        -- it schedules, it does not re-enter Lua.
+        if self._status_timer and self._status_timer_callback then
+            self._status_timer:start(0, 250, self._status_timer_callback)
+        end
+    end
+    self:request_frame(FRAME_INTERVAL_ACTIVE_MS)
+    return true
+end
+jit.off(Window._on_power_broadcast)
 
 -- Alt+digit handling (WM_SYSKEYDOWN).  Returns true when the key was a
 -- digit we consumed, so the caller can skip DefWindowProc.
@@ -663,7 +717,9 @@ function Window:_on_alt_digit(vk)
         if enabled and text ~= "" then
             local payload = xcom.build_send_payload(text,
                 self.imgui.multi_hex[0] ~= 0, self.imgui.multi_crlf[0] ~= 0)
-            if payload then self:core_send(payload, xcom.send_text) end
+            -- Same empty-payload guard as _imgui_send_enabled: a truthy ""
+            -- (whitespace-only HEX) would be silently dropped by core_send.
+            if payload and payload ~= "" then self:core_send(payload, xcom.send_text) end
         end
     elseif self.send then
         local sp = self.send
@@ -711,7 +767,7 @@ function Window:on_nchittest(lparam)
     -- header => caption for drag (unless on an interactive control).
     if cy < HEADER_H then
         -- When the ImGui bridge owns the header, it renders the window
-        -- buttons AND the Settings/Scope/Lua toggle chips as InvisibleButtons
+        -- buttons AND the Settings/Lua toggle chips as InvisibleButtons
         -- in the rightmost IMGUI_HEADER_CLUSTER_W px.  Reserve that whole
         -- strip as HTCLIENT so clicks reach ImGui; the window buttons are
         -- dispatched inside the bridge (they are NOT the legacy GDI strip
@@ -821,6 +877,16 @@ function Window:_final_drain()
             self.recv.feed(text)
         end
     end
+    -- Drain any charset bytes still held pending from a character torn at the
+    -- final batch boundary (best effort; the converter shows the orphan byte
+    -- as the code page default).  Without this a split trailing character
+    -- would stay held forever, silently missing from the last viewport.
+    if self._charset_active then
+        local tail = charset.flush()
+        if tail and #tail > 0 then
+            self:_append_imgui_receive(tail)
+        end
+    end
 end
 
 function Window:on_close()
@@ -838,6 +904,7 @@ function Window:on_close()
     if self._display_timer then self._display_timer:stop() end
     if self._status_timer then self._status_timer:stop() end
     if self._script_timer then self._script_timer:stop() end
+    if self._script_watch_timer then self._script_watch_timer:stop() end
     if self._sequence_timer then self:_stop_sequence() end
     -- SIM: disarm the pump before the drain/close (its uv handle must not
     -- survive past the core session; stop() is cheap and idempotent).
@@ -1063,6 +1130,16 @@ function Window:core_send(data_bytes, flags)
             data_bytes and #data_bytes or -1, tonumber(flags) or -1)
     end
     if not self.core then
+        return false, xcom.err_not_open
+    end
+    -- Reconnect grace interlock: the send controls are disabled while the HSM
+    -- is RECONNECTING, but a keyboard shortcut / script / send-file path can
+    -- still reach here. Refuse with a visible prompt instead of pushing bytes
+    -- at a port that is mid-recovery.
+    if self.vm:recovering() then
+        if self.imgui then
+            self.imgui:set_status("串口连接异常，等待恢复，暂不能发送")
+        end
         return false, xcom.err_not_open
     end
     if data_bytes and #data_bytes > 0 then
@@ -1311,8 +1388,17 @@ function Window:_process_rx_batch(text)
     end
     -- Charset conversion (display only; GB2312/BIG5/SJIS/UTF-16 -> UTF-8).
     -- Passthrough returns the same string reference at zero cost.
+    -- IMPORTANT: convert() returns NIL when this batch was entirely consumed
+    -- by a multi-byte character split across the drain boundary — the bytes
+    -- are held INSIDE charset.lua (pending) for the next batch.  Never coerce
+    -- that nil back to the raw text (the old `or text` did): a lone DBCS lead
+    -- byte is not valid UTF-8, so displaying it put garbage in the viewport.
+    -- Withhold the batch and let the next drain complete the character.
     if self._charset_active then
-        text = charset.convert(text) or text
+        text = charset.convert(text)
+        if text == nil then
+            return
+        end
     end
     if self.scripts then
         local ok, processed = pcall(self.scripts.process_rx, self.scripts, text)
@@ -1451,6 +1537,12 @@ local FRAME_INTERVAL_ACTIVE_MS = 16
 local FRAME_INTERVAL_DATA_MS = 100
 local FRAME_INTERVAL_IDLE_MS = 500
 
+-- Upper bound on the OPENING transitional state. The core's native serial open
+-- is bounded to ~2 s; 5 s leaves generous headroom (slow USB enumeration,
+-- driver retries) before the UI declares the open dead and faults back so the
+-- user can retry.
+local OPENING_TIMEOUT_MS = 5000
+
 function Window:request_frame(interval_ms)
     if not self.imgui then return end
     local now = uv.now()
@@ -1532,6 +1624,10 @@ function Window:render_imgui()
     end
     self:_pump_script_console()
     self:_pump_plugin_pages()
+    -- Scope panel follows the script engine, not a header chip: before the
+    -- frame is drawn, flip the DLL's scope visibility to match whether any
+    -- script is currently feeding wave points.
+    self:_reconcile_scope_visibility()
     local receive_changed = self:_flush_imgui_receive()
     local rx = self._imgui_receive or ""
     if receive_changed then
@@ -1557,6 +1653,13 @@ function Window:_dispatch_imgui_actions(actions)
     if bit.band(actions, IMGUI_ACTION.open) ~= 0 or
         bit.band(actions, IMGUI_ACTION.sync_settings) ~= 0 then
         self._imgui_port = self.imgui:port_name()
+    end
+    -- Bit 29 (retired header-scope bit) now arrives ONLY from the scope
+    -- panel's own title-bar X (scope_visible_ was cleared natively).  Record
+    -- the dismissal so the activity reconciler does not immediately reopen it.
+    if bit.band(actions, IMGUI_ACTION.scope_retired_bit) ~= 0 then
+        self._scope_dismissed = true
+        self._scope_open = false
     end
     for _, command in ipairs(IMGUI_COMMANDS) do
         if bit.band(actions, command[1]) ~= 0 then
@@ -1584,12 +1687,40 @@ end
 -- Send every enabled entry on the current multi page.  Serves both the "Send
 -- enabled" button and the auto-cycle timer (they used to duplicate this loop).
 function Window:_imgui_send_enabled()
+    local sent = 0
+    local skipped_unchecked = false   -- has text but the enable box is clear
+    local bad_hex = nil               -- first slot whose HEX text failed to parse
     for index = 0, 7 do
         local text, enabled = self.imgui:multi_entry(index)
+        if text ~= "" and not enabled then
+            skipped_unchecked = true
+        end
         if enabled and text ~= "" then
             local payload = xcom.build_send_payload(text,
                 self.imgui.multi_hex[0] ~= 0, self.imgui.multi_crlf[0] ~= 0)
-            if payload then self:core_send(payload, xcom.send_text) end
+            if payload == nil and bad_hex == nil then
+                bad_hex = index + 1
+            end
+            -- build_send_payload returns "" (a TRUTHY empty string) for a
+            -- whitespace-only HEX slot; core_send silently drops empty data,
+            -- which reads as "clicked Send enabled and nothing happened".
+            if payload and payload ~= "" then
+                self:core_send(payload, xcom.send_text)
+                sent = sent + 1
+            end
+        end
+    end
+    -- Silence is what made the original report ("clicked it and nothing
+    -- happened") unactionable, so every no-send path explains itself once.
+    if sent == 0 and self.imgui then
+        if bad_hex then
+            self:set_status_deferred("multi slot " .. bad_hex ..
+                ": invalid HEX, nothing sent")
+        elseif skipped_unchecked then
+            self:set_status_deferred(
+                "multi: tick the enable box on the rows to send")
+        else
+            self:set_status_deferred("multi: no enabled rows with text")
         end
     end
 end
@@ -1600,7 +1731,12 @@ function Window:_imgui_send_slot(index)
     if not enabled or text == "" then return end
     local payload = xcom.build_send_payload(text,
         self.imgui.multi_hex[0] ~= 0, self.imgui.multi_crlf[0] ~= 0)
-    if payload then self:core_send(payload, xcom.send_text) end
+    if payload == nil then
+        self:set_status_deferred("multi slot " .. (index + 1) ..
+            ": invalid HEX, nothing sent")
+        return
+    end
+    if payload ~= "" then self:core_send(payload, xcom.send_text) end
 end
 
 function Window:_imgui_previous_page()
@@ -1700,9 +1836,35 @@ function Window:_imgui_scripts_toggle()
     self:request_frame()
 end
 
-function Window:_imgui_scope_toggle()
-    self._scope_open = not self._scope_open
-    self:request_frame()
+-- Scope panel ownership.  The header "波形/Scope" chip is gone: the script
+-- engine owns the panel's lifetime.  While an enabled script is feeding wave
+-- points (core/waveform.lua M.active() — a push within the idle grace period)
+-- the ImPlot surface is shown; once every feeder goes quiet (script disabled /
+-- unloaded / stopped pushing) the panel hides.  Called once per rendered frame
+-- from render_imgui, so the DLL visibility always tracks the engine state.
+--
+-- The panel's own title-bar X still reports ActionToggleScope (bit 29), which
+-- Lua no longer maps to a command.  _dispatch_imgui_actions watches for it and
+-- sets `_scope_dismissed`, which sticks until a script explicitly reopens the
+-- panel via wave.show() — activity alone must never pop it back, so a user who
+-- closed the plot keeps it closed across data bursts.
+function Window:_reconcile_scope_visibility()
+    if not self.imgui or not self.imgui.set_scope_visible then return end
+    if not self._scope_owner then
+        self._scope_owner = waveform
+        -- Script-side explicit reopen: the only way to clear the dismissal
+        -- latch below.  Without this a closed panel could never come back.
+        waveform.set_host_reopen(function()
+            self._scope_dismissed = false
+            self:request_frame()
+        end)
+    end
+    local want = self._scope_owner.active() and true or false
+    if self._scope_dismissed then want = false end
+    if want ~= self._scope_open then
+        self._scope_open = want
+        self.imgui:set_scope_visible(want)
+    end
 end
 
 function Window:_imgui_settings_toggle()
@@ -1732,17 +1894,13 @@ function Window:_smoke_env_hooks()
         end
     end
     if os.getenv("XCOM_SMOKE_SCOPE") == "1" then
-        -- The Lua->DLL scope-visible route exists (cdef in
-        -- ui/imgui_bridge.lua: xcom_imgui_scope_set_visible; wrappers
-        -- M:set_scope_visible and the alias M:scope_set_visible), so no
-        -- new C export is needed.  Data is fed separately by
-        -- scripts/smoke_ui.lua via wave.push.
-        self._scope_open = true
-        if self.imgui.set_scope_visible then
-            self.imgui:set_scope_visible(true)
-        elseif self.imgui.scope_set_visible then
-            self.imgui:scope_set_visible(true)
-        end
+        -- The scope panel is script-owned now: scripts/smoke_ui.lua feeds
+        -- wave.push on a timer, which stamps waveform activity and makes
+        -- _reconcile_scope_visibility() show the panel on the next frame.
+        -- Nothing to force here — the env var only needs to prove the route;
+        -- leave the visibility to the same path production uses so the smoke
+        -- check exercises the real ownership logic.
+        self._scope_open = false
     end
     if os.getenv("XCOM_SMOKE_OPEN") == "1" and self._sim_active then
         -- Synthetic clicks cannot reach ImGui, so the end-to-end simulator
@@ -1819,10 +1977,15 @@ function Window:_pump_script_console()
     --    signature).
     if self.imgui.set_scripts then
         local names = self.scripts:script_names()
-        local signature = table.concat(names, ",")
+        -- Signature covers names AND labels: an external editor can change a
+        -- script's @name/@desc (after a hot reload) without the filename set
+        -- changing, and the console list must follow that too.
+        local labels = self.scripts:script_labels()
+        local signature = table.concat(names, ",") .. "\1" ..
+            table.concat(labels, ",")
         if signature ~= self._script_list_signature then
             self._script_list_signature = signature
-            self.imgui:set_scripts(names)
+            self.imgui:set_scripts(names, labels)
         end
         -- Copy enable state engine -> C++ checkbox buffer once per frame
         -- only when the console is open (the checkboxes write back through
@@ -2068,12 +2231,22 @@ end
 function Window:_poll_errors()
     local err = xcom.take_error(self.core)
     if err then
+        -- Open failures push the raw native Win32 code (CreateFileW /
+        -- SetCommState) into this ring, so translate the codes we know into an
+        -- actionable cause instead of showing a bare "io error". Unknown codes
+        -- keep the original message untouched.
+        local cause = xcom.describe_open_error and xcom.describe_open_error(err.code)
+        local text
+        if cause then
+            text = string.format("E%d: %s (%s)", err.code, cause, err.message)
+        else
+            text = string.format("E%d: %s", err.code, err.message)
+        end
         if self.imgui then
             -- P3 deferred: coalesced into the next rendered frame.
-            self:set_status_deferred(string.format("E%d: %s", err.code, err.message))
+            self:set_status_deferred(text)
         end
-        c.set_text(self.status.labels[4],
-                   string.format("E%d: %s", err.code, err.message))
+        c.set_text(self.status.labels[4], text)
     end
 end
 
@@ -2095,6 +2268,23 @@ function Window:poll_status()
         return
     end
     if self.vm.hsm.state == self.vm.STATE_OPENING then
+        -- OPENING watchdog: the async open should resolve within the core's
+        -- own ~2 s native window. If neither take_open_result nor the snapshot
+        -- has moved us out of OPENING after OPENING_TIMEOUT_MS, force the
+        -- transitional state to FAULT so the user is not stuck on a spinner
+        -- with the port interlock frozen.
+        if self._opening_deadline == nil then
+            self._opening_deadline = uv.now() + OPENING_TIMEOUT_MS
+        elseif uv.now() >= self._opening_deadline and
+               self.vm.hsm.state == self.vm.STATE_OPENING then
+            self.vm:force_fault()
+            self._opening_deadline = nil
+            if self.imgui then
+                self.imgui:set_status("Open timed out; check the port and parameters")
+            end
+            self:_render_ui_state()
+            return self:_poll_errors()
+        end
         -- Probe (and exercise) the v1.3 async-open result so the open does not
         -- depend solely on snapshot phase; any definitive state (OPEN/FAULT)
         -- is still applied by on_snapshot below.
@@ -2105,6 +2295,31 @@ function Window:poll_status()
                     (STATUS_TEXT[open_result] or tostring(open_result)))
             end
         end
+    else
+        -- Any state other than OPENING clears the watchdog anchor so the next
+        -- open intent starts a fresh window.
+        self._opening_deadline = nil
+    end
+    -- Live DTR/RTS hot switch.  The header toggles only write the Lua-owned
+    -- int buffers, so without this a user check would not reach the wire until
+    -- the NEXT open — the panel would show a level the port is not actually
+    -- driving.  Apply on change while OPEN; errors are reported once per edge.
+    if self.vm.hsm.state == self.vm.STATE_OPEN and self.imgui and self.imgui.dtr then
+        local dtr = self.imgui.dtr[0] ~= 0
+        local rts = self.imgui.rts[0] ~= 0
+        if dtr ~= self._lines_dtr or rts ~= self._lines_rts then
+            self._lines_dtr = dtr
+            self._lines_rts = rts
+            local rc = xcom.set_lines and xcom.set_lines(self.core, dtr, rts)
+            if rc ~= nil and tonumber(rc) ~= xcom.ok and self.imgui then
+                self:set_status_deferred(
+                    "DTR/RTS not applied: " .. (STATUS_TEXT[tonumber(rc)] or tostring(rc)))
+                -- Snap the mirrors back so the UI does not claim a level the
+                -- port rejected (e.g. RTS under flow control).
+                self._lines_dtr = nil
+                self._lines_rts = nil
+            end
+        end
     end
     local snap = xcom.get_snapshot(self.core)
     if snap then
@@ -2112,6 +2327,71 @@ function Window:poll_status()
         self._tx_bytes = snap.tx_bytes
         self.port_state = snap.port_state
         self.generation = snap.generation
+        -- Data-loss accounting is per SESSION.  The core counters are monotonic
+        -- across opens, so "lost this session" is measured from the first
+        -- snapshot of each generation, never from zero.  A generation change
+        -- (new open) also retires any latched loss banner.
+        if snap.generation ~= self._loss_gen then
+            self._loss_gen = snap.generation
+            self._loss_base_pool = snap.rx_pool_exhausted_bytes or 0
+            self._loss_base_overrun = snap.overrun_errors or 0
+            self._loss_base_bp = snap.rx_backpressure_events or 0
+            self._loss_seen = 0
+            self._bp_seen = 0
+            self._loss_banner = nil
+        end
+        -- Reconnect grace window: a fault while the session was OPEN does not
+        -- tear the UI down immediately. If the port recovers within
+        -- RECONNECT_GRACE_MS we resume; otherwise we fall through to FAULT and
+        -- the user reconnects manually. The core released the physical handle
+        -- on fault, so recovery is a fresh open of the same port.
+        local was_open = self.vm.hsm.state == self.vm.STATE_OPEN or
+                         self.vm.hsm.state == self.vm.STATE_OPENING
+        if snap.port_state == xcom.port_fault and (was_open or self._reconnect_deadline) then
+            if not self._reconnect_deadline then
+                self.vm:enter_reconnecting(snap.generation)
+                self._reconnect_deadline = uv.now() + self.vm.RECONNECT_GRACE_MS
+                self._reconnect_attempt = 0
+                self._reconnect_pending = false
+                self._reconnect_phase = nil
+                -- USB re-enumeration can move the same adapter to a different
+                -- COMx. Capture the registry description now, while the old
+                -- name may still be enumerated, so _resolve_reconnect_port can
+                -- follow the device to its new name once it reappears.
+                self._reconnect_port_desc =
+                    self:_port_description(self:_serial_config().port)
+            end
+            self:_drive_reconnect(snap.generation)
+            self:_render_ui_state()
+            return self:_poll_errors()
+        end
+        if self._reconnect_deadline then
+            -- Inside the window only OPEN/OPENING counts as recovery. A CLOSED
+            -- snapshot is our OWN xcom_close() reset (driving FAULT -> CLOSED
+            -- before the reopen) and must not be mistaken for "port is back",
+            -- so it is swallowed here rather than reaching on_snapshot.
+            if snap.port_state == xcom.port_open or snap.port_state == xcom.port_opening then
+                -- Latch the fresh core state into the HSM (it stays RECONNECTING
+                -- until settle), then commit the recovery.
+                self.vm.hsm:on_port_state(snap.port_state, snap.generation)
+                self._reconnect_deadline = nil
+                self._reconnect_pending = false
+                self._reconnect_phase = nil
+                self._reconnect_port_desc = nil
+                if self.vm:settle_recovering() then
+                    if self.imgui then
+                        self.imgui:set_status("Reconnected: " .. (self._imgui_port or "serial port"))
+                    end
+                    self:_render_ui_state()
+                end
+            end
+            self:_poll_errors()
+            return
+        end
+        -- Window elapsed with no recovery: the FAULT branch above already ran
+        -- _drive_reconnect (which times out to FAULT and clears the deadline),
+        -- so on_snapshot below lands the session in FAULT for a manual
+        -- reconnect. Nothing extra to do here.
         if self.vm:on_snapshot(snap) then
             self:_render_ui_state()
             if self.imgui then
@@ -2125,10 +2405,13 @@ function Window:poll_status()
         -- Skip the string.format allocations when the counters are unchanged
         -- (the 250 ms poller otherwise formats four identical strings per
         -- second even on a quiet line).
-        if snap.port_state ~= self._last_port_state then
+        if snap.port_state ~= self._last_port_state or self.vm:recovering() then
             self._last_port_state = snap.port_state
-            c.set_text(self.status.labels[1],
-                       xcom.port_text[snap.port_state] or tostring(snap.port_state))
+            local label = xcom.port_text[snap.port_state] or tostring(snap.port_state)
+            if self.vm:recovering() then
+                label = "RECONNECT"
+            end
+            c.set_text(self.status.labels[1], label)
         end
         if snap.rx_bytes ~= self._last_rx_fmt or snap.tx_bytes ~= self._last_tx_fmt then
             self._last_rx_fmt = snap.rx_bytes
@@ -2142,29 +2425,252 @@ function Window:poll_status()
         local drops = snap.rx_pool_exhausted_bytes + snap.tx_rejected
         local trim = snap.ui_trimmed_bytes
         local paused = snap.display_paused_bytes
-        if drops ~= self._last_drops or trim ~= self._last_trim or paused ~= self._last_paused then
-            self._last_drops, self._last_trim, self._last_paused = drops, trim, paused
-            -- Backpressure escalation: a growing rx_pool_exhausted_bytes means
-            -- the 512 KiB core pool filled and bytes were dropped at the source
-            -- — the one true data-loss path.  React immediately instead of at
-            -- the next 10 ms tick: drain right now and surface the overflow.
-            local prev_exhausted = self._last_pool_exhausted or 0
-            if snap.rx_pool_exhausted_bytes > prev_exhausted then
-                self._last_pool_exhausted = snap.rx_pool_exhausted_bytes
-                c.set_text(self.status.labels[3],
-                           string.format("DATA LOSS: rx pool overflow (total %d) - draining",
-                                         snap.rx_pool_exhausted_bytes))
+        -- Session-scoped loss, from two distinct sources:
+        --   * pool drop (rx_pool_exhausted_bytes): exact byte count. Only the
+        --     injected seam can hit this; the live serial callback withholds
+        --     reads instead of dropping.
+        --   * driver overrun (overrun_errors): bytes lost inside the driver
+        --     FIFO, count unknowable, event countable. This is the live path's
+        --     real (uncorrectable) loss.
+        local sess_pool = (snap.rx_pool_exhausted_bytes or 0) -
+                          (self._loss_base_pool or 0)
+        local sess_overrun = (snap.overrun_errors or 0) -
+                             (self._loss_base_overrun or 0)
+        if sess_pool < 0 then sess_pool = 0 end
+        if sess_overrun < 0 then sess_overrun = 0 end
+        local loss_events = sess_pool + sess_overrun
+        if loss_events ~= (self._loss_seen or 0) then
+            self._loss_seen = loss_events
+            if loss_events > 0 then
+                -- Latched banner: re-asserted every poll below so an unrelated
+                -- status write cannot make the loss flash and vanish.
+                if sess_pool > 0 and sess_overrun > 0 then
+                    self._loss_banner = string.format(
+                        "DATA LOSS: %d B pool + overrun x%d @ offset %d",
+                        sess_pool, sess_overrun, snap.rx_loss_offset or 0)
+                elseif sess_pool > 0 then
+                    self._loss_banner = string.format(
+                        "DATA LOSS: %d B dropped @ offset %d (seq %d)",
+                        sess_pool, snap.rx_loss_offset or 0, snap.rx_sequence or 0)
+                else
+                    self._loss_banner = string.format(
+                        "DATA LOSS: driver RX overrun x%d @ offset %d - lower baud/flow",
+                        sess_overrun, snap.rx_loss_offset or 0)
+                end
+                -- Drain now: this relieves a full pool and narrows the window in
+                -- which the driver FIFO can overrun.
                 self:poll_display()
+                -- Vivid + immediate: route the message to the ImGui status path
+                -- and pull a frame right away rather than at the 500 ms beat.
+                self:set_status_deferred(self._loss_banner)
                 self:request_frame(FRAME_INTERVAL_ACTIVE_MS)
             else
+                self._loss_banner = nil
+            end
+        end
+        if drops ~= self._last_drops or trim ~= self._last_trim or paused ~= self._last_paused then
+            self._last_drops, self._last_trim, self._last_paused = drops, trim, paused
+            -- Only paint the informational drop/trim/pause line when no loss
+            -- banner is latched; otherwise it would immediately be overwritten
+            -- by the banner below anyway.
+            if not self._loss_banner then
                 c.set_text(self.status.labels[3],
                            string.format("drops: %d  trim: %d  pause: %d", drops, trim, paused))
+            end
+        end
+        -- Persistence: re-assert the loss banner every poll while this session
+        -- carries loss, so the next frame and every later frame show it.
+        if self._loss_banner then
+            c.set_text(self.status.labels[3], self._loss_banner)
+        end
+        -- Early warning BEFORE any loss: the RX pool was full and the live read
+        -- callback withheld reads (rx_backpressure_events).  No bytes are lost
+        -- yet on that path, but the driver FIFO is what fills next, so surface
+        -- it once per new count.  No persistent banner here.
+        local sess_bp = (snap.rx_backpressure_events or 0) -
+                        (self._loss_base_bp or 0)
+        if sess_bp < 0 then sess_bp = 0 end
+        if sess_bp ~= (self._bp_seen or 0) then
+            self._bp_seen = sess_bp
+            if sess_bp > 0 and loss_events == 0 then
+                self:set_status_deferred(string.format(
+                    "RX backpressure x%d: host not draining the receive pool",
+                    sess_bp))
+                self:request_frame(FRAME_INTERVAL_ACTIVE_MS)
+            end
+        end
+        -- v1.5 line errors: ClearCommError counters from the core. Surface only
+        -- on change (this poller runs at 250 ms) so a storm cannot flood the
+        -- status line, and keep it off the RX/TX label so normal traffic stays
+        -- readable. A rising count means received bytes may be corrupted.
+        local line_errors = (snap.framing_errors or 0) + (snap.parity_errors or 0) +
+                            (snap.overrun_errors or 0) + (snap.break_events or 0)
+        if line_errors ~= self._last_line_errors then
+            self._last_line_errors = line_errors
+            -- Overrun is already inside the loss banner; suppress the weaker
+            -- line-error notice while a banner is latched so the banner wins.
+            if line_errors > 0 and not self._loss_banner then
+                self:set_status_deferred(string.format(
+                    "Line errors: frame %d parity %d overrun %d break %d",
+                    snap.framing_errors or 0, snap.parity_errors or 0,
+                    snap.overrun_errors or 0, snap.break_events or 0))
             end
         end
     end
     self:_poll_errors()
 end
 jit.off(Window.poll_status)
+
+-- Port-list helpers for the reconnect grace window. USB re-enumeration can
+-- move the same physical adapter from COMx to COMy, so retrying the old name
+-- never recovers. Enumeration only returns {name, description}, so the adapter
+-- is identified by its description (the SERIALCOMM value name, stable per
+-- device instance): a name change carrying the same description is treated as
+-- the same device.
+
+-- Registry description of `name` from the current enumeration, or nil when the
+-- port is gone or carries no description.
+function Window:_port_description(name)
+    if not name or name == "" then
+        return nil
+    end
+    for _, p in ipairs(xcom.list_ports() or {}) do
+        if p.name == name then
+            if p.description and p.description ~= "" then
+                return p.description
+            end
+            return nil
+        end
+    end
+    return nil
+end
+
+-- Resolve the port to reopen. Returns (target, matched):
+--   * original still enumerated -> (original, true)
+--   * original gone, exactly one newly enumerated port carries the same
+--     description -> (that name, true)   [the USB re-enumeration case]
+--   * otherwise -> (original, false)     [no reliable match]
+-- Ambiguity (0 or >1 description matches) counts as no match on purpose:
+-- opening the wrong device is worse than asking the user to reselect.
+function Window:_resolve_reconnect_port(original, desc)
+    if not original or original == "" then
+        return original, false
+    end
+    local present = false
+    local candidate = nil
+    local candidate_count = 0
+    for _, p in ipairs(xcom.list_ports() or {}) do
+        if p.name == original then
+            present = true
+        elseif desc and p.description and p.description ~= "" and
+               p.description == desc then
+            candidate = p.name
+            candidate_count = candidate_count + 1
+        end
+    end
+    if present then
+        return original, true
+    end
+    if candidate_count == 1 then
+        return candidate, true
+    end
+    return original, false
+end
+
+-- Grace-window driver: called from poll_status while the HSM mirrors a
+-- RECONNECTING session (core faulted, UI holding the window open). It arms a
+-- fresh open of the same port at most once per grace-retry interval and times
+-- the window out to FAULT. The core released the old handle on the fault, so
+-- this is a real CreateFile-style reopen, not a handle probe.
+function Window:_drive_reconnect(generation)
+    if not self.core then
+        return false
+    end
+    local now = uv.now()
+    if now >= self._reconnect_deadline then
+        self.vm:reconnect_timeout()
+        self._reconnect_deadline = nil
+        self._reconnect_attempt = 0
+        self._reconnect_pending = false
+        self._reconnect_phase = nil
+        self._reconnect_port_desc = nil
+        if self.imgui then
+            self.imgui:set_status("串口连接已断开，请手动重连")
+        end
+        -- Signal the caller to re-render: the HSM left RECONNECTING for FAULT,
+        -- which flips the open/close/send interlock back to the manual path.
+        return true
+    end
+    -- The HSM stays in RECONNECTING for the whole window (that is what gates
+    -- send/params); `_reconnect_phase` tracks the core reset -> reopen
+    -- sequence. The core's queue_open only accepts CLOSED, and a fault leaves
+    -- it in FAULT, so each attempt must first issue close() to drive
+    -- FAULT -> CLOSED (this also drains the faulted session's remaining
+    -- teardown) before open_async can be queued.
+    local serial = self:_serial_config()
+    local original = serial.port
+    -- Re-enumerate every attempt (device hot-plug is exactly what we are
+    -- recovering from) and follow the adapter to a new COMx when possible.
+    local target, matched = self:_resolve_reconnect_port(
+        original, self._reconnect_port_desc)
+    if matched and target and target ~= "" and target ~= original then
+        -- The adapter came back under a new name: adopt it in every place the
+        -- serial config is read from, refresh the dropdown, and re-arm so the
+        -- next attempt opens the new port instead of the stale one.
+        self._imgui_port = target
+        if self.conn and self.conn.port then
+            c.set_text(self.conn.port, target)
+        end
+        self:_refresh_imgui_ports()
+        serial.port = target
+        self._reconnect_pending = false
+        self._reconnect_phase = nil
+    end
+    -- Prefer the original name exactly as before (never regress a retry); use a
+    -- description-matched replacement only when one is unambiguously found.
+    local have_port = serial.port and serial.port ~= ""
+    if self._reconnect_phase == nil then
+        -- Kick off the core reset for this attempt.
+        xcom.close(self.core, 500)
+        self._reconnect_phase = "open"
+    elseif self._reconnect_phase == "open" then
+        if not self._reconnect_pending and have_port then
+            self._reconnect_attempt = (self._reconnect_attempt or 0) + 1
+            local rc = xcom.open_async(self.core, serial.port, serial.baud_rate,
+                serial.data_bits, serial.stop_bits, serial.parity, serial.flow_control,
+                serial.dtr, serial.rts)
+            -- XCOM_OK only means the request was queued; XCOM_ERR_BUSY means the
+            -- core is still tearing down. Either way the next snapshot /
+            -- take_open_result judges the attempt.
+            self._reconnect_pending = (rc == xcom.ok)
+        elseif self._reconnect_pending then
+            -- Probe the in-flight reopen. A definitive failure clears the
+            -- pending flag and re-arms the core reset for a fresh attempt.
+            local open_result = tonumber(xcom.take_open_result(self.core))
+            if open_result and open_result ~= xcom.ok and open_result ~= xcom.err_busy then
+                self._reconnect_pending = false
+                self._reconnect_phase = nil
+            end
+        end
+    end
+    if self.imgui then
+        if not matched then
+            -- Original port vanished and no single description-matched
+            -- replacement exists (a re-enumerated device we cannot identify
+            -- from {name, description} alone). Say so instead of a meaningless
+            -- countdown so the user can reselect; the window still runs in case
+            -- the device reappears.
+            self.imgui:set_status("端口已消失，可能是设备重新枚举，请重新选择端口")
+        else
+            local left = math.max(0, math.floor((self._reconnect_deadline - now) / 1000))
+            local suffix = (target ~= original) and ("  已切换到 " .. target) or ""
+            self.imgui:set_status(string.format(
+                "串口连接异常，等待恢复... (%ds)%s", left, suffix))
+        end
+    end
+    return false
+end
+jit.off(Window._drive_reconnect)
 
 -- Render every connection-dependent control from one HSM snapshot (mirrors
 -- Python's MainWindow._render_ui_state).  params_enabled gates the serial
@@ -2426,12 +2932,17 @@ function Window:start()
         open_file = function() return self:_open_file_dialog("Send file") end,
         sim = self._sim_active and self.sim or nil,
         auto_reload = self.cfg.script_auto_reload and true or false,
+        -- fs_event watch of scripts/ so an external editor save hot-reloads the
+        -- script (debounced 200 ms).  Independent of [script] auto_reload: the
+        -- watcher is the primary path, auto_reload is the mtime fallback.
+        watch = true,
     })
     local ok_scripts, err_scripts = pcall(function()
         self.scripts:load_all()
         for _, name in ipairs(self.cfg.script_enabled or {}) do
             self.scripts:enable(name, true)
         end
+        self.scripts:watch_start()
     end)
     if not ok_scripts then
         io.stderr:write("[scripts] init: " .. tostring(err_scripts) .. "\n")
@@ -2440,10 +2951,15 @@ function Window:start()
     -- state mirrors this through set_scripts_visible; the header "Lua" button
     -- toggles it later through the action bit.
     self._scripts_console_open = self.cfg.script_autorun_console and true or false
-    -- Scope/settings mirrors start explicit-false: the flags are only flipped
-    -- by the C++ action bits, and `not nil` would read true on the first
-    -- toggle and desync from the (false-initial) native visibility.
+    -- Scope mirror starts explicit-false.  It is no longer driven by a header
+    -- chip: _reconcile_scope_visibility() flips it (and the DLL visibility) to
+    -- match waveform.active() each frame.  `not nil` would read true on the
+    -- first reconcile and skip the initial hide, so keep it explicitly false.
     self._scope_open = false
+    self._scope_dismissed = false   -- panel X click suppresses re-show (see reconcile)
+    -- Settings mirror starts explicit-false: the flag is only flipped by the
+    -- C++ action bit, and `not nil` would desync from the false-initial native
+    -- visibility on the first toggle.
     self._settings_open = false
     if self._scripts_console_open and self.imgui and self.imgui.set_scripts_visible then
         self.imgui:set_scripts_visible(true)
@@ -2468,6 +2984,20 @@ function Window:start()
     jit.off(script_poll_callback, true)
     self._script_poll_callback = script_poll_callback
     self._script_timer:start(1000, 1000, script_poll_callback)
+
+    -- Fast fs_event drain (250 ms): the watcher records changed filenames
+    -- immediately, and this tick applies the 200 ms debounce and reloads them.
+    -- It runs faster than the 1 Hz housekeeping timer so an external editor
+    -- save hot-reloads within roughly a quarter second instead of a whole
+    -- second.  pump() is a no-op when no watcher/files are pending.
+    self._script_watch_timer = uv.new_timer()
+    local script_watch_callback = function()
+        local ok, err = pcall(self.scripts.pump, self.scripts)
+        if not ok then io.stderr:write("[scripts] watch: " .. tostring(err) .. "\n") end
+    end
+    jit.off(script_watch_callback, true)
+    self._script_watch_callback = script_watch_callback
+    self._script_watch_timer:start(250, 250, script_watch_callback)
 
     -- Wire connection-panel buttons / combos to handlers by control id.
     self:bind_handler(self.conn.open.id, "on_btn_open")
@@ -2613,7 +3143,8 @@ function Window:run()
     -- that skipped on_close.
     if self._sim_active then self.sim:stop() end
     for _, t in ipairs({ self._display_timer, self._status_timer,
-                         self._multi_timer, self._script_timer }) do
+                         self._multi_timer, self._script_timer,
+                         self._script_watch_timer }) do
         if t then
             t:stop()
             t:close()
@@ -2846,7 +3377,7 @@ end
 
 function Window:on_btn_refresh()
     -- Re-enumerate ports into the combo, re-selecting a persisted port if set.
-    local ports = xcom.list_ports()
+    local ports, enum_err = xcom.list_ports()
     local items = {}
     for _, p in ipairs(ports or {}) do
         local label = p.name
@@ -2861,7 +3392,15 @@ function Window:on_btn_refresh()
         c.combo_select_text(self.conn.port, self._port_want)
     end
     if #items == 0 then
-        c.set_text(self.status.labels[3], "no COM ports detected")
+        -- Distinguish "no ports" from "enumeration failed" so the user is not
+        -- left guessing at an empty combo.
+        if enum_err ~= nil then
+            local msg = (xcom.describe_enum_error and xcom.describe_enum_error(enum_err))
+                        or ("port enumeration failed (error " .. tostring(enum_err) .. ")")
+            c.set_text(self.status.labels[3], msg)
+        else
+            c.set_text(self.status.labels[3], "no COM ports detected")
+        end
     end
 end
 

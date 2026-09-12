@@ -72,6 +72,15 @@ typedef struct XcomSnapshot {
     uint32_t display_pending;
     uint16_t port_state;
     uint8_t _pad[2];
+    /* v1.5 ClearCommError line-error counters (appended; must match xcom.h) */
+    uint32_t framing_errors;
+    uint32_t parity_errors;
+    uint32_t overrun_errors;
+    uint32_t break_events;
+    /* v1.5 loss observability (appended; must match xcom.h) */
+    uint32_t rx_sequence;
+    uint32_t rx_loss_offset;
+    uint32_t rx_backpressure_events;
 } XcomSnapshot;
 
 typedef struct XcomError {
@@ -91,6 +100,8 @@ typedef struct XcomPortInfo {
 
 uint32_t xcom_version(void);
 XcomStatus xcom_list_ports(XcomPortInfo* out, uint32_t capacity, uint32_t* count);
+XcomStatus xcom_list_ports_ex(XcomPortInfo* out, uint32_t capacity, uint32_t* count,
+                              uint32_t flags, int32_t* error);
 void* xcom_create(const XcomCreateOptions* options);
 XcomStatus xcom_open(void* h, const XcomPortConfig* config);
 XcomStatus xcom_open_async(void* h, const XcomPortConfig* config);
@@ -98,6 +109,7 @@ XcomStatus xcom_take_open_result(void* h);
 XcomStatus xcom_close(void* h, uint32_t timeout_ms);
 XcomStatus xcom_send(void* h, const uint8_t* data, uint32_t size, uint32_t flags);
 XcomStatus xcom_set_options(void* h, const XcomDisplayOptions* options);
+XcomStatus xcom_set_lines(void* h, uint8_t dtr, uint8_t rts);
 XcomStatus xcom_set_auto_template(void* h, const uint8_t* data, uint32_t size,
                                   uint32_t interval_ms, uint32_t flags);
 XcomStatus xcom_drain_display(void* h, char* output, uint32_t capacity,
@@ -143,6 +155,65 @@ M.port_text = {
     [3] = "Closing",
     [4] = "Fault",
 }
+
+-- xcom_list_ports_ex flags (mirror xcom.h XCOM_LIST_PORTS_PROBE_BUSY).
+M.PROBE_BUSY = 1
+
+-- Native Win32 error -> Chinese cause, for the open-failure status line. The
+-- core pushes the raw Win32 code from CreateFileW/SetCommState into its error
+-- ring, so a bare "io error" can be turned into a cause the user can act on.
+-- Windows folds "in use" and "permission denied" into ERROR_ACCESS_DENIED (5),
+-- so those two cannot be told apart from the code alone.
+M.open_error_causes = {
+    [2]    = "端口不存在",
+    [3]    = "端口不存在",
+    [5]    = "端口被其他程序占用或权限不足",
+    [31]   = "设备无响应或已断开",
+    [32]   = "端口被其他程序占用",
+    [110]  = "端口打开失败（可能被占用）",
+    [121]  = "设备无响应（操作超时）",
+    [995]  = "操作已取消",
+    [1167] = "设备已拔出",
+    [1168] = "找不到设备",
+}
+
+-- Native enumeration status -> Chinese cause (RegOpenKeyExA LSTATUS).
+M.enum_error_causes = {
+    [5]  = "无法读取串口列表：访问被拒绝",
+    [87] = "串口列表读取失败：参数无效",
+}
+
+-- describe_open_error(code) -> cause string or nil. Never raises: a nil or
+-- unknown code simply yields nil so the caller falls back to the raw message.
+function M.describe_open_error(code)
+    local n = tonumber(code)
+    if not n then
+        return nil
+    end
+    return M.open_error_causes[n]
+end
+
+-- describe_enum_error(code) -> human string. Always returns something for a
+-- non-zero code so the UI never shows a bare number.
+function M.describe_enum_error(code)
+    local n = tonumber(code)
+    if not n or n == 0 then
+        return nil
+    end
+    return M.enum_error_causes[n] or string.format("串口枚举失败（错误码 %d）", n)
+end
+
+-- Active occupancy probing opens every enumerated port, which can drive DTR
+-- and reset an auto-reset target board. It is therefore OFF unless the caller
+-- explicitly opts in (opts.probe == true) or sets XCOM_PORT_PROBE=1.
+function M.probe_enabled_by_env()
+    local v = os.getenv("XCOM_PORT_PROBE")
+    if not v or v == "" then
+        return false
+    end
+    v = v:lower()
+    return v == "1" or v == "true" or v == "on" or v == "yes"
+end
 
 M.version_major = 1
 M.version_minor = 2
@@ -278,35 +349,60 @@ function M.create()
 end
 
 --[[-------------------------------------------------------------------------
-list_ports() -> list of {name=, description=, busy=}
+list_ports(opts) -> list of {name=, description=, busy=}, native_error
 Enumeration helper.  Calls the ABI with a bounded buffer; on insufficient
 capacity it retries once with a larger buffer sized by the returned count.
-Returns empty list on any error.
+
+Returns a second value, `native_error`, when the core could not read the
+registry port list (nil on success or on the legacy path). A DLL/symbol/ABI
+problem never raises and never breaks the caller: the worst case degrades to
+an empty list, exactly as before this change.
+
+opts.probe == true (or XCOM_PORT_PROBE=1) requests an exclusive-open occupancy
+probe. It is OFF by default because opening a port can drive DTR and reset an
+auto-reset target board; see xcom_ffi.M.probe_enabled_by_env.
 ------------------------------------------------------------------------]]--
-function M.list_ports()
+function M.list_ports(opts)
     local l = M.load()
     if not l then
         return {}
     end
+    local probe = (type(opts) == "table" and opts.probe == true) or
+                  M.probe_enabled_by_env()
+    local flags = probe and M.PROBE_BUSY or 0
     local cap = M.MAX_PORT_LIST
     local count = ffi.new("uint32_t[1]")
-    local buf_ptr
-    local function try(c, buf)
-        local rc = l.xcom_list_ports(buf, c, count)
-        return rc
+    local native = ffi.new("int32_t[1]")
+    -- Prefer the error-aware entry point when the loaded DLL exports it; fall
+    -- back to the legacy symbol so an older xcom_core.dll keeps working.
+    local list_ex = l.xcom_list_ports_ex
+    local function call(c, buf)
+        if list_ex then
+            return list_ex(buf, c, count, flags, native)
+        end
+        return l.xcom_list_ports(buf, c, count)
     end
-    -- first attempt with fixed stack-like buffer
-    local arr = ffi.new("XcomPortInfo[?]", cap)
-    local rc = try(cap, arr)
-    if rc == M.err_full then
-        -- grow to the needed count (capped)
-        cap = count[0] + 1
-        local arr2 = ffi.new("XcomPortInfo[?]", cap)
-        rc = try(cap, arr2)
-        arr = arr2
-    end
-    if rc ~= M.ok then
+    local ok, arr, rc = pcall(function()
+        local a = ffi.new("XcomPortInfo[?]", cap)
+        local r = call(cap, a)
+        if r == M.err_full then
+            cap = count[0] + 1
+            local a2 = ffi.new("XcomPortInfo[?]", cap)
+            r = call(cap, a2)
+            a = a2
+        end
+        return a, r
+    end)
+    if not ok then
         return {}
+    end
+    -- A reported native error is surfaced even alongside a partial port list.
+    local enum_error = nil
+    if list_ex and native[0] ~= 0 then
+        enum_error = native[0]
+    end
+    if rc ~= M.ok and rc ~= M.err_full and rc ~= M.err_io then
+        return {}, enum_error
     end
     local n = math.min(count[0], cap)
     local ports = {}
@@ -317,7 +413,7 @@ function M.list_ports()
             busy = arr[i].busy ~= 0,
         }
     end
-    return ports
+    return ports, enum_error
 end
 
 --[[-------------------------------------------------------------------------
@@ -383,6 +479,21 @@ function M.set_options(h, opts)
     cfg.auto_clear_bytes = opts.auto_clear_bytes or 0
     cfg.max_display_bytes = opts.max_display_bytes or (2 * 1024 * 1024)
     return M.set_options_c(h, cfg)
+end
+
+--[[-------------------------------------------------------------------------
+set_lines(h, dtr, rts) -> status
+Live modem-line control (v1.4 ABI).  dtr/rts are booleans, true = asserted
+(physical pin active).  Applies immediately with EscapeCommFunction, unlike
+the DCB flags which only take effect at open time.  Returns nil (and does
+nothing) on a pre-1.4 DLL that lacks the export, so callers degrade quietly.
+------------------------------------------------------------------------]]--
+function M.set_lines(h, dtr, rts)
+    local l = M.load()
+    if not l then return nil end
+    local fn = l.xcom_set_lines
+    if fn == nil then return nil end
+    return fn(h, (dtr and 1 or 0), (rts and 1 or 0))
 end
 
 --[[-------------------------------------------------------------------------
@@ -467,6 +578,13 @@ function M.get_snapshot(h)
         generation = s.generation,
         display_pending = s.display_pending,
         port_state = s.port_state,
+        framing_errors = s.framing_errors,
+        parity_errors = s.parity_errors,
+        overrun_errors = s.overrun_errors,
+        break_events = s.break_events,
+        rx_sequence = s.rx_sequence,
+        rx_loss_offset = s.rx_loss_offset,
+        rx_backpressure_events = s.rx_backpressure_events,
     }
 end
 
@@ -512,7 +630,7 @@ local SIZEOF = {
     create_options   = 8,
     port_config      = 32,
     display_options  = 16,
-    snapshot         = 52,
+    snapshot         = 80,
     error            = 268,
     port_info        = 324,
 }

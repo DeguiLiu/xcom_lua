@@ -32,7 +32,7 @@ end
 -- 1) The module loads on Linux (cdef + layout self-check run at require time).
 --    require() already succeeded above; assert the size pins are present.
 ok("SIZEOF table present", type(x.SIZEOF) == "table")
-eq("sizeof snapshot pinned", x.SIZEOF.snapshot, 52)
+eq("sizeof snapshot pinned", x.SIZEOF.snapshot, 80)
 eq("sizeof portconfig pinned", x.SIZEOF.port_config, 32)
 eq("sizeof error pinned", x.SIZEOF.error, 268)
 eq("sizeof portinfo pinned", x.SIZEOF.port_info, 324)
