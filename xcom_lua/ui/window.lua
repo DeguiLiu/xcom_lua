@@ -2433,6 +2433,20 @@ function Window:poll_status()
             self._bp_seen = 0
             self._loss_banner = nil
         end
+        -- Abandon the grace driver if the session left RECONNECTING for any
+        -- reason other than the driver itself. A user Close moves the HSM to
+        -- CLOSING/CLOSED/FAULT, and a watchdog force-fault moves it to FAULT,
+        -- but the deadline stayed armed: the next poll's _drive_reconnect (and
+        -- the OPEN/OPENING recovery absorb below) would then resume the
+        -- reset -> reopen sequence and reopen a port the user explicitly asked
+        -- to close. Once state is no longer RECONNECTING, drop the window.
+        if self._reconnect_deadline and not self.vm:recovering() then
+            self._reconnect_deadline = nil
+            self._reconnect_attempt = 0
+            self._reconnect_pending = false
+            self._reconnect_phase = nil
+            self._reconnect_port_desc = nil
+        end
         -- Reconnect grace window: a fault while the session was OPEN does not
         -- tear the UI down immediately. If the port recovers within
         -- RECONNECT_GRACE_MS we resume; otherwise we fall through to FAULT and
@@ -2476,12 +2490,21 @@ function Window:poll_status()
                 -- on_snapshot, which would latch it as a real state change.
                 if snap.port_state == xcom.port_open or
                    snap.port_state == xcom.port_opening then
-                    self.vm.hsm:on_port_state(snap.port_state, snap.generation)
-                    self._reconnect_deadline = nil
-                    self._reconnect_pending = false
-                    self._reconnect_phase = nil
-                    self._reconnect_port_desc = nil
-                    if self.vm:settle_recovering() then
+                    -- Only disarm the window once the generation-guarded latch
+                    -- is accepted. A stale OPEN (same generation as the pre-fault
+                    -- session) is rejected by on_port_state; clearing the
+                    -- deadline anyway would strand the HSM in RECONNECTING with
+                    -- no watchdog: _drive_reconnect never runs again and the
+                    -- session wedges until a manual Close.
+                    local latched =
+                        self.vm.hsm:on_port_state(snap.port_state, snap.generation)
+                    if latched then
+                        self._reconnect_deadline = nil
+                        self._reconnect_pending = false
+                        self._reconnect_phase = nil
+                        self._reconnect_port_desc = nil
+                    end
+                    if latched and self.vm:settle_recovering() then
                         if self.imgui then
                             -- Mark the boundary in the view. After a ROM-mode
                             -- switch the device re-enumerates, so everything

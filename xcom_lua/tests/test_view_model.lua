@@ -345,6 +345,26 @@ do
     eq("malformed inputs left state CLOSED", m.hsm.state, vm_mod.STATE_CLOSED)
 end
 
+-- 25) Grace-window interlock consistency: a latched recovery candidate must
+--     not reopen the data path before settle_recovering() commits it.  The
+--     Window:core_send funnel refuses while hsm.state is RECONNECTING (it is
+--     gated on vm:recovering()), so ui_state().send_enabled / connected must
+--     agree and stay false until settle -- otherwise the button says "send"
+--     while the funnel answers XCOM_ERR_NOT_OPEN.
+local lat = vm_mod.new()
+lat:intent_open(); lat:on_port_state(2, 1); lat:enter_reconnecting(2)
+ok("recovery candidate latched", lat:on_port_state(2, 4))
+eq("still RECONNECTING until settle", lat.hsm.state, vm_mod.STATE_RECONNECTING)
+ok("latched candidate still recovering", lat:recovering())
+eq("latched candidate super stays OFFLINE", lat.hsm:super_state(), vm_mod.SUPER_OFFLINE)
+local ls = lat:ui_state()
+ok("latched candidate send stays disabled", not ls.send_enabled)
+ok("latched candidate autosend stays disabled", not ls.autosend_enabled)
+ok("latched candidate connected stays false", not ls.connected)
+ok("settle commits the candidate", lat:settle_recovering())
+eq("settled super ONLINE", lat.hsm:super_state(), vm_mod.SUPER_ONLINE)
+ok("settled send enabled", lat:ui_state().send_enabled)
+
 -- NOTE (UI-side, unfixed here): window.lua reads state constants and the grace
 -- timeout off a ViewModel *instance* (self.vm.STATE_OPENING / self.vm.STATE_OPEN
 -- / self.vm.RECONNECT_GRACE_MS).  They live on the module table only, so on an

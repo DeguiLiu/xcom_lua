@@ -506,7 +506,14 @@ void serial_do_open(SerialCtx& ctx, const coact::Event&) noexcept
     if (core->sink.owner_open != nullptr) {
         core->sink.owner_open(core);
     }
-    if (core->port_state.load(std::memory_order_acquire) == XCOM_PORT_FAULT) {
+    // Did the owner actually establish the session? Judge that by last_open_result,
+    // which sink_owner_open sets to XCOM_OK on success and to the failing code
+    // otherwise — NOT by port_state, which still holds the PREVIOUS state until
+    // the end of this action. Reading port_state here made a reopen from Fault
+    // look like a failure (the stale FAULT was still published even though the
+    // open had just succeeded), so the transition was abandoned and the port
+    // left running with the HSM believing it had failed.
+    if (core->last_open_result.load(std::memory_order_acquire) != XCOM_OK) {
         core->diag_emit(0U, static_cast<uint16_t>(DiagEvent::kOpenFail),
                         core->last_open_result.load(std::memory_order_relaxed),
                         core->generation.load(std::memory_order_relaxed),

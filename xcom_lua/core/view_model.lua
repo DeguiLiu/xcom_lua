@@ -98,8 +98,16 @@ function M.new_hsm()
 end
 
 function Hsm:super_state()
-    -- Derived from the *effective* state: a RECONNECTING grace window does not
-    -- reopen the data path, so the send interlock must stay closed.
+    -- Derived from the *effective* state, EXCEPT that a RECONNECTING grace
+    -- window is always OFFLINE for interlock purposes: `effective` may already
+    -- hold a latched recovery candidate (OPEN/OPENING) before
+    -- settle_recovering() commits it, and deriving ONLINE from that candidate
+    -- would flip connected/send_enabled on while Window:core_send still
+    -- refuses (it gates on recovering(), i.e. state == RECONNECTING).  Keep
+    -- the two readers agreeing: the data path reopens only at settle.
+    if self.state == M.STATE_RECONNECTING then
+        return M.SUPER_OFFLINE
+    end
     return PARENT_STATE[self.effective]
 end
 

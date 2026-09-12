@@ -48,6 +48,12 @@ INCLUDES=(
 TUS=(
     xcom_core/src/io/serial_backend_win.cpp
     xcom_core/src/diagnostics/diagnostic.cpp
+    # The two files that carry the port state machine: the HSM transition table
+    # and the owner sinks in xcom_core.cpp, and the actions in xcom_ao.cpp. A
+    # transition or an action that does not compile is a state machine that
+    # silently stops transitioning, so they belong in this gate.
+    xcom_core/src/ao/xcom_ao.cpp
+    xcom_core/src/runtime/xcom_core.cpp
     xcom_core/tests/line_control_test.cpp
     xcom_core/tests/line_error_test.cpp
 )

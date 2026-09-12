@@ -92,7 +92,7 @@ constexpr std::array<coact::StateDef<SerialCtx>, 4U> kSerialStates{{
     {0, nullptr, nullptr, "Open", -1},                         // 2
     {0, nullptr, nullptr, "Fault", -1},                        // 3
 }};
-constexpr std::array<coact::TransitionDef<SerialCtx>, 5U> kSerialTransitions{{
+constexpr std::array<coact::TransitionDef<SerialCtx>, 7U> kSerialTransitions{{
     {S_CLOSED, to_signal(Signal::Open), S_OPEN, coact::TransitionKind::External, nullptr,
      serial_do_open},
     {S_OPEN, to_signal(Signal::Close), S_CLOSED, coact::TransitionKind::External, nullptr,
@@ -103,6 +103,22 @@ constexpr std::array<coact::TransitionDef<SerialCtx>, 5U> kSerialTransitions{{
      serial_do_fault},
     {S_OPEN, to_signal(Signal::Fault), S_FAULT, coact::TransitionKind::External, nullptr,
      serial_do_fault},
+    // Reopen straight from Fault. The ABI publishes FAULT and the UI offers
+    // Open there, so without this the user's request reached a state with no
+    // matching transition and was dropped silently — coact's dispatch() just
+    // returns false and the caller, having already queued the event, had no
+    // way to tell "accepted" from "discarded". That is the "clicked Open and
+    // nothing happened" report. serial_do_open already tears the failed
+    // session down through owner_open before configuring the new one, so
+    // entering it from Fault is the same work the Close-then-Open pair did.
+    {S_FAULT, to_signal(Signal::Open), S_OPEN, coact::TransitionKind::External, nullptr,
+     serial_do_open},
+    // Open while already Open: idempotent self-transition. A double-click, a
+    // retried request, or a UI that re-sends after a slow poll used to fall
+    // through to the root and vanish; re-running the open re-establishes the
+    // session with the current configuration instead of silently ignoring it.
+    {S_OPEN, to_signal(Signal::Open), S_OPEN, coact::TransitionKind::External, nullptr,
+     serial_do_open},
 }};
 
 // ---------------------------------------------------------------------------
@@ -768,6 +784,15 @@ struct CoreState {
         CoreState* const state = core != nullptr
             ? static_cast<CoreState*>(core->sink.impl) : nullptr;
         if (core == nullptr || state == nullptr) {
+            return;
+        }
+        // Virtual port: there is no backend to open, so the session is up as
+        // soon as this action runs. Publish that as success here because
+        // serial_do_open judges the outcome by last_open_result, and
+        // xcom_open_async pre-sets it to XCOM_ERR_IO — leaving it alone would
+        // make every virtual-port open look like a failure.
+        if (core->virtual_port) {
+            core->last_open_result.store(XCOM_OK, std::memory_order_release);
             return;
         }
         if (!core->virtual_port) {

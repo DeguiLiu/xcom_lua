@@ -139,3 +139,8 @@ BOOL WINAPI DeleteFileA(const char*);
 
 // MSVC spells the x86 calling convention __stdcall; GCC needs the attribute.
 #define __stdcall __attribute__((stdcall))
+
+#define THREAD_PRIORITY_NORMAL 0
+#define THREAD_PRIORITY_LOWEST -2
+#define THREAD_PRIORITY_HIGHEST 2
+BOOL WINAPI SetThreadPriority(HANDLE, int);
