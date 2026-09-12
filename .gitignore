@@ -48,13 +48,18 @@ xcom_client/
 !xcom_lua/xcom_imgui.dll
 !xcom_lua/xcom_core.dll
 
-# Only the Dear ImGui source used by the bridge is vendored here
+# Only the Dear ImGui + ImPlot sources the bridge compiles are vendored here.
+# ImPlot was missing from this list while xcom_imgui_bridge.cpp does
+# `#include "implot.h"`, so a fresh clone could not build xcom_imgui.dll at all
+# — the front-end, for every panel including the scope plot.
 third_party/*/
 third_party/*.zip
 !third_party/xcom_imgui/
 third_party/xcom_imgui/*
 !third_party/xcom_imgui/imgui/
 !third_party/xcom_imgui/imgui/**
+!third_party/xcom_imgui/implot/
+!third_party/xcom_imgui/implot/**
 !third_party/xcom_imgui/LICENSE.txt
 
 # Root-level runtime diagnostics

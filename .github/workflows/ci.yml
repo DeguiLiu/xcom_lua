@@ -107,13 +107,15 @@ jobs:
 
       # The ImGui front-end DLL has its own CMakeLists and is NOT referenced by
       # the root one, so it would otherwise go untested — and it is where the
-      # footer render, the plugin windows and the scope panel live. It needs
-      # third_party/xcom_imgui/implot, which .gitignore currently excludes, so
-      # the configure is allowed to fail loudly here instead of being skipped:
-      # a missing vendored dep must be visible, not inferred from a green run.
-      - name: Configure ImGui front-end (reports the vendored-dep gap)
-        continue-on-error: true
+      # footer render, the plugin windows and the scope panel live. Now that
+      # third_party/xcom_imgui/implot is vendored (it was excluded by
+      # .gitignore, which left this DLL unbuildable from a fresh clone), the
+      # build is a real gate rather than a reported gap.
+      - name: Configure ImGui front-end
         run: cmake -S xcom_lua/native/xcom_imgui -B build-imgui
+
+      - name: Build ImGui front-end
+        run: cmake --build build-imgui --config Release --parallel
 
       - name: Build
         run: cmake --build build --config Release --parallel
