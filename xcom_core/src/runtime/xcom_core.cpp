@@ -457,6 +457,7 @@ struct CoreState {
         core.sink.owner_close = &sink_owner_close;
         core.sink.owner_write = &sink_owner_write;
         core.sink.owner_resume_rx = &sink_owner_resume_rx;
+        core.sink.owner_set_lines = &sink_owner_set_lines;
         core.sink.autosend_set = &sink_autosend_set;
         core.sink.log_open = &sink_log_open;
         core.sink.log_append = &sink_log_append;
@@ -720,12 +721,20 @@ struct CoreState {
 
             // All fully committed blocks were published before this wait, so
             // ReceiveAo can return capacity while the serial backend keeps
-            // the unaccepted tail in its read callback. With RTS flow control
-            // enabled this also asks the peer to pause before driver buffers
-            // are exhausted.
-            core->rx_backpressured.store(1U, std::memory_order_release);
-            if (core->cfg_flow_control == 1U) {
-                state->serial_backend.set_rts(false);
+            // the unaccepted tail in its read callback. Backpressure is now
+            // expressed purely by withholding reads; RTS is not toggled here
+            // because RTS/CTS flow control is driver-owned (HANDSHAKE) and
+            // manual EscapeCommFunction calls would fight it.
+            //
+            // Edge-count the episode (0 -> 1): a rising count is the only
+            // host-side early warning that the RX pool is under pressure, and
+            // it is what precedes a driver-buffer CE_RXOVER when the stall
+            // outlasts the driver's FIFO. Counted here, cleared in
+            // rx_kick_action via the existing exchange(0).
+            if (core->rx_backpressured.exchange(
+                    1U, std::memory_order_acq_rel) == 0U) {
+                core->metrics.rx_backpressure_events.fetch_add(
+                    1U, std::memory_order_relaxed);
             }
             if (!state->rx_capacity_waiter.wait(*core)) {
                 return;
@@ -740,9 +749,15 @@ struct CoreState {
             return;
         }
         core->errors.push(error, 2U, "Win32 serial read fault");
+        // Publish FAULT directly as well as via the coact event: if the control
+        // pool is exhausted (submit_control rejected below) the signal never
+        // reaches serial_do_fault and the published state would stay OPEN with
+        // a dead handle, so every later send/status would lie. The store is
+        // idempotent with the Dispatcher's own FAULT transition.
         if (!core->submit_control(to_signal(Signal::Fault), 0U, true)) {
             core->errors.push(XCOM_ERR_IO, 0U,
                               "coact fault signal rejected");
+            core->port_state.store(XCOM_PORT_FAULT, std::memory_order_release);
         }
     }
 
@@ -768,6 +783,13 @@ struct CoreState {
                     },
                     [core](int32_t fault) noexcept {
                         serial_fault_callback(core, fault);
+                    },
+                    [core](const SerialLineStatus& status) noexcept {
+                        line_status_ingress(core, status.framing_errors,
+                                            status.parity_errors,
+                                            status.overrun_errors,
+                                            status.break_events,
+                                            status.hold_events);
                     }, error)) {
                 core->errors.push(error != kSerialSuccess ? error : XCOM_ERR_IO,
                                   2U, "Win32 serial open failed");
@@ -789,6 +811,11 @@ struct CoreState {
         core->callback_admission.store(1U, std::memory_order_release);
         core->last_open_result.store(XCOM_OK, std::memory_order_release);
     }
+
+    // Consecutive native-write failures that escalate the session to FAULT
+    // (see sink_owner_write). Three strikes tolerates one transient timeout
+    // without masking a genuinely dead port for more than a moment.
+    static constexpr uint32_t kTxFailStreakLimit = 3U;
 
     // W-P0-A1: derive a bounded write wait (ms) from the configured baud rate so
     // a legitimately slow but working link is allowed to complete a full 4096 B
@@ -834,6 +861,13 @@ struct CoreState {
             }
             if (!core->virtual_port) {
                 st->serial_backend.close();
+                if (st->serial_backend.close_stalled()) {
+                    // The read thread ignored stop_event + CancelIoEx past the
+                    // bounded probe: the driver stalled teardown. Surface it so
+                    // the stall has an explanation instead of a silent freeze.
+                    core->errors.push(XCOM_ERR_TIMEOUT, 3U,
+                                      "Win32 read thread stalled; driver did not honor cancel");
+                }
             }
             if (core->in_callback.load(std::memory_order_acquire) != 0U) {
                 core->errors.push(XCOM_ERR_IO, 2U,
@@ -865,14 +899,42 @@ struct CoreState {
         }
         uint32_t written = 0U;
         int32_t error = kSerialSuccess;
+        // Gap B: on a timeout the backend samples COMSTAT flow-control holds
+        // (CTS/DSR/XOFF) before cancelling, so a stalled send reports its cause
+        // instead of a bare "timeout".
+        uint32_t line_status = 0U;
         if (!state->serial_backend.write(core->tx.block(block), len,
                                          compute_write_timeout_ms(core->cfg_baud),
-                                         written, error)) {
+                                         written, error, &line_status)) {
             core->errors.push(error != kSerialSuccess ? error : XCOM_ERR_IO,
-                              2U, "Win32 serial write failed");
+                              2U, describe_write_failure(error, line_status));
             *result = XCOM_ERR_IO;
+            // Escalate a dead port instead of leaving port_state OPEN while
+            // every later send also fails against a stale handle:
+            //   * a fatal device-removed / access-denied / invalid-handle error
+            //     means the session is gone right now -> FAULT immediately;
+            //   * anything else (timeout, transient write fault) only faults
+            //     after a short run of consecutive failures, so one hiccup does
+            //     not kill a working session.
+            const uint32_t streak =
+                core->tx_fail_streak.fetch_add(1U, std::memory_order_relaxed) + 1U;
+            const bool fatal = error == ERROR_DEVICE_REMOVED ||
+                               error == ERROR_ACCESS_DENIED ||
+                               error == ERROR_INVALID_HANDLE ||
+                               error == ERROR_OPERATION_ABORTED;
+            if (fatal || streak >= kTxFailStreakLimit) {
+                // Publish FAULT first so the status poller sees a dead session
+                // even if the coact event is delayed or rejected; the event
+                // still runs the owner_close/physical teardown path.
+                core->port_state.store(XCOM_PORT_FAULT, std::memory_order_release);
+                if (!core->submit_control(to_signal(Signal::Fault), 0U, true)) {
+                    core->errors.push(XCOM_ERR_IO, 0U,
+                                      "writer fault signal rejected");
+                }
+            }
             return;
         }
+        core->tx_fail_streak.store(0U, std::memory_order_relaxed);
         core->metrics.tx_bytes.fetch_add(written, std::memory_order_relaxed);
         *result = XCOM_OK;
     }
@@ -884,11 +946,27 @@ struct CoreState {
         }
         CoreState* const state = static_cast<CoreState*>(core->sink.impl);
         if (state != nullptr) {
+            // Reads resume; RTS is left to the driver's RTS/CTS handshake.
             state->rx_capacity_waiter.resume();
-            if (core->cfg_flow_control == 1U) {
-                state->serial_backend.set_rts(true);
-            }
         }
+    }
+
+    // Live DTR/RTS hot switch. Called from the ABI thread (not the Dispatcher):
+    // the backend only issues EscapeCommFunction, which is thread-safe on an
+    // open handle, and set_rts() self-declines while RTS is flow-controlled.
+    static bool sink_owner_set_lines(CoreCtx* core, bool dtr_asserted,
+                                     bool rts_asserted) noexcept
+    {
+        if (core == nullptr || core->virtual_port) {
+            return false;
+        }
+        CoreState* const state = static_cast<CoreState*>(core->sink.impl);
+        if (state == nullptr || !state->serial_backend.is_open()) {
+            return false;
+        }
+        state->serial_backend.set_dtr(dtr_asserted);
+        state->serial_backend.set_rts(rts_asserted);
+        return true;
     }
 
     // ---- auto-send periodic timer ---------------------------------------
@@ -1130,12 +1208,82 @@ RxIngressResult rx_ingress(CoreCtx* core, const uint8_t* data,
         const uint32_t unaccepted = size - progress.accepted_bytes;
         core->metrics.rx_pool_exhausted_bytes.fetch_add(
             unaccepted, std::memory_order_relaxed);
+        // Locate the gap: rx_bytes already includes this call's accepted
+        // prefix, so this is the absolute accepted-byte offset at which the
+        // dropped tail begins. Pool drops only occur on the injected path
+        // (rx_ingress); the live serial callback waits for capacity instead.
+        core->metrics.rx_loss_offset.store(
+            core->metrics.rx_bytes.load(std::memory_order_relaxed),
+            std::memory_order_relaxed);
         core->diag_emit(0U, static_cast<uint16_t>(DiagEvent::kRxDrop),
                         unaccepted,
                         core->metrics.rx_pool_exhausted_bytes.load(
                             std::memory_order_relaxed), 0U, 0U);
     }
     return progress.result;
+}
+
+void line_status_ingress(CoreCtx* core, uint32_t framing_errors,
+                         uint32_t parity_errors, uint32_t overrun_errors,
+                         uint32_t break_events, uint32_t hold_events) noexcept
+{
+    if (core == nullptr) {
+        return;
+    }
+    // fetch_add returns the PREVIOUS value, so +delta is the new cumulative
+    // total. A zero delta leaves the loaded value untouched.
+    uint32_t f = core->metrics.framing_errors.load(std::memory_order_relaxed);
+    uint32_t p = core->metrics.parity_errors.load(std::memory_order_relaxed);
+    uint32_t o = core->metrics.overrun_errors.load(std::memory_order_relaxed);
+    uint32_t b = core->metrics.break_events.load(std::memory_order_relaxed);
+    if (framing_errors != 0U) {
+        f = core->metrics.framing_errors.fetch_add(framing_errors,
+                                                   std::memory_order_relaxed) +
+            framing_errors;
+    }
+    if (parity_errors != 0U) {
+        p = core->metrics.parity_errors.fetch_add(parity_errors,
+                                                  std::memory_order_relaxed) +
+            parity_errors;
+    }
+    if (overrun_errors != 0U) {
+        o = core->metrics.overrun_errors.fetch_add(overrun_errors,
+                                                   std::memory_order_relaxed) +
+            overrun_errors;
+        // Driver FIFO overflow: bytes were dropped inside the driver before we
+        // could read them, so the exact count is unknowable and the event is
+        // uncorrectable. Record the accepted-byte offset at observation time so
+        // the UI can at least locate the episode in the received stream.
+        core->metrics.rx_loss_offset.store(
+            core->metrics.rx_bytes.load(std::memory_order_relaxed),
+            std::memory_order_relaxed);
+    }
+    if (break_events != 0U) {
+        b = core->metrics.break_events.fetch_add(break_events,
+                                                 std::memory_order_relaxed) +
+            break_events;
+    }
+    if (hold_events != 0U) {
+        // Diagnostic-only metric: a flow-control hold is a throughput stall,
+        // not data corruption, so it never triggers a diagnostic record.
+        static_cast<void>(core->metrics.flow_hold_events.fetch_add(
+            hold_events, std::memory_order_relaxed));
+    }
+
+    // Diagnose on the first hit of any error category and then only at
+    // power-of-two milestones, so a sustained overrun/parity storm emits
+    // O(log n) records instead of one per event. A dedicated kLineError record
+    // (distinct from kRxDrop, which means WE dropped bytes on pool overflow)
+    // keeps "the driver already lost these" separable in the diagnostic log
+    // from "we lost these". a0 carries the combined cumulative count; the
+    // per-category breakdown lives in XcomSnapshot.
+    const auto milestone = [](uint32_t count) noexcept {
+        return count != 0U && (count & (count - 1U)) == 0U;
+    };
+    if (milestone(f) || milestone(p) || milestone(o) || milestone(b)) {
+        core->diag_emit(1U, static_cast<uint16_t>(DiagEvent::kLineError),
+                        f + p + o + b, p, o, b);
+    }
 }
 
 // ---------------------------------------------------------------------------

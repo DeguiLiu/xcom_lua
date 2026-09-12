@@ -568,6 +568,17 @@ void serial_do_fault(SerialCtx& ctx, const coact::Event&) noexcept
         return;
     }
     core->port_state.store(XCOM_PORT_FAULT, std::memory_order_release);
+    // Release the physical session now. Leaving the COM handle, read/write
+    // events and SessionWriter thread alive until the user clicks Close is the
+    // root cause of "replugging the same COM port fails with ACCESS_DENIED":
+    // the stale handle still owns the device, so a fresh CreateFile cannot
+    // succeed. The read thread has already returned (report_fault is its last
+    // act before exiting read_loop) when this runs on the Dispatcher, so the
+    // owner_close join cannot deadlock. owner_close is idempotent with the
+    // later SIG_CLOSE teardown.
+    if (core->sink.owner_close != nullptr) {
+        core->sink.owner_close(core);
+    }
     core->errors.push(XCOM_ERR_IO, 0,
                       "serial device removed / port fault; close then reopen");
     core->diag_emit(0U, static_cast<uint16_t>(DiagEvent::kFault),

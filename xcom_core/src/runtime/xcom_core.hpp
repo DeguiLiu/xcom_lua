@@ -124,6 +124,13 @@ struct DispatchSink {
     void (*owner_write)(CoreCtx* core, uint16_t block, uint16_t len,
                         int32_t* result) = nullptr;
     void (*owner_resume_rx)(CoreCtx* core) = nullptr;
+    // v1.4: live modem-line hot switch. Applies DTR/RTS while the port is
+    // open; bits are 1 = asserted, 0 = deasserted (same sense as
+    // XcomPortConfig.dtr_enable/rts_enable). Safe to call from the ABI
+    // thread; the backend only issues EscapeCommFunction. Returns false when
+    // the session has no open physical port (virtual/test or CLOSED).
+    bool (*owner_set_lines)(CoreCtx* core, bool dtr_asserted,
+                            bool rts_asserted) = nullptr;
     // Arm/cancel the low-priority auto-send periodic timer (interval_ms==0
     // cancels). Runs only on the Dispatcher through AutoSendAo.
     void (*autosend_set)(CoreCtx* core, uint32_t interval_ms) = nullptr;
@@ -409,6 +416,17 @@ struct Metrics {
     alignas(64)
     std::atomic<uint32_t> rx_bytes{0U};
     std::atomic<uint32_t> rx_pool_exhausted_bytes{0U};
+    // Edge-counted episodes where the LIVE read callback found every RxBlock
+    // in use and withheld reads. The live serial path never drops on a full
+    // pool (it blocks the read thread and retries), so this is the early
+    // warning that the host is falling behind: the driver's own buffer is
+    // what fills next, ending in a CE_RXOVER overrun (overrun_errors).
+    std::atomic<uint32_t> rx_backpressure_events{0U};
+    // Accepted-byte offset (rx_bytes at the time) of the most recent observed
+    // receive loss, whether an exact pool drop or a driver overrun report.
+    // Locates WHERE in the accepted stream the gap starts. Only meaningful
+    // once a loss counter is non-zero.
+    std::atomic<uint32_t> rx_loss_offset{0U};
     std::atomic<uint32_t> rx_callback_oversize_bytes{0U};
     std::atomic<uint32_t> callback_count{0U};
     std::atomic<uint32_t> rx_seq{0U};
@@ -429,7 +447,29 @@ struct Metrics {
     std::atomic<uint32_t> tx_rejected{0U};
     std::atomic<uint32_t> auto_tick_coalesced{0U};
     std::atomic<uint32_t> save_rejected_bytes{0U};
+
+    // v1.5 serial read-thread producer: ClearCommError line-error counters.
+    // Own cache line so the 250 ms snapshot poll cannot invalidate the hot RX
+    // byte counters. `flow_hold_events` counts rising flow-control holds (a
+    // degraded-but-not-corrupt condition) and is diagnostic-only, not exposed
+    // in XcomSnapshot.
+    alignas(64)
+    std::atomic<uint32_t> framing_errors{0U};
+    std::atomic<uint32_t> parity_errors{0U};
+    std::atomic<uint32_t> overrun_errors{0U};
+    std::atomic<uint32_t> break_events{0U};
+    std::atomic<uint32_t> flow_hold_events{0U};
 };
+
+// v1.5: fold one ClearCommError line-status report into CoreCtx::metrics and
+// emit a bounded diagnostic (first occurrence + power-of-two milestones, never
+// per event, so an overflow storm cannot flood the diag lane). Shared by the
+// real serial read callback and the xcom_test_inject_line_errors test seam.
+// Each argument is an increment; the backend reports at most 1 per category
+// per poll because ClearCommError returns a latched bitmask, not counts.
+void line_status_ingress(CoreCtx* core, uint32_t framing_errors,
+                         uint32_t parity_errors, uint32_t overrun_errors,
+                         uint32_t break_events, uint32_t hold_events) noexcept;
 
 // ---------------------------------------------------------------------------
 // Error ring (128 entries).
@@ -587,6 +627,12 @@ struct CoreCtx {
     // Open result set by the owner on the Dispatcher; read by xcom_open on the
     // caller thread after port_state leaves OPENING/FAULT.
     std::atomic<int32_t> last_open_result{XCOM_ERR_IO};
+
+    // Consecutive failed native writes. Written by the SessionWriter thread,
+    // read/cleared by it too; a fatal device-removed/access-denied error or a
+    // run of this many failures escalates the session to FAULT instead of
+    // leaving port_state OPEN while every subsequent write hits a dead handle.
+    std::atomic<uint32_t> tx_fail_streak{0U};
 
     // Injected test session flag.
     std::atomic<uint32_t> test_session{0U};
