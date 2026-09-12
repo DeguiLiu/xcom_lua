@@ -29,10 +29,24 @@ M.STATE_OPENING = "opening"
 M.STATE_OPEN = "open"
 M.STATE_CLOSING = "closing"
 M.STATE_FAULT = "fault"
+-- RECONNECTING mirrors the core's FAULT while a short grace window is running
+-- (port dropped, core has not yet been reset).  It exists only in the UI HSM:
+-- UI_TO_CORE keeps mapping it to CORE_FAULT so a snapshot that reports FAULT
+-- does not flip the derived state away from the grace window.
+M.STATE_RECONNECTING = "reconnecting"
 
 M.SUPER_OFFLINE = "offline"
 M.SUPER_TRANSITIONAL = "transitional"
 M.SUPER_ONLINE = "online"
+
+-- Reconnect grace window: a port fault (device unplugged, IO aborted, access
+-- denied) does not immediately tear the session down; the UI holds a
+-- RECONNECTING state for this long while re-opening the same port.  Recovery
+-- inside the window resumes normal traffic; past it the session goes FAULT and
+-- the user reconnects manually.  Owned by the UI layer on purpose: the core
+-- has no timer the app can verify on this host, and the HSM is the single
+-- place every interlock (send/params/close) is derived from.
+M.RECONNECT_GRACE_MS = 3000
 
 local CORE_TO_UI = {
     [CORE_CLOSED] = M.STATE_CLOSED,
@@ -47,16 +61,24 @@ local UI_TO_CORE = {
     [M.STATE_OPEN] = CORE_OPEN,
     [M.STATE_CLOSING] = CORE_CLOSING,
     [M.STATE_FAULT] = CORE_FAULT,
+    -- The core has no RECONNECTING state: the port really is faulted there,
+    -- the grace window is UI policy.  Reporting CORE_FAULT keeps the read-only
+    -- view (status-bar code, snapshot comparisons) truthful.
+    [M.STATE_RECONNECTING] = CORE_FAULT,
 }
 local PARENT_STATE = {
     [M.STATE_CLOSED] = M.SUPER_OFFLINE,
     [M.STATE_FAULT] = M.SUPER_OFFLINE,
+    -- OFFLINE: params stay editable and the watchdog can decline to recover,
+    -- which is exactly the interlock FAULT has.
+    [M.STATE_RECONNECTING] = M.SUPER_OFFLINE,
     [M.STATE_OPENING] = M.SUPER_TRANSITIONAL,
     [M.STATE_CLOSING] = M.SUPER_TRANSITIONAL,
     [M.STATE_OPEN] = M.SUPER_ONLINE,
 }
 local ALLOWED_OPEN = { [M.STATE_CLOSED] = true, [M.STATE_FAULT] = true }
-local ALLOWED_CLOSE = { [M.STATE_OPEN] = true, [M.STATE_OPENING] = true, [M.STATE_FAULT] = true }
+local ALLOWED_CLOSE = { [M.STATE_OPEN] = true, [M.STATE_OPENING] = true,
+                        [M.STATE_FAULT] = true, [M.STATE_RECONNECTING] = true }
 
 -- ---------------------------------------------------------------------------
 -- Hsm: thread-affine (single UI thread) hierarchical state-machine mirror.
@@ -65,11 +87,14 @@ local Hsm = {}
 Hsm.__index = Hsm
 
 function M.new_hsm()
-    return setmetatable({ state = M.STATE_CLOSED, generation = 0 }, Hsm)
+    return setmetatable({ state = M.STATE_CLOSED, effective = M.STATE_CLOSED,
+                          faulted = false, generation = 0 }, Hsm)
 end
 
 function Hsm:super_state()
-    return PARENT_STATE[self.state]
+    -- Derived from the *effective* state: a RECONNECTING grace window does not
+    -- reopen the data path, so the send interlock must stay closed.
+    return PARENT_STATE[self.effective]
 end
 
 function Hsm:can_open()
@@ -84,7 +109,10 @@ function Hsm:intent_open()
     if not self:can_open() then
         return false
     end
+    self._return_to = self.state
     self.state = M.STATE_OPENING
+    self.effective = M.STATE_OPENING
+    self.faulted = false
     return true
 end
 
@@ -92,16 +120,36 @@ function Hsm:intent_close()
     if not self:can_close() then
         return false
     end
+    self._return_to = self.state
     self.state = M.STATE_CLOSING
+    self.effective = M.STATE_CLOSING
+    self.faulted = false
     return true
 end
 
--- Rollback an open intent rejected before the worker received it.
+-- Rollback an open intent rejected before the worker received it.  Restores
+-- the state the open was issued from (CLOSED, FAULT or RECONNECTING), so a
+-- rejected retry re-arms the watchdog instead of stranding the user in CLOSED.
 function Hsm:reject_open()
     if self.state ~= M.STATE_OPENING then
         return false
     end
-    self.state = M.STATE_CLOSED
+    self.state = self._return_to or M.STATE_CLOSED
+    self.effective = self.state
+    self.faulted = self.state ~= M.STATE_CLOSED
+    return true
+end
+
+-- Rollback a close intent rejected before the worker received it.  Symmetric
+-- with reject_open: a close aborted during the grace window returns to
+-- RECONNECTING, a close aborted from OPEN/OPENING returns to FAULT.
+function Hsm:reject_close()
+    if self.state ~= M.STATE_CLOSING then
+        return false
+    end
+    self.state = self._return_to or M.STATE_FAULT
+    self.effective = self.state
+    self.faulted = self.state ~= M.STATE_OPEN
     return true
 end
 
@@ -111,6 +159,44 @@ function Hsm:force_fault()
         return false
     end
     self.state = M.STATE_FAULT
+    self.effective = M.STATE_FAULT
+    self.faulted = true
+    return true
+end
+
+-- Enter the reconnect grace window.  Valid whenever the session has left
+-- OFFLINE (a port was open or being opened), from any state including FAULT
+-- itself (so repeated fault signals during the window keep it alive).
+-- Generations are preserved: the caller supplies a monotonic generation for
+-- the fault edge exactly as it would for on_port_state.
+function Hsm:enter_reconnecting(generation)
+    if self.effective == M.STATE_RECONNECTING then
+        return false
+    end
+    if PARENT_STATE[self.effective] == M.SUPER_OFFLINE and
+       self.effective ~= M.STATE_FAULT then
+        return false
+    end
+    local gen = generation or self.generation
+    if gen < self.generation then
+        return false
+    end
+    self.generation = gen
+    self.state = M.STATE_RECONNECTING
+    self.effective = M.STATE_RECONNECTING
+    self.faulted = true
+    return true
+end
+
+-- The grace window elapsed with no recovery: hand the session back to the
+-- normal OFFLINE/FAULT interlock for a manual close/reopen.
+function Hsm:reconnect_timeout()
+    if self.state ~= M.STATE_RECONNECTING then
+        return false
+    end
+    self.state = M.STATE_FAULT
+    self.effective = M.STATE_FAULT
+    self.faulted = true
     return true
 end
 
@@ -123,11 +209,41 @@ function Hsm:on_port_state(core_state, generation)
     if state == nil then
         return false
     end
-    if state == self.state and generation == self.generation then
+    -- A FAULT snapshot is downgraded to RECONNECTING only while the grace
+    -- window is actually armed (the core reports FAULT for the whole window).
+    if self.state == M.STATE_RECONNECTING and state == M.STATE_FAULT then
+        state = M.STATE_RECONNECTING
+    end
+    if self.state == M.STATE_RECONNECTING then
+        -- Inside the window the derived state stays RECONNECTING, but the first
+        -- non-fault snapshot is latched in `effective`; settle_recovering()
+        -- commits it once recovery is confirmed.  Clearing `faulted` here is
+        -- what lets a genuinely-fresh non-fault state through later.
+        if state ~= M.STATE_RECONNECTING then
+            if state == M.STATE_OPENING or state == M.STATE_OPEN or
+               state == M.STATE_CLOSING then
+                self.faulted = false
+            end
+            if generation == self.generation and state == self.effective then
+                return false
+            end
+            self.generation = generation
+            self.effective = state
+            return true
+        end
+        if generation == self.generation then
+            return false
+        end
+        self.generation = generation
+        return true
+    end
+    if state == self.state and state == self.effective and
+       generation == self.generation then
         return false
     end
     self.generation = generation
     self.state = state
+    self.effective = state
     return true
 end
 
@@ -151,17 +267,27 @@ end
 -- Build the current immutable-ish render-state table.
 function ViewModel:ui_state()
     local state = self.hsm.state
+    local parent = self.hsm:super_state()
+    local online = parent == M.SUPER_ONLINE
     return {
         state = state,
-        super_state = self.hsm:super_state(),
+        super_state = parent,
         snapshot = self.snapshot,
-        params_enabled = self.hsm:super_state() == M.SUPER_OFFLINE,
+        params_enabled = parent == M.SUPER_OFFLINE,
         open_enabled = self.hsm:can_open(),
         close_enabled = self.hsm:can_close(),
-        send_enabled = state == M.STATE_OPEN,
-        autosend_enabled = state == M.STATE_OPEN,
-        connected = self.hsm:super_state() == M.SUPER_ONLINE,
+        send_enabled = online,
+        autosend_enabled = online,
+        connected = online,
+        -- RECONNECTING is a UI-only policy state; in the core the port is
+        -- FAULT, so the wire code stays FAULT and no reader needs to know
+        -- about the grace window.
         port_state_code = UI_TO_CORE[state],
+        -- UI interlock extras: reconnect grace in progress, and a session that
+        -- is simply broken now (FAULT) as opposed to recovering.
+        reconnecting = state == M.STATE_RECONNECTING,
+        faulted = state == M.STATE_FAULT,
+        reconnect_timeout_ms = M.RECONNECT_GRACE_MS,
     }
 end
 
@@ -208,7 +334,7 @@ function ViewModel:reject_open()
     if not self.hsm:reject_open() then
         return false
     end
-    self.snapshot.port_state = CORE_CLOSED
+    self.snapshot.port_state = UI_TO_CORE[self.hsm.state]
     return true
 end
 
@@ -217,6 +343,53 @@ function ViewModel:force_fault()
         return false
     end
     self.snapshot.port_state = CORE_FAULT
+    return true
+end
+
+function ViewModel:reject_close()
+    if not self.hsm:reject_close() then
+        return false
+    end
+    self.snapshot.port_state = UI_TO_CORE[self.hsm.state]
+    return true
+end
+
+function ViewModel:enter_reconnecting(generation)
+    if not self.hsm:enter_reconnecting(generation) then
+        return false
+    end
+    self.snapshot.port_state = CORE_FAULT
+    return true
+end
+
+function ViewModel:reconnect_timeout()
+    if not self.hsm:reconnect_timeout() then
+        return false
+    end
+    self.snapshot.port_state = CORE_FAULT
+    return true
+end
+
+function ViewModel:recovering()
+    return self.hsm.state == M.STATE_RECONNECTING
+end
+
+-- Confirm a grace-window recovery: the HSM has latched a recovery-candidate
+-- snapshot; adopt it as the derived state.  Returns true only on the settling
+-- edge (RECONNECTING -> OPENING/OPEN) so the caller renders once.  A latched
+-- CLOSED is deliberately NOT a recovery: inside the window the driver issues
+-- its own xcom_close() to reset the core (FAULT -> CLOSED) before reopening, so
+-- a CLOSED snapshot means "reset in progress", not "port is back".
+function ViewModel:settle_recovering()
+    if self.hsm.state ~= M.STATE_RECONNECTING then
+        return false
+    end
+    local settled = self.hsm.effective
+    if settled ~= M.STATE_OPEN and settled ~= M.STATE_OPENING then
+        return false
+    end
+    self.hsm.state = settled
+    self.snapshot.port_state = UI_TO_CORE[settled]
     return true
 end
 

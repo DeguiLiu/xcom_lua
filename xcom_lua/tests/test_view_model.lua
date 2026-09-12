@@ -102,5 +102,190 @@ ok("on_snapshot identical is no-op",
 ok("on_snapshot changed field triggers re-render",
    vm2:on_snapshot({ port_state = 2, generation = 1, rx_bytes = 42 }))
 
+-- =========================================================================
+-- Exception matrix: reconnect grace window (RECONNECTING) and the missing
+-- abnormal transitions the original HSM did not model.
+-- =========================================================================
+
+-- 9) Grace window: a fault while OPEN enters RECONNECTING, not FAULT.
+--    Send/params/close interlock mirrors OFFLINE; open is refused so the user
+--    cannot race the watchdog.
+local g = vm_mod.new()
+g:intent_open()
+g:on_port_state(2, 1)                       -- OPEN
+ok("fault enters grace window", g:enter_reconnecting(2))
+eq("state RECONNECTING", g.hsm.state, vm_mod.STATE_RECONNECTING)
+eq("grace super state OFFLINE", g.hsm:super_state(), vm_mod.SUPER_OFFLINE)
+local gs = g:ui_state()
+ok("grace: send disabled", not gs.send_enabled)
+ok("grace: autosend disabled", not gs.autosend_enabled)
+ok("grace: connected false", not gs.connected)
+ok("grace: close allowed (user abort)", gs.close_enabled)
+ok("grace: open refused (no race)", not gs.open_enabled)
+ok("grace: params editable", gs.params_enabled)
+ok("grace: reconnecting flag set", gs.reconnecting)
+ok("grace: faulted flag clear", not gs.faulted)
+eq("grace: port_state_code reports core FAULT", gs.port_state_code, 4)
+eq("grace: banner timeout constant", gs.reconnect_timeout_ms, 3000)
+ok("enter_reconnecting is not re-entrant", not g:enter_reconnecting(2))
+
+-- 10) Grace window never loses the FAULT: a FAULT snapshot inside the window
+--     keeps RECONNECTING (the core stays faulted for the whole window).
+ok("FAULT snapshot during grace stays RECONNECTING",
+   g:on_port_state(4, 3))
+eq("still RECONNECTING after FAULT snapshot", g.hsm.state, vm_mod.STATE_RECONNECTING)
+
+-- 11) Recovery: an OPEN snapshot inside the window is latched, not adopted;
+--     settle dips to the latched state once.
+ok("OPEN snapshot during grace latched", g:on_port_state(2, 4))
+eq("still RECONNECTING before settle", g.hsm.state, vm_mod.STATE_RECONNECTING)
+ok("settle_recovering confirms recovery", g:settle_recovering())
+eq("state OPEN after settle", g.hsm.state, vm_mod.STATE_OPEN)
+ok("settle is edge-triggered (no-op again)", not g:settle_recovering())
+eq("post-recovery super state ONLINE", g.hsm:super_state(), vm_mod.SUPER_ONLINE)
+local gs2 = g:ui_state()
+ok("post-recovery send enabled", gs2.send_enabled)
+ok("post-recovery connected", gs2.connected)
+ok("post-recovery reconnecting flag clear", not gs2.reconnecting)
+
+-- 12) Timeout: no recovery inside the window -> FAULT, manual reconnect only.
+local t = vm_mod.new()
+t:intent_open()
+t:on_port_state(2, 1)
+t:enter_reconnecting(2)
+ok("reconnect_timeout fires", t:reconnect_timeout())
+eq("state FAULT after timeout", t.hsm.state, vm_mod.STATE_FAULT)
+ok("can_open after timeout", t.hsm:can_open())
+ok("can_close after timeout", t.hsm:can_close())
+ok("reconnect_timeout no-op outside grace", not t:reconnect_timeout())
+-- A FAULT snapshot after timeout must NOT be swallowed back into RECONNECTING.
+ok("FAULT after timeout keeps FAULT", t:on_port_state(4, 3))
+eq("state FAULT after FAULT snapshot", t.hsm.state, vm_mod.STATE_FAULT)
+
+-- 13) Grace window reached from a transitional state (fault while OPENING).
+local g2 = vm_mod.new()
+g2:intent_open()
+ok("grace from OPENING", g2:enter_reconnecting(1))
+eq("RECONNECTING from OPENING", g2.hsm.state, vm_mod.STATE_RECONNECTING)
+
+-- 14) Grace window rejected when the session is genuinely offline.
+local g3 = vm_mod.new()
+ok("grace refused from CLOSED", not g3:enter_reconnecting())
+local g4 = vm_mod.new()
+g4:force_fault()  -- from nothing: no-op
+g4:intent_open(); g4:force_fault()      -- OPENING -> FAULT
+ok("force_fault reached FAULT for the refusal case", g4.hsm.state == vm_mod.STATE_FAULT)
+ok("grace re-arms from FAULT (repeated fault edge)", g4:enter_reconnecting(2))
+eq("RECONNECTING from FAULT", g4.hsm.state, vm_mod.STATE_RECONNECTING)
+
+-- 15) User retry inside the grace window: intent_close wins (abort recovery).
+local u = vm_mod.new()
+u:intent_open(); u:on_port_state(2, 1); u:enter_reconnecting(2)
+ok("user can close during grace", u:intent_close())
+eq("CLOSING after grace abort", u.hsm.state, vm_mod.STATE_CLOSING)
+ok("reject_close rolls back to grace, not FAULT", u:reject_close())
+eq("RECONNECTING after reject_close", u.hsm.state, vm_mod.STATE_RECONNECTING)
+
+-- 16) A rejected retry open must return to the state the retry was issued
+--     from, not strand the user in CLOSED.
+local r = vm_mod.new()
+r:intent_open(); r:on_port_state(2, 1); r:enter_reconnecting(2); r:reconnect_timeout()
+ok("retry open accepted from FAULT", r:intent_open())
+eq("OPENING after retry", r.hsm.state, vm_mod.STATE_OPENING)
+ok("reject_open restores FAULT", r:reject_open())
+eq("FAULT restored after rejected FAULT retry", r.hsm.state, vm_mod.STATE_FAULT)
+ok("clean reject_open still lands CLOSED", (function()
+    local c = vm_mod.new()
+    c:intent_open()
+    return c:reject_open() and c.hsm.state == vm_mod.STATE_CLOSED
+end)())
+
+-- 17) Generation guard while recovering: a stale OPEN from the pre-fault
+--     session must not settle the window, and it must not un-latch either.
+local s = vm_mod.new()
+s:intent_open(); s:on_port_state(2, 5); s:enter_reconnecting(6)
+ok("stale OPEN (gen 4) rejected during grace", not s:on_port_state(2, 4))
+eq("grace gen unchanged", s.hsm.generation, 6)
+ok("stale does not settle", not s:settle_recovering())
+eq("still RECONNECTING after stale", s.hsm.state, vm_mod.STATE_RECONNECTING)
+-- A fresh non-fault generation during the window latches and settles.
+ok("fresh OPEN (gen 7) accepted during grace", s:on_port_state(2, 7))
+ok("fresh OPEN settles", s:settle_recovering())
+eq("OPEN after fresh settle", s.hsm.state, vm_mod.STATE_OPEN)
+
+-- 18) Snapshot-driven grace: on_snapshot(FAULT) while OPEN must NOT tear the
+--     session down by itself (the caller decides the grace window); once the
+--     watchdog is armed the same snapshot is folded into RECONNECTING.
+local sv = vm_mod.new()
+sv:intent_open(); sv:on_snapshot({ port_state = 2, generation = 1 })
+ok("snapshot FAULT while OPEN is a plain FAULT state", sv:on_snapshot({ port_state = 4, generation = 2 }))
+eq("FAULT before watchdog", sv.hsm.state, vm_mod.STATE_FAULT)
+-- FAULT can re-arm the window (repeated fault edge), then FAULT snapshots hold.
+sv:enter_reconnecting(2)
+-- Re-verify with a clean session: OPEN -> snapshot FAULT -> enter grace.
+local sv2 = vm_mod.new()
+sv2:intent_open(); sv2:on_snapshot({ port_state = 2, generation = 1 })
+sv2:enter_reconnecting(2)
+ok("snapshot FAULT during grace stays RECONNECTING",
+   sv2:on_snapshot({ port_state = 4, generation = 3 }))
+eq("grace held across snapshot", sv2.hsm.state, vm_mod.STATE_RECONNECTING)
+-- A field-only change in the same snapshot still triggers a re-render.
+ok("field-only snapshot during grace re-renders",
+   sv2:on_snapshot({ port_state = 4, generation = 3, rx_bytes = 9 }))
+
+-- 19) Port list refresh / core reset while in grace: a CLOSED snapshot at the
+--     same or a later generation is our own reset-in-progress and must neither
+--     tear the window down nor be adopted as "recovered".
+local p = vm_mod.new()
+p:intent_open(); p:on_port_state(2, 1); p:enter_reconnecting(2)
+ok("CLOSED snapshot during grace latches (does not tear down)",
+   p:on_port_state(0, 2))
+eq("still RECONNECTING after CLOSED latch", p.hsm.state, vm_mod.STATE_RECONNECTING)
+ok("settle refuses CLOSED (reset, not recovery)",
+   not (p:on_port_state(0, 3) and p:settle_recovering()))
+eq("still RECONNECTING after refused CLOSED settle", p.hsm.state, vm_mod.STATE_RECONNECTING)
+-- A later real OPEN does settle it.
+ok("OPEN after reset settles", p:on_port_state(2, 4) and p:settle_recovering())
+eq("OPEN after reset settle", p.hsm.state, vm_mod.STATE_OPEN)
+
+-- 20) End-to-end window sequence: OPEN -> fault -> grace -> core reset
+--     (CLOSED) -> reopen queued (OPENING) -> OPEN -> settle. The CLOSED and
+--     OPENING snapshots must NOT settle the window; only a confirmed OPEN does.
+local e = vm_mod.new()
+e:intent_open(); e:on_snapshot({ port_state = 2, generation = 1 })   -- OPEN
+e:enter_reconnecting(2)                                              -- fault edge
+ok("reset CLOSED during grace does not settle",
+   e:on_snapshot({ port_state = 0, generation = 3 }) == true)
+eq("still RECONNECTING after reset CLOSED", e.hsm.state, vm_mod.STATE_RECONNECTING)
+ok("no settle on CLOSED", not e:settle_recovering())
+ok("reopen OPENING during grace is latched, not settled",
+   e:on_snapshot({ port_state = 1, generation = 4 }))
+eq("still RECONNECTING while OPENING", e.hsm.state, vm_mod.STATE_RECONNECTING)
+ok("reopen OPEN confirms recovery", e:on_snapshot({ port_state = 2, generation = 5 }))
+ok("settle adopts OPEN", e:settle_recovering())
+eq("OPEN after settle", e.hsm.state, vm_mod.STATE_OPEN)
+ok("send re-enabled after recovery", e:ui_state().send_enabled)
+
+-- 21) Device unplugged during CLOSE: CLOSING -> force_fault -> FAULT, and a
+--     later fault edge may still arm the grace window (unplug while closing is
+--     a legitimate fault even though the user asked to close).
+local c2 = vm_mod.new()
+c2:intent_open(); c2:on_port_state(2, 1); c2:intent_close()
+eq("CLOSING before fault", c2.hsm.state, vm_mod.STATE_CLOSING)
+ok("fault during CLOSE forces FAULT", c2:force_fault())
+eq("FAULT after close-time fault", c2.hsm.state, vm_mod.STATE_FAULT)
+ok("fault edge after close-time fault arms grace", c2:enter_reconnecting(5))
+eq("RECONNECTING after close-time fault edge", c2.hsm.state, vm_mod.STATE_RECONNECTING)
+
+-- 22) User close during grace is a legal abort; a subsequent open intent is
+--     refused while the close is in flight (no reopening into a half-closed
+--     core), and reject_close restores RECONNECTING for the watchdog.
+local c3 = vm_mod.new()
+c3:intent_open(); c3:on_port_state(2, 1); c3:enter_reconnecting(2)
+ok("user close during grace", c3:intent_close())
+ok("open refused while closing during grace", not c3:intent_open())
+ok("reject_close during grace restores RECONNECTING", c3:reject_close())
+eq("RECONNECTING restored", c3.hsm.state, vm_mod.STATE_RECONNECTING)
+
 print(string.format("\nview_model tests: %d passed, %d failed", passed, failed))
 os.exit(failed == 0 and 0 or 1)
