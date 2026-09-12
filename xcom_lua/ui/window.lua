@@ -324,6 +324,15 @@ function M.new(cfg, cfg_data, config_path)
     if grace and grace >= 1000 and grace <= 60000 then
         self.vm.RECONNECT_GRACE_MS = grace
     end
+    -- [serial] probe_port_busy: whether enumeration marks a port held by
+    -- another program. OFF by default because the check opens every port, and
+    -- opening can drive DTR on some USB-UART bridges — which resets a board
+    -- wired for auto-reset. That is too destructive to do behind the user's
+    -- back on every refresh, so it is an explicit opt-in for people who want
+    -- to see "(busy)" in the list and accept the risk. Without it, an occupied
+    -- port still reports its cause when the open fails.
+    self._probe_port_busy = config.get(cfg_data, "serial", "probe_port_busy",
+                                       false) == true
     Active = self
     return self
 end
@@ -431,7 +440,7 @@ end
 
 function Window:_refresh_imgui_ports()
     if not self.imgui then return end
-    local ports, enum_err = xcom.list_ports()
+    local ports, enum_err = xcom.list_ports({ probe = self._probe_port_busy })
     ports = ports or {}
     if enum_err ~= nil then
         -- Enumeration itself failed (not merely "no ports"): surface the cause
@@ -3487,7 +3496,7 @@ end
 
 function Window:on_btn_refresh()
     -- Re-enumerate ports into the combo, re-selecting a persisted port if set.
-    local ports, enum_err = xcom.list_ports()
+    local ports, enum_err = xcom.list_ports({ probe = self._probe_port_busy })
     local items = {}
     for _, p in ipairs(ports or {}) do
         local label = p.name
