@@ -42,7 +42,7 @@ local xcom = require("xcom_ffi")
 -- also calls this defensively, but geometry normalization happens first.
 w.load()
 
--- LuaJIT stays ON by default (docs/lua_coding_guidelines.md §6: a global
+-- LuaJIT stays ON by default (docs/coding-conventions.md §性能与 JIT: a global
 -- jit.off() is forbidden — interpreter mode is far slower).  The C-re-entry
 -- hazard it used to guard against (``bad callback`` panic when traced Lua is
 -- re-entered by Win32/ImGui) is handled at the correct scope instead: every

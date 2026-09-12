@@ -67,3 +67,11 @@ xcom_diag.log
 
 # Root-level runtime screenshot
 ui_current.png
+
+# Third-party manuals and reference material: large binaries that do not belong
+# in history. Keep the extracted notes (docs/*-analysis.md) instead.
+*.pdf
+*.PDF
+*.docx
+*.xlsx
+*.pptx

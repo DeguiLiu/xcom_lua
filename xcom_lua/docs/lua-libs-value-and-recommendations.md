@@ -7,14 +7,14 @@
 ## 一、总览:现状一句话
 
 xcom_lua 的脚本系统(LLCOM 兼容 API)目前**只有手写的基础字符串工具**,
-第三方库已 vendor 三批但**一行都没接入运行时**——它们是"验证可用"的弹药
+第三方库已 vendor 三批并统一放在 `xcom_lua/libs/`；`struct`/`json` 已接入脚本沙箱，其余是"验证可用"的弹药
 库,等具体功能需要时再 require。
 
 | 批次 | 位置 | 内容 | 接入状态 |
 |---|---|---|---|
-| 1 | `third_party/openresty-lua/` | resty.lrucache / resty.iconv / tablepool / jit.* 工具 | ✅ 测试绿,❌ 未使用 |
-| 2 | `third_party/lua51-libs/` | Penlight 39 模块 / moses / luaunit / LuaLogging / 30log 等 67 文件 | ✅ 测试绿,❌ 未使用 |
-| 3 | `third_party/lua-protocol-libs/` | struct / json / crc32 / crc16_modbus / crc16_ccitt / crc8 | ✅ 51/51 全绿,❌ 未使用 |
+| 1 | `xcom_lua/libs/openresty/` | resty.lrucache / resty.iconv / tablepool / jit.* 工具 | ✅ 测试绿,❌ 未使用 |
+| 2 | `xcom_lua/libs/lua51/` | Penlight 39 模块 / moses / luaunit / LuaLogging / 30log 等 67 文件 | ✅ 测试绿,❌ 未使用 |
+| 3 | `xcom_lua/libs/protocol/` | struct / json / crc32 / crc16_modbus / crc16_ccitt / crc8 | ✅ 全绿,✅ struct+json 已接入脚本沙箱 |
 
 ## 二、按能力域评估已 vendor 的库
 
@@ -125,20 +125,21 @@ luamark(基准测试,Timer 可接 uv.hrtime)、middleclass(与 30log/classlib �
 
 ## 五、接入建议(vendor 之外)
 
-库躺在 third_party 不会自己有用。建议按"功能拉动"接入:
+库躺在 libs 不会自己有用。建议按"功能拉动"接入:
 
 1. **脚本 API 暴露**:把 struct/json/CRC 挂进 script_engine 的沙箱
    (像 toHex 一样,`uartApi` 或全局),LLCOM 脚本即可 `struct.pack(...)`
+   ——`struct`/`json` 已落地,CRC 家族待接
 2. **不动主进程**:stdlib-ext 类改写内置的库**永远不进** script_engine
-3. **package.path 注入点**:main.lua 启动时把三个 third_party 目录加进
-   package.path(一段 5 行代码),而非每个脚本自己拼
+3. **package.path 注入点**:main.lua 启动时把三个 libs 目录加进
+   package.path(已对 `libs/protocol/` 落地),而非每个脚本自己拼
 
 ## 六、测试入口
 
 ```
-cd D:/workspace/SSCOM_lua
-./xcom_lua/runtime/luvjit.exe xcom_lua/tests/test_protocol_libs.lua    # struct+json+CRC 51/51
-./xcom_lua/runtime/luvjit.exe xcom_lua/tests/test_openresty_lua.lua   # 43/43
-./xcom_lua/runtime/luvjit.exe xcom_lua/tests/test_iconv.lua           # 9/9
-./xcom_lua/runtime/luvjit.exe xcom_lua/tests/test_lua51-libs.lua      # 78/78
+cd xcom_lua
+runtime/luvjit.exe tests/test_protocol_libs.lua    # struct+json+CRC 51/51
+runtime/luvjit.exe tests/test_openresty_lua.lua   # 43/43
+runtime/luvjit.exe tests/test_iconv.lua           # 9/9
+runtime/luvjit.exe tests/test_lua51-libs.lua      # 78/78
 ```

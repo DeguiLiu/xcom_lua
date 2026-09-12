@@ -600,13 +600,13 @@ ImVec4 rgb(std::uint32_t value, float alpha = 1.0f) {
 
 // Named palette (single source for every hard-coded colour in the dashboard;
 // keep in sync with ui/window.lua's PAL and assets/layout.toml).  Extracted
-// from the reference serial tool screenshots (pic/2.png light + pic/5.png
-// dark; see docs/reference-tool-design-spec.md): blue-white window, green
-// SEND button, orange timestamps, red TX echo, yellow-tinted send editor.
+// from the reference serial tool screenshot pic/1.png (see
+// docs/1png-control-buttons.md and docs/1png-separators-status-font.md):
+// blue-white window, blue SEND button, orange timestamps, red TX echo.
 namespace palette {
     // Single source of truth; all values come from PIL pixel scans of pic/1.png
     // (2026-09-05), NOT from memory or 2.png/3.png. See
-    // docs/ui-redesign-round2-progress.md §1.1 for the measurements.
+    // docs/1png-separators-status-font.md for the measurements.
     constexpr std::uint32_t kHeaderDark = 0x1E1E1E;   // header strip / dark buttons
     constexpr std::uint32_t kAccentTeal = 0x005A98;   // primary blue (1.png sampled: 909 px)
     constexpr std::uint32_t kAccentHover = 0x2E7FC4;  // primary button hover (extrapolated)
@@ -2077,7 +2077,7 @@ void Footer(const bool connected, const int rx_bytes, const int tx_bytes) {
 // ---------------------------------------------------------------------------
 // Script Console (floating window; toggled by the header "Lua" button).
 // Layout: left script list + right editor + bottom log + one-line REPL.
-// Pattern sources (docs/imgui-patterns-reference.md):
+// Pattern sources (docs/imgui-implot-reference.md):
 //   * second Begin window — example main.cpp:178-186, Cond_FirstUseEver so
 //     the user can drag/resize it;
 //   * log panel — official ExampleAppLog clipper + follow-tail;

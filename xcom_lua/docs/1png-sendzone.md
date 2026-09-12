@@ -3,7 +3,7 @@
 > 纯只读研究文档：对 `pic/1.png`（**1802×1291** RGB，SSCOM 系浅色参考界面）做 PIL 逐像素扫描 + Tesseract
 > (chi_sim) 定位文字，抠「发送/发送设置/发送参数」整块的**真实几何、坐标、尺寸、配色**，
 > 并与 `xcom_imgui_bridge.cpp` 现有 `TransmitContent / SendAction` 逐点对照，指出待改项。
-> **本环境 Read 无法目视 PNG**（见 ui-redesign-round2-progress.md §2），故全部采用像素+OCR，含糊处如实标注。
+> **本环境 Read 无法目视 PNG**（截图脚本无法直接读图），故全部采用像素+OCR，含糊处如实标注。
 > 坐标均为 1.png 实际像素（x=0..1801, y=0..1290）。日期 2026-09-05。
 > 方法与前三份一致：`1png-control-buttons.md / 1png-input-select.md / 1png-icons.md`。
 
@@ -191,7 +191,7 @@ A 按钮文档已确立：1.png **没有任何整块实底（绿/蓝)大 SEND**�
 - 诚实度：中文 OCR 有大量抗锯齿噪声，个别 row 语义（含“发送文件/扩展”句读）存疑处已在正文标注“不能确定”。
   坐标本身来自像素/Tesseract bbox，均可复核（找块 y 中心，比对 §2/§3 bbox）。
 - 参照文档：`1png-control-buttons.md`（A）、`1png-input-select.md`（B）、`1png-icons.md`（C）、
-  `ui-redesign-round2-progress.md`（方法/空白面）。
+  `1png-separators-status-font.md`（D，分隔/状态/字号）。
 - 对照源：`xcom_imgui_bridge.cpp`（D:\workspace\SSCOM_lua\xcom_lua\native\xcom_imgui\）。
 
 ---

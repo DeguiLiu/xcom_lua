@@ -1,17 +1,18 @@
 /* xcom.h - versioned C ABI contract for xcom_core.dll.
  *
  * THE authoritative cross-language contract between the C++17 core and the
- * PySide6 client (xcom_client/services/core_wrapper.py via ctypes).
+ * LuaJIT client (xcom_lua/core/xcom_ffi.lua via LuaJIT FFI).
  *
  * All functions never throw across the boundary; every exported function
  * wraps its body and returns XcomStatus / safe values.  Struct layouts are
  * fixed (no hidden padding: explicit _pad fields), MSVC x64 natural
- * alignment (/Zp8 default), so the ctypes mirrors MUST match exactly.
+ * alignment (/Zp8 default), so the FFI mirrors MUST match exactly; the Lua
+ * binding pins every sizeof at load time.
  *
- * Concurrency: only ONE caller thread (the CoreWorker QThread) may call into
- * this ABI at a time.  Inside the core all work is serialized onto the coact
+ * Concurrency: only ONE caller thread (the Lua UI thread) may call into this
+ * ABI at a time.  Inside the core all work is serialized onto the coact
  * Dispatcher.  No exported function blocks the caller thread waiting on a
- * Win32 HANDLE; the CoreWorker drives visibility with a 10 ms poll of
+ * Win32 HANDLE; the client drives visibility with a 10 ms poll of
  * xcom_drain_display (there is deliberately no exported xcom_wait_display).
  *
  * v1.1 (2026-08-31):
@@ -22,7 +23,7 @@
  *  - Removed public xcom_wait_display.
  *  - Replaced xcom_set_autosend(const XcomAutoSendConfig*) with
  *    xcom_set_auto_template(h, data, size, interval_ms, flags); the struct is
- *    gone and Python must pre-encode (HEX via bytes.fromhex).
+ *    gone and the client must pre-encode (HEX decoded in Lua).
  *
  * v1.3 (2026-09-01):
  *  - Added xcom_open_async + xcom_take_open_result so the LuaJIT client can
@@ -119,21 +120,21 @@ typedef struct XcomPortConfig {
 /* ---------------------------------------------------------------------------
  * Send flags
  *
- * NOTE (v1.1): the Python client pre-encodes the payload once before calling
- * xcom_send / xcom_set_auto_template.  HEX input is produced with
- * bytes.fromhex in Python; the core does NOT parse hex itself.  The default
- * data is therefore always already-encoded raw bytes.
+ * NOTE (v1.1): the client pre-encodes the payload once before calling
+ * xcom_send / xcom_set_auto_template.  HEX input is decoded in Lua; the core
+ * does NOT parse hex itself.  The data is therefore always already-encoded
+ * raw bytes.
  * ------------------------------------------------------------------------- */
 typedef uint32_t XcomSendFlags;
 enum {
   XCOM_SEND_TEXT = 0,     /* data is already-encoded raw bytes (default) */
   /* XCOM_SEND_HEX is retained ONLY for source compatibility / optional use.
-   * Python has already pre-encoded the payload (HEX via bytes.fromhex), so
+   * The client has already pre-encoded the payload (HEX decoded in Lua), so
    * the core does not parse hex; this flag is accepted but treated as opaque
    * and does not trigger any core-side re-encoding. */
   XCOM_SEND_HEX  = 1,
   XCOM_SEND_CRLF = 2,     /* append CR LF after the payload
-                           * (optional; Python may already have appended it) */
+                           * (optional; the client may already have appended it) */
 };
 
 /* ---------------------------------------------------------------------------
@@ -151,9 +152,8 @@ typedef struct XcomDisplayOptions {
 
 /* NOTE: the v1.0 XcomAutoSendConfig struct / xcom_set_autosend have been
  * removed.  Auto-send is configured via xcom_set_auto_template(h, data,
- * size, interval_ms, flags).  ctypes must no longer bind XcomAutoSendConfig
- * and the SIZEOF_XCOM_AUTO_SEND_CONFIG constant in core_wrapper.py is
- * deleted (see docs/abi-realign-checklist.md). */
+ * size, interval_ms, flags).  No binding for XcomAutoSendConfig exists any
+ * more. */
 
 /* ---------------------------------------------------------------------------
  * Snapshot (diagnostics + status bar).  All counters are monotonic.
@@ -283,13 +283,13 @@ XCOM_API XcomStatus xcom_close(XcomHandle h, uint32_t timeout_ms);
 
 /* Manual / quick send.  SYNCHRONOUS-COPY semantics (v1.1): the DLL copies
  * data[0:size] verbatim into a unique TxBlockPool slot before returning, OR
- * returns rejected/error.  The caller pointer is never retained.  Python has
- * already pre-encoded the payload (HEX via bytes.fromhex, optional CRLF
+ * returns rejected/error.  The caller pointer is never retained.  The client
+ * has already pre-encoded the payload (HEX decoded in Lua, optional CRLF
  * applied), so the core does not re-encode or parse HEX.  The function does
  * NOT block for the actual serial WriteResult: it returns as soon as the
  * payload is queued (hence "queue-and-return"); the eventual write success or
  * failure is reported asynchronously via xcom_get_snapshot / xcom_take_error.
- * Python may freely release/reuse its bytes/ctypes buffer after return. */
+ * The caller may freely release/reuse its buffer after return. */
 XCOM_API XcomStatus xcom_send(XcomHandle h, const uint8_t* data,
                               uint32_t size, XcomSendFlags flags);
 
@@ -310,7 +310,7 @@ XCOM_API XcomStatus xcom_set_lines(XcomHandle h, uint8_t dtr, uint8_t rts);
 /* Configure auto-send template.  data is the pre-encoded payload (same
  * synchronous-copy / queue-and-return contract as xcom_send; the core copies
  * into a dedicated template TxBlockSlot before returning).  interval_ms==0
- * disables auto-send.  flags uses XCOM_SEND_TEXT (Python encodes HEX/CRLF).
+ * disables auto-send.  flags uses XCOM_SEND_TEXT (the client encodes HEX/CRLF).
  * A subsequent uncommitted re-configuration replaces the template descriptor
  * atomically on the Dispatcher; coalesced ticks increment
  * auto_tick_coalesced. */
@@ -322,8 +322,8 @@ XCOM_API XcomStatus xcom_set_auto_template(XcomHandle h, const uint8_t* data,
  * output.  On success *written is the byte count (0 = none).  The bytes are
  * UTF-8 text: in text view the raw bytes (optionally timestamp-prefixed), in
  * hex view "AA BB CC " sequences.  May be called repeatedly until
- * snapshot.display_pending == 0.  The CoreWorker polls this with a 10 ms
- * timer (Qt::PreciseTimer). */
+ * snapshot.display_pending == 0.  The client polls this with a 10 ms luv
+ * timer on its UI thread. */
 XCOM_API XcomStatus xcom_drain_display(XcomHandle h, char* output,
                                        uint32_t capacity, uint32_t* written);
 
@@ -338,7 +338,7 @@ XCOM_API XcomStatus xcom_take_error(XcomHandle h, XcomError* output);
  * Dedicated file writer
  *
  * All file I/O runs on the core-owned writer thread, never in a coact handler
- * or the GUI/CoreWorker caller. `append` and `submit_atomic` synchronously
+ * or the UI caller. `append` and `submit_atomic` synchronously
  * copy their input before returning. A full writer queue returns XCOM_ERR_FULL
  * without accepting or dropping bytes; callers retry after draining/errors.
  * ------------------------------------------------------------------------- */
@@ -430,8 +430,8 @@ XCOM_API XcomStatus xcom_test_inject_line_errors(XcomHandle h, uint32_t framing,
                                                  uint32_t break_events);
 
 /* NOTE (v1.1 ABI removal): there is deliberately NO exported xcom_wait_display.
- * The Python side must NOT wait on a Win32 HANDLE.  CoreWorker polls
- * xcom_drain_display on a 10 ms timer; the DLL keeps its own internal display
+ * The client must NOT wait on a Win32 HANDLE.  It polls xcom_drain_display on
+ * a 10 ms timer; the DLL keeps its own internal display
  * wake event for the Dispatcher but that event is NOT exported. */
 
 #ifdef __cplusplus

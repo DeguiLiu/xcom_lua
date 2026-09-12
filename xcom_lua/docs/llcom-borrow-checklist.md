@@ -2,7 +2,10 @@
 
 > 四列：优先级（高/中/低） | 借鉴项 | 当前 xcom_lua 实现位置 | 实施成本与风险
 > 覆盖 UI / API / 脚本 / 架构四个维度，至少 15 条。
-> 参考前 4 份文档：`llcom-overview.md`、`llcom-ui-layout.md`、`llcom-lua-api.md`、`llcom-script-system.md`。
+> 参考前文：`llcom-reference.md`（LLCOM 的 UI / Lua API / 脚本系统调研合集）。
+> 状态说明：本清单为 LLCOM 借鉴项的长期索引，部分条目已落地（如 #6 `apiAddPoint` 已由
+> `xcom_imgui_scope_*` / Scope 面板实现、#15/#16/#19/#21/#22 已实现）；下表的"当前实现位置"
+> 为 2026-09-05 快照，引用以符号名为准。
 
 ## A. UI 维度（WPF → ImGui）
 
