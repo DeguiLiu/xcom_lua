@@ -1,0 +1,154 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Cancel a superseded run on the same ref: a queued CI for an older commit
+# tells us nothing once a newer one is running.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Pure-Lua suites. These need no DLL, no serial hardware and no Windows: the
+  # modules under test (view_model, charset, xcom_ffi's layout pins, the script
+  # plugins, ...) are plain Lua 5.1 and are deliberately written to be runnable
+  # anywhere. This is the fast, always-meaningful gate.
+  # ---------------------------------------------------------------------------
+  lua-tests:
+    name: Lua tests (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The project pins LuaJIT through OpenResty's build, which is what the
+      # Windows runtime (runtime/luvjit.exe) is based on. Matching it here keeps
+      # bytecode and FFI semantics identical between CI and the shipped binary.
+      - name: Install LuaJIT
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends luajit lua-cjson
+
+      - name: Select interpreter
+        id: lj
+        # Prefer the OpenResty layout when a dev machine clones with it present,
+        # otherwise fall back to the distro luajit.
+        run: |
+          if [ -x "$HOME/.local/openresty/luajit/bin/luajit" ]; then
+            echo "bin=$HOME/.local/openresty/luajit/bin/luajit" >> "$GITHUB_OUTPUT"
+          else
+            echo "bin=luajit" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run portable Lua suites
+        working-directory: xcom_lua
+        run: |
+          set -u
+          LUAI="${{ steps.lj.outputs.bin }}"
+          "$LUAI" -v
+          # Every file listed here must pass on a machine with no Windows DLL
+          # and no serial port. Tests needing luv / xcom_core.dll / hardware are
+          # intentionally absent — they run in the Windows job or not at all.
+          SUITES="
+            test_ansi
+            test_charset
+            test_config
+            test_multi_send
+            test_port_enum
+            test_reconnect_port
+            test_rx_charset_batch
+            test_script_meta
+            test_shipped_scripts
+            test_view_model
+            test_wave_ring
+            test_xcom_ffi
+          "
+          fail=0
+          for t in $SUITES; do
+            if [ ! -f "tests/$t.lua" ]; then
+              echo "::error::missing suite tests/$t.lua"
+              fail=1
+              continue
+            fi
+            # Trust the suite's own exit status (each ends with
+            # os.exit(failed == 0 and 0 or 1)) rather than scraping the summary
+            # line, and log the full output so a failure is diagnosable here.
+            echo "----- $t -----"
+            if "$LUAI" "tests/$t.lua"; then
+              echo "OK: $t"
+            else
+              echo "::error::$t failed"
+              fail=1
+            fi
+          done
+          exit $fail
+
+  # ---------------------------------------------------------------------------
+  # Native core + ImGui bridge. CMakeLists.txt hard-requires WIN32 (the serial
+  # backend is Win32-native and the front-end is DirectX 11), so this job can
+  # only run on Windows.
+  # ---------------------------------------------------------------------------
+  native:
+    name: Native build + C++ tests (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DBUILD_TESTING=ON
+
+      # The three new suites (line_control / line_error / tx_diag) exist to make
+      # the hardware-free parts of the modem-line, ClearCommError and TX-drain
+      # paths executable without a real adapter. They are the only automated
+      # coverage those changes have, so a build break here is a hard failure.
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Run C++ tests
+        working-directory: build
+        run: ctest -C Release --output-on-failure
+
+  # ---------------------------------------------------------------------------
+  # Static guard: the FFI cdef in xcom_ffi.lua pins sizeof() for every ABI
+  # struct, and the C header is authoritative. Drift between them silently
+  # corrupts every field read after the change, so check the pins explicitly
+  # rather than relying on a suite that might get skipped.
+  # ---------------------------------------------------------------------------
+  abi-layout:
+    name: ABI layout pins (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install LuaJIT
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends luajit
+      - name: Verify struct size pins
+        working-directory: xcom_lua
+        # require() runs the module-load assertion, which compares ffi.sizeof
+        # against the pinned table for every cdef'd struct and errors on drift,
+        # so a mismatch fails this step instead of silently misreading fields.
+        # The module lives in core/, hence the explicit package.path.
+        run: |
+          luajit -e 'package.path = "./core/?.lua;" .. package.path; require("xcom_ffi"); print("ABI layout pins OK")'
+
+  # ---------------------------------------------------------------------------
+  # C++ syntax gate. The authoritative build is MSVC on Windows (the job above),
+  # but a Windows runner is slow and unavailable offline, so a compiler-level
+  # parse of the serial/ABI sources also runs here against a minimal windows.h
+  # stand-in (tools/win32-stub). This catches syntax, type and missing-declaration
+  # errors within seconds. It is a supplement to, never a replacement for, the
+  # real build — see the script's header for what it cannot model.
+  # ---------------------------------------------------------------------------
+  cpp-syntax:
+    name: C++ syntax check (Linux + win32 stub)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Parse serial / ABI translation units
+        run: tools/check_cpp_syntax.sh
