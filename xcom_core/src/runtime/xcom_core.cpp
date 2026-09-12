@@ -113,12 +113,18 @@ constexpr std::array<coact::TransitionDef<SerialCtx>, 7U> kSerialTransitions{{
     // entering it from Fault is the same work the Close-then-Open pair did.
     {S_FAULT, to_signal(Signal::Open), S_OPEN, coact::TransitionKind::External, nullptr,
      serial_do_open},
-    // Open while already Open: idempotent self-transition. A double-click, a
-    // retried request, or a UI that re-sends after a slow poll used to fall
-    // through to the root and vanish; re-running the open re-establishes the
-    // session with the current configuration instead of silently ignoring it.
-    {S_OPEN, to_signal(Signal::Open), S_OPEN, coact::TransitionKind::External, nullptr,
-     serial_do_open},
+    // Open while already Open: idempotent no-op. It exists only so the event
+    // has somewhere to land — an event with no matching transition is dropped
+    // by coact's dispatch() with a false return the caller cannot see, so a
+    // double-click or a retried request vanished without a trace. It must NOT
+    // re-run serial_do_open: that closes and reopens the port, clears the RX
+    // sequencing state and advances the generation, which drops any traffic
+    // already queued in the session (smoke_test pins exactly that: two queued
+    // sends keep their distinct descriptor lengths only if the session is not
+    // restarted underneath them). Internal kind means the action runs without
+    // leaving and re-entering the state.
+    {S_OPEN, to_signal(Signal::Open), S_OPEN, coact::TransitionKind::Internal, nullptr,
+     nullptr},
 }};
 
 // ---------------------------------------------------------------------------

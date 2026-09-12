@@ -207,10 +207,16 @@ XcomStatus queue_open(CoreCtx* core, const XcomPortConfig* config,
     if (current_state == XCOM_PORT_OPEN) {
         return XCOM_ERR_ALREADY_OPEN;
     }
-    // SerialAo only accepts SIG_OPEN while its HSM is Closed. Retrying directly
-    // from FAULT used to set OPENING and wait for an event the HSM could not
-    // consume. Require close/reset first so the ABI fails fast.
-    if (current_state != XCOM_PORT_CLOSED) {
+    // Retrying straight from FAULT is now a real transition, not a dead end.
+    // The HSM carries Fault --Open--> Open, and serial_do_open tears the failed
+    // session down through owner_open before configuring the new one, so this
+    // is the same work the Close-then-Open pair performed. It used to be
+    // rejected with XCOM_ERR_BUSY because the HSM had no edge out of Fault and
+    // the request would have waited on an event nothing could consume — the
+    // user-visible effect was "clicked Open and nothing happened", since the UI
+    // offers Open in FAULT (same as the Lua model's ALLOWED_OPEN).
+    if (current_state != XCOM_PORT_CLOSED &&
+        current_state != XCOM_PORT_FAULT) {
         return XCOM_ERR_BUSY;
     }
 

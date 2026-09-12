@@ -54,6 +54,7 @@ TUS=(
     # silently stops transitioning, so they belong in this gate.
     xcom_core/src/ao/xcom_ao.cpp
     xcom_core/src/runtime/xcom_core.cpp
+    xcom_core/src/abi/xcom_abi.cpp
     xcom_core/tests/line_control_test.cpp
     xcom_core/tests/line_error_test.cpp
 )
