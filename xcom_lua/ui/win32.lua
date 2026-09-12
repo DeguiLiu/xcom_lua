@@ -598,7 +598,14 @@ BOOL SetCapture(HWND hWnd);
 BOOL ReleaseCapture(void);
 BOOL SetForegroundWindow(HWND hWnd);
 /* PS_SOLID = 0; SRCCOPY = 0x00CC0020 (constants below, in M.gdi). */
-]] 
+
+/* ---- shell helpers ---- */
+/* ShellExecuteW returns as soon as the verb is dispatched; it does not wait
+ * for Explorer. That is what makes it usable from the message pump, where
+ * os.execute('start ...') would block the UI thread until the shell exited. */
+HINSTANCE ShellExecuteW(HWND hwnd, LPCWSTR lpOperation, LPCWSTR lpFile,
+                        LPCWSTR lpParameters, LPCWSTR lpDirectory, int nShowCmd);
+]]
 
 -- ---------------------------------------------------------------------------
 -- Module-level lazy loaders (Windows DLL symbol resolution).
@@ -706,6 +713,37 @@ function M.utf16_to_utf8(ptr, len)
     local buf = ffi.new("char[?]", needed)
     kernel32.WideCharToMultiByte(M.CP_UTF8, 0, ptr, n, buf, needed, nil, nil)
     return ffi.string(buf, needed)
+end
+
+-- ---------------------------------------------------------------------------
+-- Shell
+-- ---------------------------------------------------------------------------
+
+local SW_SHOWNORMAL = 1
+
+-- Open a directory (or file) with its registered handler, without blocking the
+-- message pump.  Returns true when the shell accepted the request.
+--
+-- ShellExecuteW hands the verb to the shell and returns immediately; it does
+-- NOT wait for Explorer to finish.  Building a command string for
+-- os.execute('start "" "..."') instead would block the UI thread until the
+-- spawned process exited, and it interpolates the path into a command line,
+-- so any quote or metacharacter in it became shell syntax.  Passing the path
+-- as a wide-string argument keeps it data, not code.
+function M.open_folder(path)
+    if not path or path == "" then
+        return false
+    end
+    local wide = M.utf8_to_utf16(path)
+    if wide == nil then
+        return false
+    end
+    -- Cast the HINSTANCE result to an integer: a return value <= 32 is an
+    -- error code, anything above is success.  Without the cast LuaJIT yields
+    -- a pointer cdata that cannot be compared to a number.
+    local result = ffi.cast("intptr_t",
+        M.shell32.ShellExecuteW(nil, "open", wide, nil, nil, SW_SHOWNORMAL))
+    return result > 32
 end
 
 return M

@@ -2117,7 +2117,10 @@ function Window:_pump_script_console()
                 elseif event.type == 3 then   -- Open folder (shell-execute)
                     local dir = (self.config_path and
                         self.config_path:match("^(.*)[/\\]") or ".") .. "/scripts"
-                    os.execute('start "" "' .. dir:gsub("/", "\\") .. '"')
+                    -- Non-blocking shell dispatch; see w.open_folder. The
+                    -- previous os.execute('start ...') blocked the message
+                    -- pump and interpolated the path into a command line.
+                    w.open_folder(dir)
                 elseif event.type == 4 then   -- Clear log
                     self.scripts:clear_log()
                 elseif event.type == 5 then   -- New script

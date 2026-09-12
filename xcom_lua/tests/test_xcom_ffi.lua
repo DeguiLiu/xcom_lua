@@ -37,8 +37,11 @@ eq("sizeof portconfig pinned", x.SIZEOF.port_config, 32)
 eq("sizeof error pinned", x.SIZEOF.error, 268)
 eq("sizeof portinfo pinned", x.SIZEOF.port_info, 324)
 
--- 2) version packing (v1.2.0 -> 0x010200)
-eq("packed version 010200", string.format("%06x", x.packed_version()), "010200")
+-- 2) version packing (v1.5.0 -> 0x010500).  This must track xcom.h's
+-- XCOM_VERSION_MAJOR/MINOR/PATCH: the cdef and the size pins above already
+-- describe the v1.5 layout, so a stale constant here would make a capability
+-- gate compare against the wrong DLL version.
+eq("packed version 010500", string.format("%06x", x.packed_version()), "010500")
 eq("constant ok", x.ok, 0)
 eq("constant full", x.err_full, -5)
 eq("port open", x.port_open, 2)

@@ -1,5 +1,5 @@
 --[[--------------------------------------------------------------------------
-core/xcom_ffi.lua - LuaJIT FFI binding for xcom_core.dll (xcom.h v1.2 ABI).
+core/xcom_ffi.lua - LuaJIT FFI binding for xcom_core.dll (xcom.h v1.5 ABI).
 
 This module ONLY declares the C ABI and loads the DLL.  It is not callable on
 Linux (no xcom_core.dll); use `luajit -bl` for syntax checking and review the
@@ -215,8 +215,12 @@ function M.probe_enabled_by_env()
     return v == "1" or v == "true" or v == "on" or v == "yes"
 end
 
+-- ABI version this binding is built against.  Keep in step with xcom.h's
+-- XCOM_VERSION_MAJOR/MINOR/PATCH: the cdef below already declares the v1.5
+-- fields and the size pins assert the v1.5 layout, so a stale value here would
+-- make any future capability gate under-report the loaded DLL.
 M.version_major = 1
-M.version_minor = 2
+M.version_minor = 5
 M.version_patch = 0
 
 -- VERSION: (major << 16) | (minor << 8) | patch, as returned by xcom_version().
@@ -558,9 +562,17 @@ end
 --[[-------------------------------------------------------------------------
 get_snapshot(h) -> XcomSnapshot or nil  (assumes caller keeps handle alive)
 Returns a fresh Lua table snapshot for the status bar / UI.
+
+The FFI struct behind it is a module-level scratch buffer, not a per-call
+allocation: this runs on every 250 ms status poll, and allocating a cdata for
+each tick just fed the GC. The returned *table* is still freshly allocated —
+ViewModel:on_snapshot retains it and diffs it field-by-field against the
+previous one, so handing out a shared table would silently break every
+change detection downstream.
 ------------------------------------------------------------------------]]--
+local snapshot_scratch = tc.snapshot()
 function M.get_snapshot(h)
-    local s = tc.snapshot()
+    local s = snapshot_scratch
     s.struct_size = ffi.sizeof(tc.snapshot)
     if M.get_snapshot_c(h, s) ~= M.ok then
         return nil
