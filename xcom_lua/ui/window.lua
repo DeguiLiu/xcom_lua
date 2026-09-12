@@ -1587,6 +1587,12 @@ local FRAME_INTERVAL_IDLE_MS = 500
 -- user can retry.
 local OPENING_TIMEOUT_MS = 5000
 
+-- Close-side counterpart. The ABI close waits up to 2 s for its own teardown,
+-- so a healthy close resolves inside this with room to spare; the timeout only
+-- fires when the core never confirms, which is the case that would otherwise
+-- strand the session in CLOSING permanently.
+local CLOSING_TIMEOUT_MS = 5000
+
 function Window:request_frame(interval_ms)
     if not self.imgui then return end
     local now = uv.now()
@@ -2343,6 +2349,29 @@ function Window:poll_status()
         -- Any state other than OPENING clears the watchdog anchor so the next
         -- open intent starts a fresh window.
         self._opening_deadline = nil
+    end
+    if self.vm.hsm.state == self.vm.STATE_CLOSING then
+        -- CLOSING watchdog, mirroring the OPENING one. xcom_close waits on the
+        -- core (bounded there by the ABI's own timeout), but a port whose
+        -- teardown never completes leaves the HSM in CLOSING with open and
+        -- close both refused — the same frozen-interlock symptom as a stuck
+        -- OPENING, and with no recovery path at all. Forcing FAULT restores
+        -- the manual reconnect route, which is strictly better than a state
+        -- the user cannot leave.
+        if self._closing_deadline == nil then
+            self._closing_deadline = uv.now() + CLOSING_TIMEOUT_MS
+        elseif uv.now() >= self._closing_deadline then
+            self.vm:force_fault()
+            self._closing_deadline = nil
+            if self.imgui then
+                self.imgui:set_status(
+                    "Close timed out; the port did not confirm teardown")
+            end
+            self:_render_ui_state()
+            return self:_poll_errors()
+        end
+    else
+        self._closing_deadline = nil
     end
     -- Live DTR/RTS hot switch.  The header toggles only write the Lua-owned
     -- int buffers, so without this a user check would not reach the wire until
