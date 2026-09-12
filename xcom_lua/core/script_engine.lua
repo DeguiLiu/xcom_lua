@@ -63,7 +63,14 @@ Hook dispatch order inside process_rx(text):
 
 local M = {}
 
-local uv = require("luv")
+-- luv is a soft dependency.  The engine runs on the Windows runtime
+-- (luvjit.exe / luv.dll) where it is always present, but the pure-logic layer
+-- (metadata parsing, reload debounce) must be unit-testable on a host without
+-- a Linux luv build.  Every uv.* call below lives in a function that only runs
+-- for a live engine (timers, fs, fs_event), so a nil uv degrades those to
+-- no-ops instead of failing at require-time.
+local has_uv, uv = pcall(require, "luv")
+if not has_uv then uv = nil end
 
 -- Cap a single script's log line so a runaway tostring can't blow the ring.
 local LOG_LINE_MAX = 2000
@@ -189,6 +196,111 @@ string.utf8Len = string.utf8Len or str_utf8Len
 local script_string = string
 
 -- ---------------------------------------------------------------------------
+-- Script metadata header
+-- LLCOM-style scripts describe themselves with leading comment tags so the
+-- console can show a human label instead of the raw filename.  Convention
+-- (all optional, all read-only, parsed from the file HEAD only):
+--
+--     -- @name 绘制曲线
+--     -- @desc 解析串口数值行，绘制实时曲线（最多4条）
+--
+-- Only the first occurrence of each tag wins; tag lines must appear within the
+-- first META_HEAD_LINES lines so a `@name` mentioned deep in a body comment
+-- can never hijack the list label.  A file with no tags falls back to its
+-- filename (see display_name).  Purely lexical — no chunk is loaded.
+-- ---------------------------------------------------------------------------
+local META_HEAD_LINES = 24   -- how many leading lines are scanned for tags
+
+local meta = {}
+
+-- Parse `text` -> { name = string|nil, desc = string|nil }.  Nil-safe: a nil
+-- or non-string input yields an empty result so callers never need a guard.
+function meta.parse(text)
+    local out = {}
+    if type(text) ~= "string" or text == "" then return out end
+    local scanned = 0
+    for line in text:gmatch("[^\r\n]*") do
+        if scanned >= META_HEAD_LINES then break end
+        scanned = scanned + 1
+        local tag, value = line:match("^%s*%-%-%s*@([%a_]+)%s+(.-)%s*$")
+        if tag == "name" and out.name == nil and value ~= "" then
+            out.name = value
+        elseif tag == "desc" and out.desc == nil and value ~= "" then
+            out.desc = value
+        end
+    end
+    return out
+end
+
+-- The list label for one script: the @name when present, else the filename.
+-- @desc is deliberately NOT the label (it is long-form; a tooltip may use it).
+function meta.display_name(name, parsed)
+    if parsed and type(parsed.name) == "string" and parsed.name ~= "" then
+        return parsed.name
+    end
+    return name
+end
+
+M.meta = meta
+
+-- ---------------------------------------------------------------------------
+-- Reload debounce scheduler (fs_event -> one reload per burst)
+-- A naive fs_event fires several times for a single editor save (write, close,
+-- maybe a rename), and a half-written file must not be loaded.  `touch(name)`
+-- records the event time; `ready(name)` returns true once window_ms has passed
+-- with no newer event, consuming the entry.  The clock is injectable so the
+-- logic is testable without sleeping.  Pure Lua — no uv here.
+-- ---------------------------------------------------------------------------
+local debounce = {}
+
+-- opts.window_ms (default 200), opts.now (default os.clock-based ms)
+function debounce.new(opts)
+    opts = opts or {}
+    local self = {
+        window_ms = opts.window_ms or 200,
+        now = opts.now or function() return os.clock() * 1000 end,
+        pending = {},   -- name -> last event ms
+    }
+    return setmetatable(self, { __index = debounce })
+end
+
+function debounce:touch(name)
+    if type(name) ~= "string" then return end
+    self.pending[name] = self.now()
+end
+
+-- True exactly once per settled burst; clears the entry so the next call
+-- returns false until a further touch().
+function debounce:ready(name)
+    local stamp = self.pending[name]
+    if stamp == nil then return false end
+    if (self.now() - stamp) < self.window_ms then return false end
+    self.pending[name] = nil
+    return true
+end
+
+function debounce:forget(name)
+    self.pending[name] = nil
+end
+
+M.debounce = debounce
+
+-- Pure decision layer over load_script(): given the engine's record table and
+-- a set of changed filenames, return the names that must be reloaded — enabled
+-- scripts only (a disabled script is reloaded when the user next enables it),
+-- sorted for a stable dispatch order, ignoring unknown names.
+function M.reload_plan(records, changed)
+    local out = {}
+    if type(records) ~= "table" or type(changed) ~= "table" then return out end
+    for _, name in ipairs(changed) do
+        local record = records[name]
+        if record and record.enabled then out[#out + 1] = name end
+    end
+    table.sort(out)
+    return out
+end
+
+-- ---------------------------------------------------------------------------
 -- Construction
 -- ---------------------------------------------------------------------------
 
@@ -202,6 +314,9 @@ local script_string = string
 --                   (window.lua pushes the ring to the C++ console)
 --   wave            optional module table exposed as `wave` (core/waveform)
 --   auto_reload     bool — poll script mtimes each poll() tick (1 Hz)
+--   watch           bool — fs_event watch of script_dir; changed enabled
+--                   scripts reload after a debounce window (pump() drives it)
+--   watch_window_ms debounce window for the watcher (default 200)
 function M.new(opts)
     opts = opts or {}
     local engine = {
@@ -220,8 +335,10 @@ function M.new(opts)
         -- window.lua wires this to ui/win32.lua's GetOpenFileNameW.
         open_file_fn = opts.open_file,
         auto_reload = opts.auto_reload and true or false,
+        watch = opts.watch and true or false,
+        watch_window_ms = opts.watch_window_ms or 200,
         -- name -> script record
-        -- record = { name, path, chunk_env, enabled, mtime,
+        -- record = { name, path, chunk_env, enabled, mtime, meta, label,
         --            recv_hook, send_hook, keeps, drops, strikes_recv,
         --            last_loaded }
         scripts = {},
@@ -236,6 +353,11 @@ function M.new(opts)
         log_flushed = 0,       -- last log_count pushed to the UI
         timers = {},           -- strong refs; timer:stop() on shutdown
         repl_env = nil,        -- first enabled script's env (REPL host)
+        -- fs_event watcher state (nil until watch_start succeeds)
+        _watcher = nil,
+        _watch_debounce = nil,
+        _watch_changed = nil,  -- name -> true, coalesced until pump drains it
+        _labels_dirty = true,
     }
     return setmetatable(engine, { __index = M })
 end
@@ -578,6 +700,15 @@ local function build_env(engine, record)
     if ok_struct then env.struct = struct end
     local ok_json, json = pcall(require, "json")
     if ok_json then env.json = json end
+    -- LuaJIT bit operations (band/bor/bxor/lshift/rshift/rol/ror/bswap/...).
+    -- LuaJIT has no `~` operator, so without this a script implementing XOR /
+    -- CRC must expand the arithmetic by hand — correct but several times
+    -- slower (see the CRC16/LRC/NMEA plugins).  Sandbox-supplied rather than
+    -- reached through the global table so scripts stay portable to a plain
+    -- Lua 5.1 host, where `bit` may be absent; those scripts must still fall
+    -- back gracefully (probe `if bit then ... else <arithmetic> end`).
+    local ok_bit, bit = pcall(require, "bit")
+    if ok_bit then env.bit = bit end
     -- Base64 encode (pure Lua, straightforward loop; LLCOM scripts commonly
     -- need it).  decode omitted until a script asks for it.
     do
@@ -691,6 +822,24 @@ local function script_mtime(path)
     return stat and stat.mtime.sec or nil
 end
 
+-- Read only the head of a script file (bounded, no whole-file slurp) and parse
+-- its @name/@desc tags.  Files are small and this runs on rescans, but the
+-- 64-line cap keeps a pathological file from being read to the end for a label
+-- that can only live in the header anyway.  Returns the meta.parse table.
+local META_READ_LINES = 64
+local function read_script_meta(path)
+    local f = io.open(path, "rb")
+    if not f then return meta.parse(nil) end
+    local head = {}
+    for _ = 1, META_READ_LINES do
+        local line = f:read("*l")
+        if line == nil then break end
+        head[#head + 1] = line
+    end
+    f:close()
+    return meta.parse(table.concat(head, "\n"))
+end
+
 -- (Re)load one script file.  Returns ok, err.  A failed (re)load disables the
 -- script and keeps the previous hook state cleared so a broken edit cannot
 -- keep stale hooks alive.
@@ -716,6 +865,10 @@ function M:load_script(name)
     record.strikes_recv = 0
     record.strikes_send = 0
     record.mtime = script_mtime(record.path)
+    -- Refresh the header label on every (re)load: a hot edit may have changed
+    -- @name/@desc, and the console list should follow without a full rescan.
+    record.meta = read_script_meta(record.path)
+    record.label = meta.display_name(name, record.meta)
     close_record_fds(record)
     record.env = build_env(self, record)
     record.last_loaded = uv.now()
@@ -759,12 +912,39 @@ function M:load_all()
             }
             self.scripts[name] = record
         end
+        -- (Re)read the header on every scan: an external editor may have
+        -- changed a script's @name/@desc while it was disabled, and the list
+        -- label must track that.  Cheap — a bounded head read per file.
+        local record = self.scripts[name]
+        record.meta = read_script_meta(record.path)
+        record.label = meta.display_name(name, record.meta)
     end
     self.order = names
+    self._labels_dirty = true
 end
 
 function M:script_names()
     return self.order
+end
+
+-- Display labels, index-aligned with script_names(): the @name when a script
+-- declared one, else the filename.  window.lua pushes these to the DLL so the
+-- console list shows a description while the engine keeps indexing by filename.
+function M:script_labels()
+    local out = {}
+    for i, name in ipairs(self.order) do
+        local record = self.scripts[name]
+        out[i] = (record and record.label) or name
+    end
+    return out
+end
+
+-- Full metadata for one script: { name, desc } where name is the list label
+-- and desc the long-form description (nil when the script declared neither).
+function M:script_meta(name)
+    local record = self.scripts[name]
+    if not record then return nil end
+    return record.meta or meta.parse(nil)
 end
 
 function M:enable(name, enabled)
@@ -845,6 +1025,7 @@ function M:timer_destroy(handle)
 end
 
 function M:shutdown()
+    self:watch_stop()
     for _, timer in ipairs(self.timers) do
         local ok = pcall(function() timer:stop() end)
         if not ok then io.stderr:write("[script] timer stop failed\n") end
@@ -853,6 +1034,95 @@ function M:shutdown()
     for _, record in pairs(self.scripts) do
         close_record_fds(record)
     end
+end
+
+-- ---------------------------------------------------------------------------
+-- fs_event hot-reload watcher
+-- Opt-in (opts.watch).  Watches script_dir for writes and records changed
+-- filenames; pump() coalesces them through the debounce window and reloads
+-- only the enabled scripts whose files settled.  Two durability properties:
+--
+--   * Coalescing by NAME, not by event: an editor save emits several events
+--     (write + close + maybe rename) and each would otherwise queue a reload
+--     of a half-written file.  The debounce keeps re-arming until 200 ms pass
+--     with no further event for that file, so the chunk is complete.
+--   * A failed reload is already non-destructive: load_script disables the
+--     record and clears its hooks rather than leaving stale ones alive, so a
+--     syntax error mid-edit just shows in the log and self-heals on the next
+--     save that parses.
+--
+-- The libuv callback only records the name (no chunk load, no logging) — heavy
+-- work stays in pump(), which poll() drives from window.lua's 1 Hz timer.
+-- ---------------------------------------------------------------------------
+function M:watch_start()
+    if self._watcher or not self.watch or uv == nil then return false end
+    local ok, watcher = pcall(uv.new_fs_event)
+    if not ok or not watcher then
+        self:log(4, "engine", "fs_event unavailable; file watch disabled")
+        return false
+    end
+    local engine = self
+    self._watch_debounce = debounce.new({
+        window_ms = self.watch_window_ms,
+        now = function() return uv.now() end,
+    })
+    self._watch_changed = self._watch_changed or {}
+    local callback = function(err, filename)
+        if err or type(filename) ~= "string" then return end
+        -- UV_RENAME / UV_CHANGE both land here; some editors write a temp file
+        -- then rename over the target, so a rename on the target name is the
+        -- common "save" signature.  Only *.lua names matter.
+        if not filename:match("%.lua$") then return end
+        engine._watch_changed[filename] = true
+        engine._watch_debounce:touch(filename)
+    end
+    if jit and jit.off then jit.off(callback, true) end
+    local started, err = pcall(uv.fs_event_start, watcher, self.script_dir,
+        { recursive = false }, callback)
+    if not started then
+        self:log(4, "engine", "fs_event_start failed: " .. tostring(err))
+        pcall(function() watcher:close() end)
+        return false
+    end
+    self._watcher = watcher
+    self:log(3, "engine", "watching " .. tostring(self.script_dir) ..
+        " for changes")
+    return true
+end
+
+function M:watch_stop()
+    if self._watcher then
+        local watcher = self._watcher
+        self._watcher = nil
+        pcall(function() watcher:stop() end)
+        pcall(function() watcher:close() end)
+    end
+    self._watch_debounce = nil
+    self._watch_changed = nil
+end
+
+-- Drain settled changes -> reload enabled scripts.  Returns the reloaded name
+-- list (for tests / callers that want to observe), or an empty table.
+-- Safe to call with no watcher: it also services the legacy mtime poller.
+function M:pump()
+    self:flush_pending()
+    local reloaded = {}
+    local debounce_state = self._watch_debounce
+    local changed = self._watch_changed
+    if not debounce_state or not changed then return reloaded end
+    local settled = {}
+    for name in pairs(changed) do
+        if debounce_state:ready(name) then
+            changed[name] = nil
+            settled[#settled + 1] = name
+        end
+    end
+    for _, name in ipairs(M.reload_plan(self.scripts, settled)) do
+        self:log(3, name, "changed on disk, reloading")
+        self:load_script(name)
+        reloaded[#reloaded + 1] = name
+    end
+    return reloaded
 end
 
 -- ---------------------------------------------------------------------------
@@ -1133,10 +1403,14 @@ function M:process_rx(text, now_ms)
 end
 
 -- Periodic housekeeping from window.lua's 1 Hz timer:
---   * mtime hot-reload of enabled scripts (opt-in)
 --   * pending partial-line idle flush
+--   * fs_event watcher drain (debounced reload of changed enabled scripts)
+--   * mtime hot-reload of enabled scripts (legacy opt-in; a belt-and-braces
+--     fallback for environments where fs_event could not start)
+-- The watcher drain runs FIRST so a settled external save wins over the mtime
+-- comparison sitting on a stale record.mtime.
 function M:poll()
-    self:flush_pending()
+    self:pump()
     if not self.auto_reload then return end
     for _, name in ipairs(self.order) do
         local record = self.scripts[name]

@@ -166,6 +166,7 @@ struct Lang final {
     const char* script_empty_title;
     const char* script_empty_detail;
     const char* repl_label;
+    const char* plugin_windows;         // Settings section: plugin window toggles
     const char* scope_follow;
     const char* scope_hint;
     const char* scope_empty_title;
@@ -206,6 +207,7 @@ struct Lang final {
         fn(script_new); fn(script_open_folder); fn(script_reload); fn(script_clear_log);
         fn(script_empty_title); fn(script_empty_detail);
         fn(repl_label);
+        fn(plugin_windows);
         fn(scope_follow); fn(scope_hint); fn(scope_empty_title); fn(scope_empty_detail);
         fn(scope_axis_x); fn(scope_dt_fmt);
     }
@@ -252,6 +254,7 @@ constexpr Lang kLangZh{
     /*script_reload*/ "重新加载", /*script_clear_log*/ "清空日志",
     /*script_empty_title*/ "请选择脚本", /*script_empty_detail*/ "从左侧列表挑选",
     /*repl_label*/ "命令行",
+    /*plugin_windows*/ "插件窗口",
     /*scope_follow*/ "跟随",
     /*scope_hint*/ "拖拽:平移  滚轮:缩放  双击:适应",
     /*scope_empty_title*/ "无波形数据",
@@ -291,6 +294,7 @@ constexpr Lang kLangEn{
     /*script_reload*/ "Reload", /*script_clear_log*/ "Clear log",
     /*script_empty_title*/ "SELECT A SCRIPT", /*script_empty_detail*/ "pick one from the list",
     /*repl_label*/ "REPL",
+    /*plugin_windows*/ "PLUGIN WINDOWS",
     /*scope_follow*/ "Follow",
     /*scope_hint*/ "drag: pan  wheel: zoom  dbl-click: fit",
     /*scope_empty_title*/ "NO SCOPE DATA",
@@ -415,6 +419,14 @@ public:
     // Script console (floating window; header "Lua" button toggles it).
     bool scripts_visible_ = false;
     std::vector<std::string> script_names_{};
+    // Display labels, index-aligned with script_names_.  Carries each script's
+    // @name when it declared one, else the filename (Lua decides — see
+    // core/script_engine.lua meta.display_name).  Kept SEPARATE from
+    // script_names_ so the latter stays the stable index key: script_events_
+    // carry only an index, and Lua maps it back through script_names().
+    // Empty on a pre-labels DLL/Lua pair, in which case the console falls back
+    // to script_names_ for rendering.
+    std::vector<std::string> script_labels_{};
     int* script_enabled_ = nullptr;   // Lua-owned int[count]
     std::string script_log_{};        // full log text (Lua pushes the tail)
     std::vector<std::size_t> script_log_lines_{1, 0};  // line offsets
@@ -459,7 +471,11 @@ public:
     bool scope_y_fit_ = true;         // auto-fit Y (serial numeric streams)
     double scope_cursor_a_ = 0.0;     // measurement cursor A (seconds)
     double scope_cursor_b_ = 0.0;     // measurement cursor B (seconds)
-    bool scope_visible_ = false;      // scope panel toggle (header button)
+    // Scope panel visibility.  No header chip toggles it any more: Lua drives
+    // it from script activity (window.lua _reconcile_scope_visibility ->
+    // xcom_imgui_scope_set_visible) and the panel's own title-bar X clears it
+    // (reporting ActionToggleScope so Lua resyncs).
+    bool scope_visible_ = false;
     bool scope_has_data_ = false;
     double scope_last_x_ = 0.0;
     // Settings popup (header "Set" chip).  Body-size fonts are pre-baked at
@@ -484,8 +500,15 @@ public:
         // per declaration (values_ready_ gate), never by render-time probes.
         double values_[kWidgetsMax]{};
         bool values_ready_ = false;
+        // Independent-window state (user ask: "lua插件生成的界面最好是独立的
+        // 窗口").  Each plugin page is its own top-level ImGui window; the
+        // Settings window keeps a toggle per page so a window the user closed
+        // (X) can be re-opened.  Defaults to OPEN on declaration so enabling a
+        // plugin shows its UI without a second click.
+        bool window_open_ = true;
+        bool window_appeared_ = false;   // first-frame position seed
     };
-    std::vector<PluginPage> plugin_pages_{};         // tab order
+    std::vector<PluginPage> plugin_pages_{};         // declaration order
     std::vector<std::string> plugin_events_{};       // "page:kind:id[:value]"
 
     // Active UI language, resolved from [ui] language in layout.toml during
@@ -525,7 +548,7 @@ enum class Action : std::uint32_t {
     // IMGUI_ACTION as scripts_window / run_sequence).
     ActionToggleScripts = 1 << 27,   // header "Lua" button -> script console
     ActionRunSequence = 1 << 28,     // Multi-tab "Run": sequential command list
-    ActionToggleScope = 1 << 29,     // header "Scope" button -> ImPlot panel
+    ActionToggleScope = 1 << 29,     // scope panel's own X (no header chip now)
     ActionToggleSettings = 1 << 30,  // header "Set" chip -> settings window
 };
 
@@ -929,13 +952,17 @@ void Header(int& actions, const bool connected) {
                        ImGuiRuntime::instance().lang().subtitle);
     const char* const status = connected ? runtime.lang().online : runtime.lang().offline;
     const float button_group_start = ImGui::GetWindowWidth() - 108.0f;
-    // Header toggle chips ("Set"/"Scope"/"Lua", right-to-left).  1.png shows
-    // the header controls borderless — icon-only, no frames — so the chips
-    // drop their white tile + outline entirely and express selection state via
-    // GLYPH TINT instead (selected = kAccentTeal, unselected = kTextBody).
-    // The labels stay text for now: the icon set for these three doesn't exist
-    // yet (docs/1png-icons.md §7), and inventing glyphs would drift from the
-    // reference.  Hit areas + action bits are byte-identical to before.
+    // Header toggle chips ("Set"/"Lua", right-to-left).  1.png shows the header
+    // controls borderless — icon-only, no frames — so the chips drop their
+    // white tile + outline entirely and express selection state via GLYPH TINT
+    // instead (selected = kAccentTeal, unselected = kTextBody).  The labels
+    // stay text for now: the icon set doesn't exist yet (docs/1png-icons.md
+    // §7), and inventing glyphs would drift from the reference.
+    //
+    // The "Scope" chip is gone: the ImPlot panel is script-owned now (Lua shows
+    // it while a script feeds wave points — see window.lua
+    // _reconcile_scope_visibility).  ActionToggleScope / scope_visible_ stay so
+    // the title-bar X on the panel itself still toggles and notifies Lua.
     // Table-driven: one chip spec per header toggle, right-to-left order.
     {
         auto& runtime = ImGuiRuntime::instance();
@@ -950,9 +977,7 @@ void Header(int& actions, const bool connected) {
         const HeaderChip chips[] = {
             {"##lua_console", runtime.lang().chip_lua, -44.0f, 36.0f,
              Action::ActionToggleScripts, &runtime.scripts_visible_},
-            {"##scope_toggle", runtime.lang().chip_scope, -96.0f, 48.0f,
-             Action::ActionToggleScope, &runtime.scope_visible_},
-            {"##settings_toggle", runtime.lang().chip_set, -144.0f, 40.0f,
+            {"##settings_toggle", runtime.lang().chip_set, -96.0f, 40.0f,
              Action::ActionToggleSettings, &runtime.settings_visible_},
         };
         for (const HeaderChip& chip : chips) {
@@ -991,10 +1016,9 @@ void Header(int& actions, const bool connected) {
     }
     const float status_width = status_width_cache[status_idx] + 32.0f;
     // The status text must clear the whole chip cluster, not just the 12px
-    // margin: Set/Scope/Lua start at button_group_start - 144, so anchor the
-    // label to the left of that (a -12 offset used to drop it straight on top
-    // of the Scope and Lua chips).
-    constexpr float kChipClusterLeft = 144.0f;
+    // margin: Set/Lua start at button_group_start - 96 (the Scope chip is
+    // gone), so anchor the label to the left of that.
+    constexpr float kChipClusterLeft = 96.0f;
     ImGui::SetCursorPos(ImVec2(button_group_start - kChipClusterLeft - status_width - 8.0f, 8.0f));
     const ImVec2 status_origin = ImGui::GetCursorScreenPos();
     ImGui::GetWindowDrawList()->AddCircleFilled(
@@ -2018,6 +2042,29 @@ void Footer(const bool connected, const int rx_bytes, const int tx_bytes) {
             hint.data(), hint.data() + hint.size()).x;
     }
     const float hint_width = hint_width_cache[hint_idx];
+    // Live status line from Lua (xcom_imgui_set_status): open failures, port
+    // causes, DTR/RTS rejections, data-loss banners, reconnect countdown. The
+    // buffer was previously write-only — Lua set it on 30+ paths (window.lua)
+    // and nothing ever drew it, so every one of those messages was invisible
+    // in the ImGui front-end and the UI looked unresponsive to failures.
+    // Render it in the free space between the RX/TX counters and the right-hand
+    // hint, clipping to whatever room is left so a long message can never
+    // collide with either neighbour.
+    if (!runtime.status_text_.empty()) {
+        const float text_left = origin.x + counter_x + counters_width + 12.0f;
+        const float text_right = origin.x + (std::max)(
+            footer_width - hint_width - 14.0f, content_boundary + 8.0f) - 8.0f;
+        if (text_right > text_left) {
+            const ImVec4 clip(text_left, origin.y, text_right,
+                              origin.y + kFooterHeight);
+            draw_list->PushClipRect(ImVec2(clip.x, clip.y),
+                                    ImVec2(clip.z, clip.w), true);
+            draw_list->AddText(ImVec2(text_left, baseline),
+                               ImGui::GetColorU32(rgb(0xB4551F)),  // amber: advisory
+                               runtime.status_text_.c_str());
+            draw_list->PopClipRect();
+        }
+    }
     draw_list->AddText(ImVec2(origin.x + (std::max)(footer_width - hint_width - 14.0f,
                                                      content_boundary + 8.0f), baseline),
                        ImGui::GetColorU32(rgb(palette::kTextMuted)), hint.data(),
@@ -2121,8 +2168,16 @@ int ScriptEditorResize(ImGuiInputTextCallbackData* data) {
                     }
                     ImGui::SameLine();
                     const bool selected = runtime.script_edit_index_ == index;
-                    if (ImGui::Selectable(runtime.script_names_[index].c_str(),
-                                          selected)) {
+                    // Show the human label (@name) when Lua supplied one;
+                    // fall back to the filename for a pre-labels pair.  The
+                    // selected index and the event index stay the NAME index —
+                    // only the rendered string differs.
+                    const char* const shown =
+                        runtime.script_labels_.size() ==
+                                runtime.script_names_.size()
+                            ? runtime.script_labels_[index].c_str()
+                            : runtime.script_names_[index].c_str();
+                    if (ImGui::Selectable(shown, selected)) {
                         runtime.script_events_.push_back(
                             (static_cast<int>(ScriptEvent::Edit) << 8) | index);
                     }
@@ -2234,6 +2289,9 @@ int ScriptEditorResize(ImGuiInputTextCallbackData* data) {
 // double-click re-fits (ImPlot built-in).  Data flows in ONLY through
 // xcom_imgui_scope_push (Lua side, uv.now() timestamps) — the bridge never
 // samples time itself because frames are passive (16-100 ms).
+// Visibility is host-driven: Lua sets scope_visible_ from script activity
+// (window.lua _reconcile_scope_visibility); the panel's title-bar X clears it
+// here and reports ActionToggleScope so Lua records the dismissal.
 // ---------------------------------------------------------------------------
 [[nodiscard]] int ScopeContent() {
     auto& runtime = ImGuiRuntime::instance();
@@ -2493,9 +2551,11 @@ void RenderPluginSpec(ImGuiRuntime& runtime, ImGuiRuntime::PluginPage& page) {
 }
 
 // Settings floating window (user ask: "设置"按钮弹出配置).  Left column keeps
-// host-level options (body font size, like llcom's SettingWindow basics); the
-// plugin pages Lua declared via xcom_imgui_set_plugin_page render as tabs on
-// the right — that is the dynamic-UI surface for script-drawn settings.
+// host-level options (body font size, like llcom's SettingWindow basics).  Lua
+// plugin pages (xcom_imgui_set_plugin_page) no longer render as tabs here:
+// each is its own top-level window (PluginWindowsContent below), and this
+// window keeps a "Plugin windows" section with one toggle per page so a window
+// the user closed can be re-opened.
 [[nodiscard]] int SettingsContent() {
     auto& runtime = ImGuiRuntime::instance();
     int actions = 0;
@@ -2541,16 +2601,23 @@ void RenderPluginSpec(ImGuiRuntime& runtime, ImGuiRuntime::PluginPage& page) {
                 }
                 ImGui::EndTabItem();
             }
-            for (auto& page : runtime.plugin_pages_) {
-                ImGui::PushID(page.id.c_str());
-                // "Label###id": the title shows as-is while duplicate tab
-                // names (two plugins calling themselves "Tools") stay unique.
-                const std::string tab_label{page.title + "##" + page.id};
-                if (ImGui::BeginTabItem(tab_label.c_str())) {
-                    RenderPluginSpec(runtime, page);
-                    ImGui::EndTabItem();
+            // Lua plugin pages are NO LONGER tabs of this window: each renders
+            // as its own top-level window (PluginWindowsContent, below).  The
+            // Settings window keeps one toggle per page so a window the user
+            // closed can be brought back.  The section is hidden entirely when
+            // no plugin declared a page.
+            if (!runtime.plugin_pages_.empty()) {
+                ImGui::Separator();
+                Section(lang.plugin_windows);
+                for (auto& page : runtime.plugin_pages_) {
+                    ImGui::PushID(page.id.c_str());
+                    bool open = page.window_open_;
+                    if (ImGui::Checkbox(page.title.c_str(), &open)) {
+                        page.window_open_ = open;
+                        if (open) page.window_appeared_ = false;  // re-seed pos
+                    }
+                    ImGui::PopID();
                 }
-                ImGui::PopID();
             }
             ImGui::EndTabBar();
         }
@@ -2559,6 +2626,46 @@ void RenderPluginSpec(ImGuiRuntime& runtime, ImGuiRuntime::PluginPage& page) {
     if (!open) {
         actions |= Action::ActionToggleSettings;
         runtime.settings_visible_ = false;
+    }
+    return actions;
+}
+
+// Lua plugin pages as independent floating windows (user ask: "lua插件生成的
+// 界面最好是独立的窗口").  Each PluginPage gets its own top-level ImGui window
+// whose ImGui ID is keyed off the page id, so two plugins sharing a display
+// title still get distinct windows/positions.  A closed (X) window does NOT
+// drop the page — the spec stays live and the Settings window's toggle
+// re-opens it, which is what makes the checkbox in Settings meaningful.
+[[nodiscard]] int PluginWindowsContent() {
+    auto& runtime = ImGuiRuntime::instance();
+    if (runtime.plugin_pages_.empty()) return 0;
+    int actions = 0;
+    for (auto& page : runtime.plugin_pages_) {
+        if (!page.window_open_) continue;
+        // First appearance: cascade the window so two plugins don't stack
+        // exactly on top of each other.  Persisted position (imgui.ini) wins
+        // on later runs via FirstUseEver.
+        if (!page.window_appeared_) {
+            page.window_appeared_ = true;
+            ImGui::SetNextWindowSize(ImVec2(360.0f, 260.0f),
+                                     ImGuiCond_FirstUseEver);
+            ImGui::SetNextWindowPos(ImVec2(220.0f, 120.0f),
+                                    ImGuiCond_FirstUseEver);
+        }
+        bool open = page.window_open_;
+        // "Title###plugin_<id>": the part before ### is the visible title
+        // (user-authored, may be Chinese), the part after is the stable ImGui
+        // ID — so two plugins sharing a display title still get distinct
+        // windows and remembered positions.  The id originates from Lua's
+        // "script.lua:local_id" page key, so it is unique process-wide.
+        const std::string window_title{page.title + "###plugin_" + page.id};
+        if (ImGui::Begin(window_title.c_str(), &open)) {
+            RenderPluginSpec(runtime, page);
+        }
+        ImGui::End();
+        // The X button flips `open`; mirror it so Settings' checkbox follows
+        // and the window stays closed until re-opened.
+        page.window_open_ = open;
     }
     return actions;
 }
@@ -2926,6 +3033,20 @@ static void rebuild_fonts(ImGuiRuntime& runtime) {
         const Lang& lang = runtime.lang();
         lang.for_each_text([&text_builder](const char* const utf8) { text_builder.AddText(utf8); });
         text_builder.AddText("0123456789");
+        // Script list labels (@name) are user-authored Chinese, so their glyphs
+        // are NOT in the Lang tables — register them here or a script calling
+        // itself "绘制曲线" renders as tofu in the console list.  The body and
+        // heading faces both merge ui_glyph_ranges_, so one pass covers both.
+        for (const std::string& label : runtime.script_labels_) {
+            text_builder.AddText(label.c_str());
+        }
+        // The footer status line is set by Lua and may contain Chinese
+        // ("端口被其他程序占用", "串口连接异常，等待恢复...").  It is re-baked
+        // on change (see xcom_imgui_set_status), so only the current string
+        // needs to be registered here.
+        if (!runtime.status_text_.empty()) {
+            text_builder.AddText(runtime.status_text_.c_str());
+        }
         text_builder.BuildRanges(&runtime.ui_glyph_ranges_);
     }
 
@@ -3361,6 +3482,9 @@ extern "C" __declspec(dllexport) int xcom_imgui_draw_console(
     actions |= ui::ScriptConsoleContent();
     actions |= ui::ScopeContent();
     actions |= ui::SettingsContent();
+    // Lua plugin pages render as independent floating windows ON TOP of the
+    // Settings window, so the toggles that re-open them stay reachable.
+    actions |= ui::PluginWindowsContent();
     // The accumulated action mask is the C ABI return value — returned to the
     // Lua caller verbatim (single consumer; no observer indirection needed).
     return actions;
@@ -3549,12 +3673,64 @@ extern "C" __declspec(dllexport) void xcom_imgui_set_status(const char* text) {
     // Null-safe: an empty view's data() may be null, and assign(nullptr, 0)
     // is undefined; short-circuit instead of clamping a null pointer.
     if (text == nullptr || text[0] == '\0') {
+        // Clearing never needs a rebuild: the legacy glyphs stay baked (a
+        // slightly over-full atlas only costs atlas space, never correctness),
+        // and the next non-empty status takes the missing-glyph path below.
         runtime.status_text_.clear();
         return;
     }
     const std::string_view value(text);
-    runtime.status_text_.assign(value.data(),
-                                value.size() < kStatusLimit ? value.size() : kStatusLimit);
+    std::string next(value.data(),
+                     value.size() < kStatusLimit ? value.size() : kStatusLimit);
+    if (next == runtime.status_text_) return;   // no change: no font churn
+    runtime.status_text_ = std::move(next);
+    // The line is drawn in the footer (see Footer()) and may contain Chinese
+    // from Lua, so its glyphs must exist in the baked atlas. Status strings
+    // appear at runtime, long after the first bake, so defer a rebuild to the
+    // top of the next frame — the same safe point the script-@name and
+    // mono-CJK paths use.
+    //
+    // rebuild_fonts() re-bakes the whole atlas and is far too expensive to run
+    // on every status change (the reconnect countdown rewrites this string
+    // every second, the data-loss banner every 250 ms). Decode the UTF-8 and
+    // ask the body faces whether they already cover every code point; only a
+    // genuinely new glyph — a Chinese cause string appearing for the first
+    // time in this session — schedules the rebuild. All three body sizes are
+    // checked because the settings panel can switch the active face after the
+    // glyphs were first baked.
+    if (runtime.body_fonts_[1] != nullptr) {
+        bool missing = false;
+        for (std::size_t i = 0; i < runtime.status_text_.size() && !missing;) {
+            const unsigned char lead =
+                static_cast<unsigned char>(runtime.status_text_[i]);
+            std::uint32_t cp = lead;
+            std::size_t len = 1U;
+            if (lead >= 0xF0U) { cp = lead & 0x07U; len = 4U; }
+            else if (lead >= 0xE0U) { cp = lead & 0x0FU; len = 3U; }
+            else if (lead >= 0xC0U) { cp = lead & 0x1FU; len = 2U; }
+            if (i + len > runtime.status_text_.size()) break;   // truncated tail
+            for (std::size_t k = 1U; k < len; ++k) {
+                cp = (cp << 6U) |
+                     (static_cast<unsigned char>(runtime.status_text_[i + k]) & 0x3FU);
+            }
+            i += len;
+            if (cp < 0x80U) continue;   // ASCII is always baked
+            for (ImFont* const body : runtime.body_fonts_) {
+                if (body != nullptr &&
+                    !body->IsGlyphInFont(static_cast<ImWchar>(cp))) {
+                    missing = true;
+                    break;
+                }
+            }
+        }
+        if (missing) {
+            runtime.font_rebuild_pending_ = true;
+        }
+    } else {
+        // Pre-bake: nothing is loaded yet, so the initial bake (which also
+        // registers status_text_) will pick the glyphs up.
+        runtime.font_rebuild_pending_ = true;
+    }
 }
 
 extern "C" __declspec(dllexport) int xcom_imgui_new_frame() {
@@ -3712,6 +3888,7 @@ extern "C" __declspec(dllexport) void xcom_imgui_set_scripts(
     auto& runtime = ImGuiRuntime::instance();
     if (!extension_ready(runtime)) return;
     runtime.script_names_.clear();
+    runtime.script_labels_.clear();   // labels are index-aligned with names
     if (!names_packed || count <= 0) {
         runtime.script_enabled_ = nullptr;
         return;
@@ -3724,7 +3901,43 @@ extern "C" __declspec(dllexport) void xcom_imgui_set_scripts(
     runtime.script_enabled_ = enabled;
 }
 
-// Full log tail (replaces the previous content; Lua pushes the concatenated
+// Display labels for the script list ("label1\0label2\0..."), index-aligned
+// with the names handed to xcom_imgui_set_scripts.  A separate export so the
+// set_scripts ABI / index-key contract is untouched; Lua sends the same count
+// and order.  The font glyphs for these strings are registered in
+// rebuild_fonts() — without that a Chinese @name would render as tofu.
+extern "C" __declspec(dllexport) void xcom_imgui_set_script_labels(
+    const char* labels_packed) {
+    auto& runtime = ImGuiRuntime::instance();
+    if (!extension_ready(runtime)) return;
+    std::vector<std::string> next;
+    if (labels_packed) {
+        const char* cursor = labels_packed;
+        // Walk the NUL-separated list; the empty trailing token after the last
+        // separator terminates it.
+        while (*cursor != '\0' &&
+               next.size() < runtime.script_names_.size()) {
+            next.emplace_back(cursor);
+            cursor += next.back().size() + 1;
+        }
+    }
+    // A label vector shorter than the name list (Lua sent fewer) is discarded
+    // wholesale: a partial mapping would mislabel rows.
+    if (!next.empty() && next.size() != runtime.script_names_.size()) {
+        next.clear();
+    }
+    if (next == runtime.script_labels_) return;   // no change: no font churn
+    runtime.script_labels_ = std::move(next);
+    // Glyphs are baked in rebuild_fonts() from these strings.  When the app is
+    // already running a label can appear/change after the last bake (a script
+    // was enabled or its @name edited), so defer a rebuild to the top of the
+    // next frame — same safe point the mono-CJK toggle uses.  At init the
+    // initial bake has not happened yet, so no rebuild is needed (and asking
+    // for one here would run before the DX11 device exists).
+    if (runtime.initialized_) {
+        runtime.font_rebuild_pending_ = true;
+    }
+}
 // ring only when dirty).  Line offsets are rebuilt with the same memchr scan
 // as the receive text.
 extern "C" __declspec(dllexport) void xcom_imgui_set_script_log(

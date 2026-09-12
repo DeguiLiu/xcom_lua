@@ -33,6 +33,7 @@ void xcom_imgui_set_charset(int* index);
 void xcom_imgui_set_frame_gap(int* enabled, int* ms);
 void xcom_imgui_set_highlight_rules(const char* packed, int count);
 void xcom_imgui_set_scripts(const char* names_packed, int* enabled, int count);
+void xcom_imgui_set_script_labels(const char* labels_packed);
 void xcom_imgui_set_script_log(const char* text, size_t length);
 void xcom_imgui_set_scripts_visible(int visible);
 int xcom_imgui_take_script_events(int* events, int capacity);
@@ -258,12 +259,18 @@ function M:set_script_log(text)
 end
 
 -- Script list + Lua-owned enable buffer.  names: array of strings.
+-- labels (optional): array of DISPLAY strings, index-aligned with names — the
+-- @name/@desc label when a script declared one, else the filename.  The DLL
+-- keeps `names` as the index key (events carry only the index) and renders
+-- `labels`; a pre-labels DLL simply ignores the second export.
 -- The bridge keeps `self._script_enabled_buf` alive (Lua-owned int array).
-function M:set_scripts(names)
+function M:set_scripts(names, labels)
     local push = optional_export("xcom_imgui_set_scripts")
     if not push then return end
     if not names or #names == 0 then
         self._script_enabled_buf = nil
+        self._script_names = nil
+        self._script_labels = nil
         push(nil, nil, 0)
         return
     end
@@ -273,6 +280,14 @@ function M:set_scripts(names)
     self._script_names = names
     local packed = table.concat(names, "\0")
     push(packed, enabled, #names)
+    -- Labels ride a separate export so the set_scripts ABI stays untouched.
+    if labels and #labels == #names then
+        self._script_labels = labels
+        local set_labels = optional_export("xcom_imgui_set_script_labels")
+        if set_labels then
+            set_labels(table.concat(labels, "\0"))
+        end
+    end
     return enabled
 end
 
@@ -357,10 +372,12 @@ function M:scope_configure(opts)
 end
 
 -- Toggle the whole scope panel.  Accepts a bool or an int (0/1); the C-side
--- default is hidden (scope_visible_ = false) until the header "Scope" chip or a
--- script opens it.  Same export as set_scope_visible, provided under the
--- scope_* name for symmetry with scope_push/scope_clear/scope_configure; a
--- no-op on an older DLL.
+-- default is hidden (scope_visible_ = false).  There is no header chip any
+-- more: window.lua drives this from script activity (waveform.active()), so a
+-- script feeding wave.push shows the panel and going quiet hides it.
+-- Same export as set_scope_visible, provided under the scope_* name for
+-- symmetry with scope_push/scope_clear/scope_configure; a no-op on an older
+-- DLL.
 function M:scope_set_visible(visible)
     local push = optional_export("xcom_imgui_scope_set_visible")
     if push then push(visible and 1 or 0) end
