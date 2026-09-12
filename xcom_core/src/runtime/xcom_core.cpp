@@ -794,14 +794,19 @@ struct CoreState {
         }
         // Virtual port: there is no backend to open, so the session is up as
         // soon as this action runs. Publish that as success here because
-        // serial_do_open judges the outcome by last_open_result, and
-        // xcom_open_async pre-sets it to XCOM_ERR_IO — leaving it alone would
-        // make every virtual-port open look like a failure.
+        // serial_do_open judges the outcome by last_open_result, and the open
+        // path pre-sets it to XCOM_ERR_IO — leaving it alone would make every
+        // virtual-port open look like a failure.
+        //
+        // This must NOT return early: the writer start and the callback
+        // admission below are what make the session usable at all. Skipping
+        // them left a virtual port "open" with no writer thread and callbacks
+        // refused, so sends never reached tx_bytes and close(timeout=0) had
+        // nothing in flight to time out on.
         if (core->virtual_port) {
             core->last_open_result.store(XCOM_OK, std::memory_order_release);
-            return;
         }
-        if (!core->virtual_port) {
+        else {
             const SerialPortOptions options{
                 core->port_name.data(), core->cfg_baud, core->cfg_data_bits,
                 core->cfg_stop_bits, core->cfg_parity, core->cfg_flow_control,
