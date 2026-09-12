@@ -15,6 +15,14 @@ namespace {
 
 constexpr std::uint32_t kReadChunkBytes = 4096U;
 
+// Grace period granted to a cancelled read before the read thread gives up and
+// exits. Only armed once stop_requested_ is set, so a healthy session waits
+// indefinitely (zero overhead) and only teardown is bounded. A driver that
+// honours CancelIoEx signals read_event_ well inside this; one that does not
+// (wedge, USB stack stuck mid-IRP) would otherwise hold the read thread — and
+// therefore close()'s join — forever.
+constexpr DWORD kCancelledReadGraceMs = 1500U;
+
 std::wstring utf8_to_wide(std::string_view text)
 {
     if (text.empty()) {
@@ -174,23 +182,18 @@ void WinSerialBackend::close() noexcept
         CancelIoEx(port_.get(), &write_overlapped_);
     }
     if (read_thread_.joinable()) {
-        // Unbounded join. A stalled driver can leave the pending OVERLAPPED
-        // ReadFile neither completing nor honoring CancelIoEx, and then this
-        // blocks until the driver releases the IRP.
+        // Join, bounded in practice rather than in this call: the read loop
+        // arms its own kCancelledReadGraceMs timeout once stop_requested_ is
+        // set, so a driver that ignores CancelIoEx releases the thread instead
+        // of blocking teardown forever. stop_requested_ is already published
+        // above, so the loop cannot re-enter an infinite wait.
         //
-        // We do NOT detach on timeout. The read loop dereferences port_,
-        // read_event_ and read_overlapped_ on every iteration, so a detached
-        // thread would race the resets below and, because the backend is a
-        // by-value member of a static-slot CoreState that destroy() recycles,
-        // would eventually touch freed memory. Making detach safe needs shared
-        // ownership of the backend, which is a larger change than this fix
-        // warrants — so the pre-existing failure mode stands, unpapered-over.
-        //
-        // A bounded WaitForSingleObject probe used to sit here and then join
-        // anyway, which could not prevent the block and only added a syscall
-        // and a 1 s delay to every close on a wedged port. It is gone: a probe
-        // that cannot change the outcome is worse than no probe, because it
-        // reads like protection.
+        // We still do not detach. The read loop dereferences port_,
+        // read_event_ and read_overlapped_ each iteration, and the backend is a
+        // by-value member of a static-slot CoreState that destroy() recycles, so
+        // a still-running thread could touch freed memory. The in-thread timeout
+        // above is what makes the join terminate, without needing shared
+        // ownership.
         read_thread_.join();
     }
     on_read_ = {};
@@ -428,8 +431,28 @@ void WinSerialBackend::read_loop() noexcept
             return;
         }
         const std::array<HANDLE, 2> waits{stop_event_.get(), read_event_.get()};
+        // A healthy session waits indefinitely: the read blocks until the driver
+        // completes it or shutdown signals stop_event_. The bounded wait is
+        // armed only when a close is already in progress, which is the one case
+        // where a driver that ignores CancelIoEx must not be allowed to hold the
+        // thread (and close()'s join) forever. Returning here is safe: the read
+        // thread touches only stack state after this point, so nothing dangles
+        // even though close() is about to reset the handles and the backend.
+        const DWORD wait_timeout = stop_requested_.load(std::memory_order_acquire)
+                                       ? kCancelledReadGraceMs
+                                       : INFINITE;
         const DWORD wait = WaitForMultipleObjects(static_cast<DWORD>(waits.size()),
-                                                   waits.data(), FALSE, INFINITE);
+                                                   waits.data(), FALSE, wait_timeout);
+        if (wait == WAIT_TIMEOUT) {
+            // The driver never released the pending IRP. Record it and let the
+            // thread exit so teardown can proceed; the port is being closed
+            // anyway, so leaving the IRP outstanding costs nothing.
+            if (on_fault_) {
+                on_fault_(static_cast<std::int32_t>(ERROR_OPERATION_ABORTED));
+            }
+            open_.store(false, std::memory_order_release);
+            return;
+        }
         if (wait == WAIT_OBJECT_0 || stop_requested_.load(std::memory_order_acquire)) {
             return;
         }
