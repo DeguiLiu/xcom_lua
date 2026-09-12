@@ -26,6 +26,10 @@
 
 #include "xcom_abi_internal.hpp"
 #include "xcom_core.hpp"
+// enumerate_serial_ports_ex: the ABI-level error/occupancy-aware port lister.
+// Only the function declaration is needed; no Win32 registry type leaks here
+// (xcom_core.hpp already pulls windows.h for the core context).
+#include "serial_backend_win.hpp"
 #include "foundation/text.hpp"
 #include "pal_windows.hpp"
 
@@ -94,6 +98,49 @@ XCOM_API XcomStatus xcom_list_ports(XcomPortInfo* out, uint32_t capacity,
         return xcom::list_ports_impl(out, capacity, count);
     }
     catch (...) {
+        return XCOM_ERR_IO;
+    }
+}
+
+// v1.4 error/occupancy-aware enumeration. Same buffer/count contract as
+// xcom_list_ports, plus:
+//   * `error` (optional) receives the native enumeration status (0 = success).
+//     A missing SERIALCOMM key is "no ports", not an error.
+//   * `flags` may include XCOM_LIST_PORTS_PROBE_BUSY to probe each port for
+//     exclusive occupancy. Default callers MUST pass 0: the probe opens the
+//     port and can disturb an auto-reset target board (see xcom.h).
+// Returns XCOM_ERR_IO when the registry enumeration itself failed (out/count
+// still carry whatever was found so a partial list can be shown), otherwise
+// XCOM_OK / XCOM_ERR_FULL exactly like xcom_list_ports.
+XCOM_API XcomStatus xcom_list_ports_ex(XcomPortInfo* out, uint32_t capacity,
+                                       uint32_t* count, uint32_t flags,
+                                       int32_t* error)
+{
+    try {
+        if (error != nullptr) {
+            *error = 0;
+        }
+        if (count == nullptr || (capacity != 0U && out == nullptr)) {
+            return XCOM_ERR_PARAM;
+        }
+        std::int32_t native_error = 0;
+        const bool probe = (flags & XCOM_LIST_PORTS_PROBE_BUSY) != 0U;
+        const uint32_t found =
+            xcom::enumerate_serial_ports_ex(out, capacity, probe, native_error);
+        *count = found;
+        if (error != nullptr) {
+            *error = native_error;
+        }
+        if (native_error != 0) {
+            return XCOM_ERR_IO;
+        }
+        return found > capacity ? XCOM_ERR_FULL : XCOM_OK;
+    }
+    catch (...) {
+        // Never throw across the boundary and never claim success.
+        if (error != nullptr) {
+            *error = 0;
+        }
         return XCOM_ERR_IO;
     }
 }
@@ -423,6 +470,40 @@ XCOM_API XcomStatus xcom_set_options(XcomHandle hh,
     }
 }
 
+// v1.4: live modem-line hot switch. `dtr`/`rts` are 1 = asserted (physical
+// pin active), 0 = deasserted, matching XcomPortConfig.dtr_enable/rts_enable.
+// Applies immediately while the port is open; returns XCOM_ERR_NOT_OPEN when
+// there is no open physical session, and XCOM_ERR_UNSUPPORTED when RTS/CTS
+// flow control owns the RTS pin (the request is silently ignored rather than
+// fighting the driver).
+XCOM_API XcomStatus xcom_set_lines(XcomHandle hh, uint8_t dtr, uint8_t rts)
+{
+    try {
+        xcom::Handle* h = xcom::xcom_handle_valid(hh) ?
+                              static_cast<xcom::Handle*>(hh) : nullptr;
+        if (h == nullptr) {
+            return XCOM_ERR_PARAM;
+        }
+        xcom::CoreCtx* core = xcom::xcom_handle_core(h);
+        if (core->port_state.load(std::memory_order_acquire) != XCOM_PORT_OPEN) {
+            return XCOM_ERR_NOT_OPEN;
+        }
+        // Refuse the RTS half up front under RTS/CTS so the caller gets a
+        // deterministic UNSUPPORTED rather than a driver-dependent silence.
+        if (rts != 0U && core->cfg_flow_control == 1U) {
+            return XCOM_ERR_UNSUPPORTED;
+        }
+        if (core->sink.owner_set_lines == nullptr ||
+            !core->sink.owner_set_lines(core, dtr != 0U, rts != 0U)) {
+            return XCOM_ERR_NOT_OPEN;   // virtual session: no physical pin
+        }
+        return XCOM_OK;
+    }
+    catch (...) {
+        return XCOM_ERR_IO;
+    }
+}
+
 // v1.1: configure the auto-send template. data is pre-encoded raw bytes; the
 // core copies it into a dedicated template slot before returning. interval_ms
 // == 0 disables auto-send. flags uses XCOM_SEND_TEXT (HEX/CRLF are pre-applied
@@ -546,6 +627,22 @@ XCOM_API XcomStatus xcom_get_snapshot(XcomHandle hh, XcomSnapshot* output)
         output->port_state = core->port_state.load(std::memory_order_relaxed);
         output->_pad[0] = 0U;
         output->_pad[1] = 0U;
+        // v1.5 line-error counters (appended fields; see XcomSnapshot).
+        output->framing_errors =
+            core->metrics.framing_errors.load(std::memory_order_relaxed);
+        output->parity_errors =
+            core->metrics.parity_errors.load(std::memory_order_relaxed);
+        output->overrun_errors =
+            core->metrics.overrun_errors.load(std::memory_order_relaxed);
+        output->break_events =
+            core->metrics.break_events.load(std::memory_order_relaxed);
+        // v1.5 loss observability (appended fields; see XcomSnapshot).
+        output->rx_sequence =
+            core->metrics.rx_seq.load(std::memory_order_relaxed);
+        output->rx_loss_offset =
+            core->metrics.rx_loss_offset.load(std::memory_order_relaxed);
+        output->rx_backpressure_events =
+            core->metrics.rx_backpressure_events.load(std::memory_order_relaxed);
         return XCOM_OK;
     }
     catch (...) {
@@ -740,6 +837,33 @@ XCOM_API XcomStatus xcom_test_inject_rx(XcomHandle hh, const uint8_t* data,
                        xcom::RxIngressResult::kAllAccepted
                    ? XCOM_OK
                    : XCOM_ERR_IO;
+    }
+    catch (...) {
+        return XCOM_ERR_IO;
+    }
+}
+
+XCOM_API XcomStatus xcom_test_inject_line_errors(XcomHandle hh, uint32_t framing,
+                                                 uint32_t parity, uint32_t overrun,
+                                                 uint32_t break_events)
+{
+    try {
+        xcom::Handle* h = xcom::xcom_handle_valid(hh) ?
+                              static_cast<xcom::Handle*>(hh) : nullptr;
+        if (h == nullptr) {
+            return XCOM_ERR_PARAM;
+        }
+        xcom::CoreCtx* core = xcom::xcom_handle_core(h);
+        if (core->port_state.load(std::memory_order_acquire) != XCOM_PORT_OPEN) {
+            return XCOM_ERR_NOT_OPEN;
+        }
+        // Routed through the same ingress the serial read callback uses, so the
+        // accumulation/milestone-diag semantics under test are the production
+        // ones. hold_events is left to the real ClearCommError path (a hold is
+        // sampled from COMSTAT, not something the test seam can fabricate).
+        xcom::line_status_ingress(core, framing, parity, overrun, break_events,
+                                  0U);
+        return XCOM_OK;
     }
     catch (...) {
         return XCOM_ERR_IO;

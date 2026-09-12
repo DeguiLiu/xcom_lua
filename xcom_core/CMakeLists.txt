@@ -128,6 +128,58 @@ if(BUILD_TESTING)
     add_test(NAME xcom.async_open COMMAND xcom_async_open_test)
 endif()
 
+add_executable(xcom_line_control_test tests/line_control_test.cpp)
+target_compile_features(xcom_line_control_test PRIVATE cxx_std_17)
+target_include_directories(xcom_line_control_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_definitions(xcom_line_control_test PRIVATE
+    WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS)
+target_link_libraries(xcom_line_control_test PRIVATE xcom_core)
+set_target_properties(xcom_line_control_test PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+if(BUILD_TESTING)
+    add_test(NAME xcom.line_control COMMAND xcom_line_control_test)
+endif()
+
+# v1.5 line-error accounting contract. No serial hardware: the counts are
+# injected through the TEST-ONLY seam and read back through the public
+# snapshot ABI, covering the struct layout, monotonic accumulation, and the
+# metrics reset-free semantics the real ClearCommError path relies on.
+add_executable(xcom_line_error_test tests/line_error_test.cpp)
+target_compile_features(xcom_line_error_test PRIVATE cxx_std_17)
+target_include_directories(xcom_line_error_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_definitions(xcom_line_error_test PRIVATE
+    WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS)
+target_link_libraries(xcom_line_error_test PRIVATE xcom_core)
+set_target_properties(xcom_line_error_test PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+if(BUILD_TESTING)
+    add_test(NAME xcom.line_error COMMAND xcom_line_error_test)
+endif()
+
+# TX teardown drain + flow-control stall diagnosis. Compiles the backend TU
+# directly (not via the DLL) so the guard paths and the header-inline message
+# mapping are reachable without the exported C ABI.
+add_executable(xcom_tx_diag_test
+    tests/tx_diag_test.cpp
+    src/io/serial_backend_win.cpp
+    src/foundation/unique_handle.cpp)
+target_compile_features(xcom_tx_diag_test PRIVATE cxx_std_17)
+target_include_directories(xcom_tx_diag_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/io
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/foundation)
+target_compile_definitions(xcom_tx_diag_test PRIVATE
+    WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS)
+target_link_libraries(xcom_tx_diag_test PRIVATE advapi32)
+set_target_properties(xcom_tx_diag_test PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+if(BUILD_TESTING)
+    add_test(NAME xcom.tx_diag COMMAND xcom_tx_diag_test)
+endif()
+
 add_executable(xcom_windows_pal_test
     tests/windows_pal_test.cpp
     src/runtime/pal_windows.cpp

@@ -28,6 +28,24 @@
  *  - Added xcom_open_async + xcom_take_open_result so the LuaJIT client can
  *    move the ~2 s blocking open off its single message-loop thread.  The
  *    synchronous xcom_open remains byte-for-byte compatible.
+ *
+ * v1.4 (2026-09-13):
+ *  - Added xcom_set_lines for live DTR/RTS hot switching (1 = asserted).
+ *    open() now pins the requested levels with EscapeCommFunction instead of
+ *    trusting the driver-dependent DCB DISABLE value.
+ *
+ * v1.5 (2026-09-13):
+ *  - Read-loop line-error monitoring: ClearCommError is now called after each
+ *    completed read, surfacing driver receive faults (CE_FRAME/CE_RXPARITY/
+ *    CE_RXOVER|CE_OVERRUN/CE_BREAK) that were previously discarded silently.
+ *    XcomSnapshot gains four monotonic counters appended AFTER the v1.4 fields
+ *    (existing offsets unchanged; struct_size drives compatibility). Added the
+ *    TEST-ONLY xcom_test_inject_line_errors seam so the counting contract is
+ *    verifiable without serial hardware.
+ *  - Receive-loss observability: XcomSnapshot gains rx_sequence, rx_loss_offset
+ *    and rx_backpressure_events (appended after the line-error counters) so the
+ *    client can show WHERE in the accepted stream a loss occurred and warn
+ *    before the driver FIFO overruns.
  */
 #ifndef XCOM_H_
 #define XCOM_H_
@@ -49,7 +67,7 @@ extern "C" {
 #endif
 
 #define XCOM_VERSION_MAJOR 1
-#define XCOM_VERSION_MINOR 3
+#define XCOM_VERSION_MINOR 5
 #define XCOM_VERSION_PATCH 0
 
 /* ---------------------------------------------------------------------------
@@ -155,6 +173,26 @@ typedef struct XcomSnapshot {
   uint32_t display_pending;        /* >0: more display batches are buffered */
   uint16_t port_state;             /* XCOM_PORT_* */
   uint8_t  _pad[2];
+  /* v1.5 line-error counters (ClearCommError), appended AFTER every v1.0..v1.4
+   * field so their offsets are unchanged. Monotonic across sessions, like the
+   * other counters. ClearCommError returns a latched bitmask rather than
+   * counts, so each completed read contributes at most 1 per category. */
+  uint32_t framing_errors;         /* CE_FRAME: stop-bit / framing fault */
+  uint32_t parity_errors;          /* CE_RXPARITY: parity mismatch */
+  uint32_t overrun_errors;         /* CE_RXOVER | CE_OVERRUN: driver RX overflow */
+  uint32_t break_events;           /* CE_BREAK: break condition on the line */
+  /* v1.5 loss-observability counters (appended AFTER the line-error block so
+   * every previous offset is unchanged; struct_size drives compatibility).
+   * rx_sequence is the monotonic count of committed Rx blocks; rx_loss_offset
+   * is the accepted-byte offset at which the most recent receive loss (pool
+   * drop or driver overrun) was observed, so a gap can be located in the
+   * received stream. rx_backpressure_events counts episodes where the live
+   * read callback found every Rx block in use and withheld reads: no bytes are
+   * lost on that path, but a rising count is the host-side early warning that
+   * the driver FIFO is what fills next (and then overruns, overrun_errors). */
+  uint32_t rx_sequence;
+  uint32_t rx_loss_offset;
+  uint32_t rx_backpressure_events;
 } XcomSnapshot;
 
 enum {
@@ -182,9 +220,24 @@ typedef struct XcomError {
 typedef struct XcomPortInfo {
   char     name[64];          /* "COM3" */
   char     description[256];  /* friendly name if available */
-  uint8_t  busy;              /* 1 = currently open by another handle */
+  uint8_t  busy;              /* 1 = currently open by another handle.
+                               * Only ever set when xcom_list_ports_ex is called
+                               * with XCOM_LIST_PORTS_PROBE_BUSY; the legacy
+                               * xcom_list_ports leaves it 0. */
   uint8_t  _pad[3];
 } XcomPortInfo;
+
+/* Flags for xcom_list_ports_ex. */
+enum {
+  /* Probe each port for exclusive occupancy: CreateFileW with share mode 0 is
+   * attempted and the handle immediately closed, without SetCommState /
+   * EscapeCommFunction / any I/O, so no DCB is programmed and no DTR/RTS IOCTL
+   * is issued. A port that fails with ERROR_ACCESS_DENIED is reported busy.
+   * NOTE: a plain open still delivers an open IRP, and a few USB-UART drivers
+   * assert DTR on open; leave this flag off on boards with an auto-reset circuit
+   * that must not be disturbed during enumeration. */
+  XCOM_LIST_PORTS_PROBE_BUSY = 0x1u,
+};
 
 /* ---------------------------------------------------------------------------
  * ABI functions
@@ -244,6 +297,15 @@ XCOM_API XcomStatus xcom_send(XcomHandle h, const uint8_t* data,
  * subsequent blocks only; never reformats history. */
 XCOM_API XcomStatus xcom_set_options(XcomHandle h,
                                      const XcomDisplayOptions* options);
+
+/* v1.4 live modem-line control.  dtr/rts are 1 = asserted (physical pin
+ * active), 0 = deasserted; the same sense as XcomPortConfig.dtr_enable /
+ * rts_enable.  Applied immediately with EscapeCommFunction on an open port so
+ * the pin level is deterministic, unlike the driver-dependent DCB DISABLE
+ * value.  Returns XCOM_ERR_NOT_OPEN when no physical session is open, and
+ * XCOM_ERR_UNSUPPORTED when RTS/CTS flow control is active (the driver owns
+ * RTS and the request is ignored, not fought). */
+XCOM_API XcomStatus xcom_set_lines(XcomHandle h, uint8_t dtr, uint8_t rts);
 
 /* Configure auto-send template.  data is the pre-encoded payload (same
  * synchronous-copy / queue-and-return contract as xcom_send; the core copies
@@ -357,6 +419,15 @@ XCOM_API void xcom_destroy(XcomHandle h);
  * without serial hardware.  Returns XCOM_ERR_NOT_OPEN when no session. */
 XCOM_API XcomStatus xcom_test_inject_rx(XcomHandle h, const uint8_t* data,
                                         uint32_t size);
+
+/* v1.5 TEST-ONLY seam: add classified serial line-error counts exactly as the
+ * Win32 read loop's ClearCommError path would, so the accounting and snapshot
+ * contract can be regression-tested without serial hardware.  The four values
+ * are increments, not totals.  Returns XCOM_ERR_NOT_OPEN when no session is
+ * open (line errors only exist on a live receive path). */
+XCOM_API XcomStatus xcom_test_inject_line_errors(XcomHandle h, uint32_t framing,
+                                                 uint32_t parity, uint32_t overrun,
+                                                 uint32_t break_events);
 
 /* NOTE (v1.1 ABI removal): there is deliberately NO exported xcom_wait_display.
  * The Python side must NOT wait on a Win32 HANDLE.  CoreWorker polls
