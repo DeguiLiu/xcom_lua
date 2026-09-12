@@ -65,6 +65,7 @@ std::string_view diag_event_name(uint16_t event_id) noexcept
     case DiagEvent::kDiagTick:  return "DIAG_TICK";
     case DiagEvent::kDiagStart: return "DIAG_START";
     case DiagEvent::kDiagRotate:return "DIAG_ROTATE";
+    case DiagEvent::kLineError: return "LINE_ERROR";
     }
     return "UNKNOWN";
 }
@@ -304,6 +305,9 @@ struct DiagnosticWriter::Impl {
             return;
         case DiagEvent::kDiagRotate:
             logger.record<LogLevel::kWarn, 11>(source, a0);
+            return;
+        case DiagEvent::kLineError:
+            logger.record<LogLevel::kWarn, 12>(source, a0, a1, a2, a3);
             return;
         }
     }

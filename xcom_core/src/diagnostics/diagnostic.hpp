@@ -40,6 +40,12 @@ enum class DiagEvent : uint16_t {
     kDiagTick = 9,     // periodic heartbeat snapshot (DiagnosticAo)
     kDiagStart = 10,   // writer started / configured
     kDiagRotate = 11,  // file rotated on size bound
+    // ClearCommError line-error counters (framing / parity / overrun / break).
+    // Distinct from kRxDrop: that record means WE dropped bytes (pool
+    // overflow), while this one means the DRIVER already lost them before we
+    // ever saw them — a different cause with different remedies (lower baud,
+    // enable flow control, shorten the cable).
+    kLineError = 12,
 };
 
 struct CoreCtx;
