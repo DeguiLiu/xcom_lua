@@ -231,3 +231,31 @@ jobs:
 
       - name: Parse serial / ABI translation units
         run: tools/check_cpp_syntax.sh
+
+  # ---------------------------------------------------------------------------
+  # Executes the hardware-free C++ suites that no other job can run. They are
+  # registered under if(NOT WIN32) in xcom_core/CMakeLists.txt (they supply fake
+  # Win32 definitions that would collide with the real import library on
+  # Windows), and the root CMakeLists.txt aborts on a non-Windows host - so the
+  # Windows job skips them and a Linux `ctest` cannot even configure. Until this
+  # job existed they were parsed by the syntax gate but never executed by
+  # anything: the close/reap race, the gate-latch, the short-write continuation
+  # and the pin-write contract regressions all lived in tests no CI run ran.
+  # ---------------------------------------------------------------------------
+  host-cpp-tests:
+    name: Host C++ tests (Linux + win32 stub)
+    runs-on: ubuntu-latest
+    env:
+      XCOM_COACT_ROOT: ${{ github.workspace }}/coact
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check out coact at the pinned revision
+        uses: actions/checkout@v4
+        with:
+          repository: DeguiLiu/coact
+          ref: ${{ env.COACT_REF }}
+          path: coact
+
+      - name: Build and run the host-only suites
+        run: tools/run_host_cpp_tests.sh

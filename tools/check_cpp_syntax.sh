@@ -102,15 +102,17 @@ TUS=(
     xcom_core/tests/windows_pal_test.cpp
     # Host-only suites, which CMake cannot reach: the root CMakeLists aborts on a
     # non-Windows host, and on Windows these targets are skipped because they
-    # need the Win32 stub. Parsing them here is the only thing that stops them
-    # from rotting between the rare manual runs. The P0-1 gate-latch and P1-1
-    # reap-before-return regressions live in the first two.
+    # need the Win32 stub. The P0-1 gate-latch and P1-1 reap-before-return
+    # regressions live in the first two. Parsing them here catches type drift;
+    # tools/run_host_cpp_tests.sh is what actually EXECUTES them on every CI run.
     xcom_core/tests/rx_kick_gate_test.cpp
     xcom_core/tests/serial_close_reap_test.cpp
     xcom_core/tests/open_failure_status_test.cpp
     xcom_core/tests/fault_latch_reconcile_test.cpp
     xcom_core/tests/rx_reject_count_test.cpp
     xcom_core/tests/open_pin_warning_test.cpp
+    xcom_core/tests/serial_short_write_test.cpp
+    xcom_core/tests/log_writer_shutdown_test.cpp
 )
 
 fail=0
