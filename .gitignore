@@ -91,3 +91,21 @@ xcom_lua/bytecode/
 # compiled .wixobj into obj/. Neither is source.
 xcom_lua/installer/obj/
 xcom_lua/installer/files.wxs
+
+# Upstream scaffolding accidentally cloned into the vendored implot directory.
+# The build uses only implot.cpp / implot_items.cpp (both tracked); example/,
+# implot_demo.cpp, the upstream .github/ and README are not part of the vendor
+# set. The nested .git/ in particular must never be committed: it turns the
+# directory into an embedded repository and confuses submodule handling.
+third_party/xcom_imgui/implot/.git/
+third_party/xcom_imgui/implot/.github/
+third_party/xcom_imgui/implot/.gitignore
+third_party/xcom_imgui/implot/README.md
+third_party/xcom_imgui/implot/TODO.md
+third_party/xcom_imgui/implot/example/
+third_party/xcom_imgui/implot/implot_demo.cpp
+
+# Reference screenshots and per-session verification captures. pic/1.png is the
+# visual baseline the UI is checked against; the _*.png files are throwaway
+# captures from individual review passes. None are build inputs.
+pic/
