@@ -1,0 +1,117 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  XCOM installer.
+
+  Layout mirrors the portable zip: the staged tree under $(var.SourceDir) is
+  installed whole, so an MSI install and a zip extraction produce the same
+  directory. Shortcuts point at runtime\xcom.exe, which is the real launcher
+  (the root of the zip has no xcom.exe of its own).
+
+  Machine-wide install under Program Files (perMachine, UAC prompt on install).
+
+  config.ini ships as the default. Because the app writes user files next to
+  itself (imgui.ini, logs, edited scripts), uninstall removes the install root
+  only when it is empty, so a user who edited scripts/ does not lose them.
+-->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+
+  <Product Id="*"
+           Name="XCOM 串口调试工具"
+           Language="2052"
+           Version="$(var.ProductVersion)"
+           Manufacturer="Degui Liu"
+           UpgradeCode="7F3A9C41-5B62-4E18-9D74-2C8EA6B10F53">
+
+    <Package Id="*"
+             InstallerVersion="500"
+             Compressed="yes"
+             InstallScope="perMachine"
+             Description="XCOM serial port debug tool $(var.ProductVersion)"
+             Comments="LuaJIT + Dear ImGui serial console" />
+
+    <!-- One installed version at a time; upgrade replaces in place. -->
+    <MajorUpgrade DowngradeErrorMessage="已安装更高版本的 XCOM。请先卸载后再安装此版本。"
+                  AllowSameVersionUpgrades="yes" />
+
+    <MediaTemplate EmbedCab="yes" />
+
+    <!-- Windows 10 1607+; the runtime needs the VC143 CRT we bundle ourselves. -->
+    <Condition Message="此安装程序需要 Windows 10 或更高版本。">
+      <![CDATA[Installed OR (VersionNT >= 603)]]>
+    </Condition>
+
+    <Property Id="ARPPRODUCTICON" Value="XcomIcon" />
+    <Property Id="ARPHELPLINK" Value="https://github.com/DeguiLiu/xcom_lua" />
+    <Property Id="WIXUI_INSTALLDIR" Value="INSTALLFOLDER" />
+
+    <Icon Id="XcomIcon" SourceFile="$(var.SourceDir)\runtime\xcom.ico" />
+
+    <!-- ===================== directories ===================== -->
+
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="ProgramFiles64Folder">
+        <Directory Id="INSTALLFOLDER" Name="XCOM" />
+      </Directory>
+      <Directory Id="ProgramMenuFolder">
+        <Directory Id="AppMenuFolder" Name="XCOM" />
+      </Directory>
+      <Directory Id="DesktopFolder" />
+    </Directory>
+
+    <!-- ===================== shortcuts ===================== -->
+
+    <DirectoryRef Id="AppMenuFolder">
+      <Component Id="StartMenuShortcut" Guid="A1E4C7D2-9F35-4B8A-8C61-5D2E70B4F938">
+        <Shortcut Id="StartMenuLink"
+                  Name="XCOM 串口调试工具"
+                  Description="XCOM serial port debug tool"
+                  Target="[INSTALLFOLDER]runtime\xcom.exe"
+                  WorkingDirectory="INSTALLFOLDER"
+                  Icon="XcomIcon" />
+        <RemoveFolder Id="RemoveAppMenuFolder" On="uninstall" />
+        <RegistryValue Root="HKCU" Key="Software\XCOM\Installer"
+                       Name="StartMenu" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+
+    <DirectoryRef Id="DesktopFolder">
+      <Component Id="DesktopShortcut" Guid="C8B14E77-3D62-4A09-B5F1-6E84A2C7D310">
+        <Shortcut Id="DesktopLink"
+                  Name="XCOM 串口调试工具"
+                  Description="XCOM serial port debug tool"
+                  Target="[INSTALLFOLDER]runtime\xcom.exe"
+                  WorkingDirectory="INSTALLFOLDER"
+                  Icon="XcomIcon" />
+        <RegistryValue Root="HKCU" Key="Software\XCOM\Installer"
+                       Name="Desktop" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+
+    <!-- Uninstall cleanup for the install root.
+
+         RemoveFolder deletes the folder only when it is empty, so a user who
+         edited scripts/ or kept logs will not lose them - the folder simply
+         stays behind with their files in it. The RemoveFile entries name the
+         two files the app generates on first run, which is what ICE64 asks for
+         given the root sits under the user profile. -->
+    <DirectoryRef Id="INSTALLFOLDER">
+      <Component Id="InstallRootCleanup" Guid="E5D9021A-7C48-4F53-9B6E-3A1F84D27C05">
+        <RemoveFolder Id="RemoveInstallRoot" On="uninstall" />
+        <RemoveFile Id="RemoveImguiIni" Name="imgui.ini" On="uninstall" />
+        <RemoveFile Id="RemoveDiagLog" Name="xcom_diag.log" On="uninstall" />
+        <RegistryValue Root="HKCU" Key="Software\XCOM\Installer"
+                       Name="InstallRoot" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+
+    <Feature Id="MainFeature" Title="XCOM" Level="1" Absent="disallow"
+             Description="XCOM serial port debug tool">
+      <ComponentGroupRef Id="XcomFiles" />
+      <ComponentRef Id="StartMenuShortcut" />
+      <ComponentRef Id="DesktopShortcut" />
+      <ComponentRef Id="InstallRootCleanup" />
+    </Feature>
+
+    <UIRef Id="WixUI_InstallDir" />
+  </Product>
+</Wix>

@@ -84,3 +84,10 @@ ui_current.png
 # hypothetical — the committed bytecode/ui/window.ljbc still carried the
 # pre-fix FRAME_INTERVAL_* global reads long after the source was corrected.
 xcom_lua/bytecode/
+
+# WiX build outputs. build_msi.ps1 regenerates files.wxs with heat.exe on every
+# run (the component GUIDs are deterministic, so the file is reproducible, but
+# it is derived from the staged tree rather than hand-maintained) and writes the
+# compiled .wixobj into obj/. Neither is source.
+xcom_lua/installer/obj/
+xcom_lua/installer/files.wxs
