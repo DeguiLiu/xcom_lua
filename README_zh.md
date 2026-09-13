@@ -77,3 +77,5 @@ runtime\xcom.exe               # 打包启动器（main.ljbc，无控制台）
 `xcom.exe` 优先 `main.ljbc`，回退 `main.lua`；设 `XCOM_CORE_DLL` 可指定核心 DLL。
 
 设计文档见 `docs/architecture.md`（架构）与 `docs/design-summary.md`（概要设计）。
+想了解 LuaJIT + C++ 的分工、插件模型与「接收不丢数据」的实现，见
+`docs/technical-overview.md`（技术白皮书）。
