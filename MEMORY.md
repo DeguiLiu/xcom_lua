@@ -2,7 +2,7 @@
 
 本文记录 `SSCOM_lua` 工程中可复用的 C++17 约束、性能原则和设计模式。内容分为两部分：
 
-1. `xcom_core/framework/coact` 的实时核心基线。
+1. coact 实时核心基线（外部 checkout `../coact`，`windows` 分支）。
 2. `xcom_lua/native/xcom_imgui` 桥接层已经采用的 UI 结构。
 
 ## C++17 特性
@@ -154,11 +154,11 @@
 
 ## 相关入口
 
-- `xcom_core/framework/coact/include/coact/pool.hpp`
-- `xcom_core/framework/coact/include/coact/expected.hpp`
-- `xcom_core/framework/coact/include/coact/hsm.hpp`
-- `xcom_core/framework/coact/include/coact/ao.hpp`
-- `xcom_core/framework/coact/include/coact/policy.hpp`
+- `../coact/include/coact/pool.hpp`
+- `../coact/include/coact/expected.hpp`
+- `../coact/include/coact/hsm.hpp`
+- `../coact/include/coact/ao.hpp`
+- `../coact/include/coact/policy.hpp`
 - `xcom_lua/native/xcom_imgui/xcom_imgui_bridge.cpp`
 - `xcom_lua/native/xcom_imgui/layout.toml`
 

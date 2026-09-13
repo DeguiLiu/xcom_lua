@@ -75,3 +75,12 @@ ui_current.png
 *.docx
 *.xlsx
 *.pptx
+
+# Generated Lua bytecode for the bytecode-only run/release layout.
+# xcom_lua/build_bytecode.ps1 writes it here by default and the release build
+# always rebuilds it into the package, so it is a build output, not source.
+# It must not be committed: main.lua's package.path lists .ljbc BEFORE .lua, so
+# a stale checked-in copy silently shadows the current source. That is not
+# hypothetical — the committed bytecode/ui/window.ljbc still carried the
+# pre-fix FRAME_INTERVAL_* global reads long after the source was corrected.
+xcom_lua/bytecode/

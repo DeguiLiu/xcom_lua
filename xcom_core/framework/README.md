@@ -1,16 +1,19 @@
 # XCOM C++ Frameworks
 
-This directory contains reusable, project-owned C++ frameworks.  It is kept
-separate from `../src`: that tree implements XCOM's ABI, serial backend, file
-writer and product-specific Active Objects.
+XCOM consumes the coact event runtime from an **external checkout**, not from a
+vendored copy in this tree. The `windows` branch of that checkout carries the
+Win32 PAL adapter XCOM needs.
 
-`coact/` is the only event runtime used by XCOM.  Its fixed pools, bounded
-queues, Dispatcher and HSM are framework code; the XCOM Windows PAL adapter is
-compiled by the product core from `../src/runtime` and implements coact's PAL
-contract.  Keeping the two boundaries explicit prevents a product helper from
-becoming a second scheduler or queue implementation.
+The include root is resolved by the `XCOM_COACT_ROOT` cache variable (default
+`../../coact` relative to `xcom_core/`, i.e. `<workspace>/coact`); see
+`xcom_core/CMakeLists.txt` and `tools/check_cpp_syntax.sh`. XCOM includes only
+`coact/include` and does not add coact's standalone test or example CMake
+project to the product build.
 
-The complete coact source, tests and design material remain together so changes
-to its concurrency primitives can be reviewed and tested at the framework
-boundary.  XCOM includes only `coact/include` and does not add coact's standalone
-test or example CMake project to the product build.
+XCOM's own C++ stays in `../src`: the versioned ABI, the Win32 serial backend,
+the file writer and the product-specific Active Objects. The Windows PAL is the
+one coact ships on its `windows` branch — the product compiles coact's own
+`src/core/pal_windows.cpp` rather than carrying a second implementation, and
+binds it to a real `SpinCriticalSection` because irq masking is a no-op on an
+SMP host. Keeping the boundary explicit prevents a product helper from becoming
+a second scheduler or queue implementation.
