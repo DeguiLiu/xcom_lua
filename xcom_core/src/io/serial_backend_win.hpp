@@ -290,6 +290,14 @@ public:
     // with the kLineStatus* bits sampled from the port's COMSTAT *before* the
     // failed transmit is cancelled, so the caller can name the stall cause; on
     // any other outcome it is set to 0.
+    //
+    // Contract: returns true only when all `size` bytes were accepted by the
+    // driver. A short WriteFile completion is continued (the unwritten tail is
+    // re-issued from where the driver stopped) until the whole buffer is out or
+    // a genuine error / the bounded retry stops it. On false, `written` is the
+    // exact number of bytes that DID reach the driver (0 <= written < size), so
+    // a truncated frame is reported, never silently dropped; `error` carries
+    // the real Win32 cause.
     [[nodiscard]] bool write(const std::uint8_t* data, std::uint16_t size,
                              std::uint32_t timeout_ms, std::uint32_t& written,
                              std::int32_t& error,

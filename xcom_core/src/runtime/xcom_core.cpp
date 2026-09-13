@@ -1025,8 +1025,30 @@ struct CoreState {
         if (!state->serial_backend.write(core->tx.block(block), len,
                                          compute_write_timeout_ms(core->cfg_baud),
                                          written, error, &line_status)) {
-            core->errors.push(error != kSerialSuccess ? error : XCOM_ERR_IO,
-                              2U, describe_write_failure(error, line_status));
+            // The backend stops at the first genuine failure but reports in
+            // `written` exactly how many bytes reached the driver before it. A
+            // short write is therefore NOT discarded: account the bytes the
+            // device did receive and name the truncation, so a half frame is
+            // visible rather than inferred from a bare "write failed".
+            if (written != 0U) {
+                core->metrics.tx_bytes.fetch_add(written,
+                                                 std::memory_order_relaxed);
+            }
+            const char* const reason =
+                describe_write_failure(error, line_status);
+            if (written != 0U && written < len) {
+                std::array<char, 160U> message{};
+                std::snprintf(message.data(), message.size(),
+                              "%s (truncated: %u of %u bytes sent)", reason,
+                              static_cast<unsigned>(written),
+                              static_cast<unsigned>(len));
+                core->errors.push(error != kSerialSuccess ? error : XCOM_ERR_IO,
+                                  2U, message.data());
+            }
+            else {
+                core->errors.push(error != kSerialSuccess ? error : XCOM_ERR_IO,
+                                  2U, reason);
+            }
             *result = XCOM_ERR_IO;
             // Escalate a dead port instead of leaving port_state OPEN while
             // every later send also fails against a stale handle:

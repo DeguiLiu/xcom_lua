@@ -34,6 +34,16 @@ namespace {
 
 constexpr std::uint32_t kReadChunkBytes = 4096U;
 
+// Outer bound on the short-write retry loop in write(). A serial WriteFile is
+// expected to complete with the whole request (or fail); a shorter completion is
+// a driver/filter anomaly, and the unwritten tail must be re-issued rather than
+// dropped. Each retry below must make progress (at least one byte), so the loop
+// is already bounded by `size`; this cap additionally stops a pathological
+// driver that dribbles a byte per completion from holding the writer for up to
+// `size` rounds. Exhaustion is reported as a real failure carrying the count
+// that did go out, never a silent truncation.
+constexpr std::uint32_t kMaxWriteIterations = 8U;
+
 // Grace period granted to a cancelled read before the read thread gives up and
 // exits. Only armed once stop_requested_ is set, so a healthy session waits
 // indefinitely (zero overhead) and only teardown is bounded. A driver that
@@ -287,46 +297,108 @@ bool WinSerialBackend::write(const std::uint8_t* data, std::uint16_t size,
         error = ERROR_INVALID_PARAMETER;
         return false;
     }
-    ResetEvent(write_event_.get());
-    DWORD native_written = 0U;
-    if (WriteFile(port_.get(), data, size, &native_written, &write_overlapped_) != FALSE) {
-        written = native_written;
-        return written == size;
-    }
-    const DWORD pending_error = GetLastError();
-    if (pending_error != ERROR_IO_PENDING) {
-        error = static_cast<std::int32_t>(pending_error);
-        return false;
-    }
-    write_in_flight_.store(true, std::memory_order_release);
-    const DWORD wait = WaitForSingleObject(write_event_.get(), timeout_ms);
-    if (wait != WAIT_OBJECT_0) {
-        // Gap B: sample COMSTAT before cancelling, while the port still reflects
-        // the stall. fCtsHold/fXoffHold tell "peer not ready / peer paused"
-        // apart from a genuinely full TX path, instead of reporting a bare
-        // ERROR_TIMEOUT the UI cannot explain.
-        if (wait == WAIT_TIMEOUT) {
-            capture_line_status(line_status);
+    // Continue a SHORT transfer instead of discarding its tail. A serial
+    // WriteFile normally completes with the whole request (or fails outright);
+    // a driver/filter can still complete it early. Re-issue from exactly where
+    // the driver stopped until the whole buffer is out, a genuine error stops
+    // us, or a driver accepts nothing (no-progress/retry cap - both are reported
+    // with the exact byte count that reached the device). `written` therefore
+    // always reflects reality: size on success, the true partial count on
+    // failure. `timeout_ms` is per attempt, matching the previous single-write
+    // semantics; it is not multiplied by the retry cap because each retry
+    // requires forward progress.
+    std::uint32_t total = 0U;
+    for (std::uint32_t iteration = 0U; iteration < kMaxWriteIterations;
+         ++iteration) {
+        const std::uint8_t* const chunk = data + total;
+        const DWORD chunk_size = static_cast<DWORD>(size - total);
+        ResetEvent(write_event_.get());
+        // The OS owns Internal/InternalHigh/Offset/OffsetHigh for each pending
+        // operation; re-arm them per attempt (hEvent is preserved) exactly as
+        // read_loop does, so a stale value from the previous attempt cannot leak
+        // into the next WriteFile.
+        write_overlapped_.Internal = 0UL;
+        write_overlapped_.InternalHigh = 0UL;
+        write_overlapped_.Offset = 0UL;
+        write_overlapped_.OffsetHigh = 0UL;
+        DWORD native_written = 0U;
+        if (WriteFile(port_.get(), chunk, chunk_size, &native_written,
+                      &write_overlapped_) != FALSE) {
+            // A completion must not claim more than was requested; clamping
+            // keeps `total` from overrunning `size` and underflowing the next
+            // chunk size.
+            if (native_written > chunk_size) {
+                native_written = chunk_size;
+            }
+            total += native_written;
+            if (total >= size) {
+                written = total;
+                return true;
+            }
+            if (native_written == 0U) {
+                // WriteFile claimed success but accepted nothing. Retrying
+                // cannot make progress, so stop and report the bytes that did
+                // go out rather than spinning.
+                written = total;
+                error = ERROR_WRITE_FAULT;
+                return false;
+            }
+            continue;
         }
-        CancelIoEx(port_.get(), &write_overlapped_);
-        static_cast<void>(WaitForSingleObject(write_event_.get(), 200U));
-        error = wait == WAIT_TIMEOUT ? ERROR_TIMEOUT : static_cast<std::int32_t>(GetLastError());
+        const DWORD pending_error = GetLastError();
+        if (pending_error != ERROR_IO_PENDING) {
+            // Genuine failure, possibly after part of the buffer already
+            // reached the driver: report the real cause and the exact count.
+            written = total;
+            error = static_cast<std::int32_t>(pending_error);
+            return false;
+        }
+        write_in_flight_.store(true, std::memory_order_release);
+        const DWORD wait = WaitForSingleObject(write_event_.get(), timeout_ms);
+        if (wait != WAIT_OBJECT_0) {
+            // Gap B: sample COMSTAT before cancelling, while the port still
+            // reflects the stall. fCtsHold/fXoffHold tell "peer not ready / peer
+            // paused" apart from a genuinely full TX path, instead of reporting
+            // a bare ERROR_TIMEOUT the UI cannot explain.
+            if (wait == WAIT_TIMEOUT) {
+                capture_line_status(line_status);
+            }
+            CancelIoEx(port_.get(), &write_overlapped_);
+            static_cast<void>(WaitForSingleObject(write_event_.get(), 200U));
+            error = wait == WAIT_TIMEOUT ? ERROR_TIMEOUT
+                                         : static_cast<std::int32_t>(GetLastError());
+            write_in_flight_.store(false, std::memory_order_release);
+            written = total;
+            return false;
+        }
+        const BOOL reaped =
+            GetOverlappedResult(port_.get(), &write_overlapped_, &native_written, FALSE);
         write_in_flight_.store(false, std::memory_order_release);
-        return false;
+        if (reaped == FALSE) {
+            error = static_cast<std::int32_t>(GetLastError());
+            written = total;
+            return false;
+        }
+        if (native_written > chunk_size) {
+            native_written = chunk_size;
+        }
+        total += native_written;
+        if (total >= size) {
+            written = total;
+            return true;
+        }
+        if (native_written == 0U) {
+            // Same no-progress rule for an overlapped completion.
+            written = total;
+            error = ERROR_WRITE_FAULT;
+            return false;
+        }
     }
-    const BOOL reaped =
-        GetOverlappedResult(port_.get(), &write_overlapped_, &native_written, FALSE);
-    write_in_flight_.store(false, std::memory_order_release);
-    if (reaped == FALSE) {
-        error = static_cast<std::int32_t>(GetLastError());
-        return false;
-    }
-    written = native_written;
-    if (written != size) {
-        error = ERROR_WRITE_FAULT;
-        return false;
-    }
-    return true;
+    // Retry budget exhausted without finishing and without a hard error: the
+    // remainder is NOT silently dropped - hand back everything that was sent.
+    written = total;
+    error = ERROR_WRITE_FAULT;
+    return false;
 }
 
 void WinSerialBackend::abort_pending_write() noexcept
