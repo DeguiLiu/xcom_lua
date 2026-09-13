@@ -3,12 +3,30 @@
 #include "serial_backend_win.hpp"
 
 #include <array>
+#include <cstring>
 #include <string>
 #include <utility>
 
 #include "foundation/text.hpp"
 
 #include <winreg.h>
+// SetupAPI is the read-only PnP view of the device tree. Used ONLY during
+// enumeration to read SPDRP_HARDWAREID for an already-known COMx; it never
+// opens the port (no CreateFileW, SetCommState, EscapeCommFunction or I/O).
+// initguid.h instantiates GUID_DEVCLASS_PORTS in this TU so the device-class
+// GUID needs no extra import library.
+#include <initguid.h>
+#include <devguid.h>
+#include <setupapi.h>
+
+// winerror.h, included by <windows.h>, names this canonical "another process
+// holds the device" status as 32. The Linux syntax-check stub in
+// tools/win32-stub models only the Win32 surface this TU used before, so spell
+// the documented value as a fallback there; a real Windows build uses the SDK
+// macro unchanged.
+#ifndef ERROR_SHARING_VIOLATION
+#define ERROR_SHARING_VIOLATION 32U
+#endif
 
 namespace xcom {
 namespace {
@@ -64,6 +82,36 @@ BYTE map_parity(std::uint8_t value) noexcept
     }
 }
 
+// Full pre-open validation. Mirrors the ABI layer's range checks and adds the
+// data-bits/stop-bits cross-check the Win32 DCB does not enforce: the driver
+// coerces an illegal 1.5-stop-bit / 8-data-bit word to 1 stop bit instead of
+// failing, so it has to be rejected here or open() would bless a port that is
+// not on the wire. Runs before CreateFileW so an invalid request never opens
+// (and never pulses DTR on) the device.
+bool validate_serial_options(const SerialPortOptions& options,
+                             std::int32_t& error) noexcept
+{
+    if (options.baud == 0U || options.parity > 4U ||
+        options.flow_control > 2U) {
+        error = ERROR_INVALID_PARAMETER;
+        return false;
+    }
+    if (!valid_line_format(options.data_bits, options.stop_bits)) {
+        error = ERROR_INVALID_PARAMETER;
+        return false;
+    }
+    // Reject an out-of-range drive state before CreateFileW. The ABI layer already
+    // refuses raw values above LeaveAlone (XCOM_ERR_PARAM); this is the
+    // defence-in-depth that guarantees no later stage can static_cast a stray
+    // value into a DCB write or an EscapeCommFunction call.
+    if (!valid_line_drive(options.dtr_drive) ||
+        !valid_line_drive(options.rts_drive)) {
+        error = ERROR_INVALID_PARAMETER;
+        return false;
+    }
+    return true;
+}
+
 // Occupancy probe for enumeration (see enumerate_serial_ports_ex).
 //
 // STABILITY: this is OPT-IN and is NEVER invoked by default. A plain
@@ -75,7 +123,8 @@ BYTE map_parity(std::uint8_t value) noexcept
 //
 // When it is requested: a COM port held by another handle that asked for
 // exclusive access (dwShareMode 0, what every serial terminal uses) makes a
-// second CreateFileW fail with ERROR_ACCESS_DENIED. That failure path is
+// second CreateFileW fail with ERROR_ACCESS_DENIED (or, on some filter /
+// redirector drivers, ERROR_SHARING_VIOLATION). That failure path is
 // completely side-effect free: no handle is ever returned for the busy port.
 // On the success path (port free) the handle is closed immediately. This
 // helper performs NO I/O and does NOT call SetCommState or EscapeCommFunction:
@@ -99,7 +148,15 @@ bool probe_port_busy(const char* port_name) noexcept
                                0U, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL,
                                nullptr);
     if (probe == INVALID_HANDLE_VALUE) {
-        return GetLastError() == ERROR_ACCESS_DENIED;
+        // A port held by another handle that asked for exclusive access
+        // (dwShareMode 0) normally fails with ERROR_ACCESS_DENIED, but some
+        // filter/redirector drivers surface the same occupancy as
+        // ERROR_SHARING_VIOLATION (32). Classifying only ACCESS_DENIED made
+        // the opt-in probe report such a port as free, so the user only found
+        // out when the open itself failed. Both codes mean "in use".
+        const DWORD open_error = GetLastError();
+        return open_error == ERROR_ACCESS_DENIED ||
+               open_error == ERROR_SHARING_VIOLATION;
     }
     CloseHandle(probe);
     return false;
@@ -122,6 +179,9 @@ bool WinSerialBackend::open(const SerialPortOptions& options,
 {
     close();
     error = ERROR_SUCCESS;
+    if (!validate_serial_options(options, error)) {
+        return false;
+    }
     try {
         std::wstring device = utf8_to_wide(options.port_name);
         if (device.empty()) {
@@ -316,22 +376,32 @@ void WinSerialBackend::capture_line_status(std::uint32_t* out) noexcept
     }
 }
 
-void WinSerialBackend::set_rts(bool asserted) noexcept
+LineApplyResult WinSerialBackend::set_rts(bool asserted) noexcept
 {
     if (!port_.valid()) {
-        return;
+        return LineApplyResult::Closed;
     }
     if (rts_handshake_.load(std::memory_order_acquire)) {
-        return;   // driver owns RTS under RTS/CTS flow control
+        // Driver owns RTS under RTS/CTS. Deliberately not applied, and NOT a
+        // failure: the caller must still be told so it does not display an RTS
+        // change that never reached the pin.
+        return LineApplyResult::DriverOwned;
     }
-    EscapeCommFunction(port_.get(), asserted ? SETRTS : CLRRTS);
+    if (EscapeCommFunction(port_.get(), asserted ? SETRTS : CLRRTS) == FALSE) {
+        return LineApplyResult::Failed;
+    }
+    return LineApplyResult::Applied;
 }
 
-void WinSerialBackend::set_dtr(bool asserted) noexcept
+LineApplyResult WinSerialBackend::set_dtr(bool asserted) noexcept
 {
-    if (port_.valid()) {
-        EscapeCommFunction(port_.get(), asserted ? SETDTR : CLRDTR);
+    if (!port_.valid()) {
+        return LineApplyResult::Closed;
     }
+    if (EscapeCommFunction(port_.get(), asserted ? SETDTR : CLRDTR) == FALSE) {
+        return LineApplyResult::Failed;
+    }
+    return LineApplyResult::Applied;
 }
 
 bool WinSerialBackend::is_open() const noexcept
@@ -360,16 +430,56 @@ bool WinSerialBackend::configure(const SerialPortOptions& options,
     dcb.fParity = options.parity != 0U;
     const bool handshake = options.flow_control == 1U;
     dcb.fOutxCtsFlow = handshake ? TRUE : FALSE;
+    // LeaveAlone selects the DISABLE encoding: among the three DCB line-control
+    // values it is the only one that does not actively assert the pin.
+    // LIMITATION: DISABLE is not "leave the line floating". Windows has no
+    // high-impedance modem-control setting, and some drivers still present a
+    // level for DISABLE, so this cannot guarantee the pin is untouched during
+    // SetCommState. It only avoids the SETxxx assertion we would otherwise
+    // request; the true open-time behaviour is driver-owned.
     dcb.fRtsControl = handshake
                           ? RTS_CONTROL_HANDSHAKE
-                          : (options.rts_enabled ? RTS_CONTROL_ENABLE
-                                                 : RTS_CONTROL_DISABLE);
-    dcb.fDtrControl = options.dtr_enabled ? DTR_CONTROL_ENABLE
-                                          : DTR_CONTROL_DISABLE;
+                          : (options.rts_drive == LineDrive::Assert
+                                 ? RTS_CONTROL_ENABLE
+                                 : RTS_CONTROL_DISABLE);
+    dcb.fDtrControl = options.dtr_drive == LineDrive::Assert
+                          ? DTR_CONTROL_ENABLE
+                          : DTR_CONTROL_DISABLE;
     dcb.fOutX = options.flow_control == 2U;
     dcb.fInX = options.flow_control == 2U;
+    // A line error must NOT tear down the read IRP. The reset value is
+    // driver-specific; with fAbortOnError TRUE a framing/overrun error aborts
+    // the pending ReadFile, which surfaces in read_loop as a failed overlapped
+    // completion and would make the reader classify an ordinary line glitch as a
+    // fatal fault. Keep it FALSE so errors arrive through the ClearCommError
+    // latch the read loop already polls.
+    dcb.fAbortOnError = FALSE;
     if (SetCommState(port_.get(), &dcb) == FALSE) {
         error = static_cast<std::int32_t>(GetLastError());
+        return false;
+    }
+    // Verify the driver honoured the DCB before trusting the port. SetCommState
+    // succeeds even when the hardware cannot provide the request: a USB bridge
+    // silently rounds an unsupported baud (e.g. 250000), and 1.5 stop bits with
+    // 8 data bits is coerced to 1 stop bit. Reading the DCB back is the only way
+    // to tell "configured as asked" from "configured as the driver felt like",
+    // and comparing exactly the fields programmed above catches the coercion
+    // instead of reporting a lie. DCBlength must be set or GetCommState fails.
+    DCB verified{};
+    verified.DCBlength = sizeof(verified);
+    if (GetCommState(port_.get(), &verified) == FALSE) {
+        error = static_cast<std::int32_t>(GetLastError());
+        return false;
+    }
+    if (verified.BaudRate != dcb.BaudRate || verified.ByteSize != dcb.ByteSize ||
+        verified.StopBits != dcb.StopBits || verified.Parity != dcb.Parity ||
+        verified.fBinary != dcb.fBinary || verified.fParity != dcb.fParity ||
+        verified.fOutxCtsFlow != dcb.fOutxCtsFlow ||
+        verified.fRtsControl != dcb.fRtsControl ||
+        verified.fDtrControl != dcb.fDtrControl || verified.fOutX != dcb.fOutX ||
+        verified.fInX != dcb.fInX ||
+        verified.fAbortOnError != dcb.fAbortOnError) {
+        error = ERROR_NOT_SUPPORTED;
         return false;
     }
     rts_handshake_.store(handshake, std::memory_order_release);
@@ -377,12 +487,45 @@ bool WinSerialBackend::configure(const SerialPortOptions& options,
     // behavior is driver-dependent, so without this replay a board can be
     // left held in reset (DTR asserted) or in BOOT (RTS asserted). In HANDSHAKE
     // mode the driver owns RTS and SETRTS/CLRRTS must not be issued against it.
-    EscapeCommFunction(port_.get(), options.dtr_enabled ? SETDTR : CLRDTR);
-    if (!handshake) {
-        EscapeCommFunction(port_.get(), options.rts_enabled ? SETRTS : CLRRTS);
+    //
+    // LeaveAlone skips the replay for that line: no SETxxx/CLRxxx is issued, so
+    // the only remaining open-time influence is the DCB value programmed above
+    // and whatever CreateFileW itself did. LIMITATION: this removes OUR
+    // transition, not every possible one - a bridge that asserts DTR on the open
+    // IRP is outside user-mode control. Whether a target stops resetting must be
+    // verified on hardware; it is not claimed here.
+    //
+    // The result is deliberately ignored here: the DCB above already programmed
+    // the level, so a redundant-IOCTL failure must not fail an otherwise valid
+    // open. That leaves the open-time DTR/BOOT pulse as a KNOWN silent-failure
+    // and known target-reset risk (needs real hardware to resolve; tracked
+    // separately). set_dtr()/set_rts() are used only so the return is captured
+    // rather than discarded at the source - it changes no behaviour.
+    if (options.dtr_drive != LineDrive::LeaveAlone) {
+        static_cast<void>(set_dtr(options.dtr_drive == LineDrive::Assert));
+    }
+    if (!handshake && options.rts_drive != LineDrive::LeaveAlone) {
+        static_cast<void>(set_rts(options.rts_drive == LineDrive::Assert));
     }
     COMMTIMEOUTS timeouts{};
-    timeouts.ReadIntervalTimeout = MAXDWORD;
+    // Bounded tick, not the old "return immediately" mode. ReadIntervalTimeout =
+    // MAXDWORD combined with zero total-timeout fields makes every ReadFile
+    // complete at once (MSDN: "return immediately ... even if no bytes have been
+    // received"), so an idle line spun the read loop — and its per-completion
+    // ClearCommError — at full CPU. Here no inter-byte gap timeout is used; the
+    // total timeout (multiplier 0 * bytes + constant) caps each IRP at
+    // kReadTickTimeoutMs, so an idle line completes with 0 bytes about every
+    // 50 ms and the loop ticks ~20 Hz instead of spinning. A 0-byte completion
+    // therefore costs the full 50 ms, so it cannot busy-loop.
+    //
+    // Trade-off: up to kReadTickTimeoutMs of added receive latency. That is
+    // imperceptible in a console, while the CPU saving is not. The MSDN
+    // "MAXDWORD interval + MAXDWORD multiplier + constant" form is deliberately
+    // NOT used: it completes as soon as the first buffered byte arrives, which
+    // at 921600 baud can mean one completion — and one ClearCommError — per byte.
+    timeouts.ReadIntervalTimeout = 0U;
+    timeouts.ReadTotalTimeoutMultiplier = 0U;
+    timeouts.ReadTotalTimeoutConstant = kReadTickTimeoutMs;
     if (SetCommTimeouts(port_.get(), &timeouts) == FALSE) {
         error = static_cast<std::int32_t>(GetLastError());
         return false;
@@ -395,6 +538,13 @@ void WinSerialBackend::read_loop() noexcept
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
     std::array<std::uint8_t, kReadChunkBytes> buffer{};
     while (!stop_requested_.load(std::memory_order_acquire)) {
+        // Liveness: the loop completed an iteration (a read returned, with or
+        // without bytes, or a fault is about to be handled). An idle line still
+        // reaches here about every 50 ms via the COMMTIMEOUTS read tick, so an
+        // old stamp means the thread is stuck inside the driver, not idle.
+        if (on_beat_) {
+            on_beat_();
+        }
         ResetEvent(read_event_.get());
         // Re-zero the OVERLAPPED bookkeeping fields each read. The hEvent
         // member is re-armed below (ResetEvent already cleared the event) and
@@ -435,9 +585,14 @@ void WinSerialBackend::read_loop() noexcept
         // completes it or shutdown signals stop_event_. The bounded wait is
         // armed only when a close is already in progress, which is the one case
         // where a driver that ignores CancelIoEx must not be allowed to hold the
-        // thread (and close()'s join) forever. Returning here is safe: the read
-        // thread touches only stack state after this point, so nothing dangles
-        // even though close() is about to reset the handles and the backend.
+        // thread (and close()'s join) forever.
+        //
+        // LIFETIME: returning after this point is safe because close() joins
+        // THIS thread before it resets port_, the event handles or on_read_
+        // (see close()). A late on_read_ call below therefore still targets
+        // live objects; the callback itself re-checks the runtime's admission
+        // gate, so a delivery racing teardown is either ingested or explicitly
+        // refused there, never dereferenced after free.
         const DWORD wait_timeout = stop_requested_.load(std::memory_order_acquire)
                                        ? kCancelledReadGraceMs
                                        : INFINITE;
@@ -453,22 +608,81 @@ void WinSerialBackend::read_loop() noexcept
             open_.store(false, std::memory_order_release);
             return;
         }
-        if (wait == WAIT_OBJECT_0 || stop_requested_.load(std::memory_order_acquire)) {
+        // stop_event_ is index 0 and read_event_ is index 1. WaitForMultipleObjects
+        // reports the LOWEST signaled index, so a stop that races a completion
+        // returns WAIT_OBJECT_0 even though read_event_ is ALSO set. Decide from
+        // the read event itself, not from the raw wait code: a completed read
+        // must be reaped and delivered before returning, in both the
+        // simultaneous ("both signaled") and the read-first cases.
+        const bool read_completed =
+            (wait == WAIT_OBJECT_0 + 1U) ||
+            ((wait == WAIT_OBJECT_0) &&
+             (WaitForSingleObject(read_event_.get(), 0U) == WAIT_OBJECT_0));
+        if (!read_completed) {
+            // stop_event_ alone: the IRP is still pending (close() has already
+            // issued CancelIoEx) and no bytes completed, so there is nothing to
+            // reap. Any other result is WAIT_FAILED: no object was signaled and
+            // no operation completed, so `received` still holds this iteration's
+            // initial zero and must not be delivered. GetLastError() belongs to
+            // the failed wait; a deliberate teardown must not be reported as a
+            // device fault.
+            const bool wait_failed =
+                (wait != WAIT_OBJECT_0) && (wait != WAIT_OBJECT_0 + 1U);
+            if (wait_failed &&
+                !stop_requested_.load(std::memory_order_acquire)) {
+                report_fault(static_cast<std::int32_t>(GetLastError()));
+                open_.store(false, std::memory_order_release);
+            }
             return;
         }
-        if (wait != WAIT_OBJECT_0 + 1U ||
-            GetOverlappedResult(port_.get(), &read_overlapped_, &received, FALSE) == FALSE) {
-            const DWORD result_error = GetLastError();
-            if (!stop_requested_.load(std::memory_order_acquire) &&
-                result_error != ERROR_OPERATION_ABORTED) {
+        // read_event_ is set: the kernel has completed the read IRP,
+        // successfully or not. That is the ONLY condition under which `received`
+        // is safe to consume — GetOverlappedResult copies the transferred count
+        // out of the just-completed OVERLAPPED, so it can be neither a torn count
+        // nor a stale one from a previous iteration. On a failed completion a
+        // driver may still report the partial count the kernel moved before the
+        // error (line error, abort, surprise removal); those bytes must reach
+        // on_read_ instead of being silently discarded.
+        const BOOL reaped =
+            GetOverlappedResult(port_.get(), &read_overlapped_, &received, FALSE);
+        const DWORD result_error =
+            reaped != FALSE ? ERROR_SUCCESS : GetLastError();
+        // A failed completion is not obliged to bound the count by the request;
+        // clamp so on_read_ can never be handed more than `buffer` holds.
+        if (received > static_cast<DWORD>(buffer.size())) {
+            received = static_cast<DWORD>(buffer.size());
+        }
+        if (reaped != FALSE) {
+            poll_line_status();
+        }
+        // Deliver any transferred bytes FIRST, before the fault is reported. The
+        // fault path below (and the Dispatcher that consumes it) tears the
+        // session down, so bytes delivered afterwards would be lost with it.
+        if (received != 0U && on_read_) {
+            on_read_(buffer.data(), received);
+        }
+        if (reaped == FALSE) {
+            // Any failure here is reported, including ERROR_OPERATION_ABORTED.
+            // The only place this backend cancels the read IRP is close(), and
+            // it publishes stop_requested_ before calling CancelIoEx, so a
+            // deliberate teardown is already filtered by the guard above. An
+            // abort that arrives with stop_requested_ still false therefore
+            // means the DRIVER dropped the IRP (surprise removal / USB
+            // re-enumeration). Suppressing it would exit this thread without
+            // raising a fault while open_ stayed true, leaving a session that
+            // reports OPEN with no reader forever.
+            if (!stop_requested_.load(std::memory_order_acquire)) {
                 report_fault(static_cast<std::int32_t>(result_error));
                 open_.store(false, std::memory_order_release);
             }
             return;
         }
-        poll_line_status();
-        if (received != 0U && on_read_) {
-            on_read_(buffer.data(), received);
+        if (stop_requested_.load(std::memory_order_acquire)) {
+            // The completion reaped above was raced by a stop (or discovered
+            // behind one); its bytes were delivered before this point. Honour
+            // the stop now. Safe to return: close() is still blocked in its
+            // join and has not yet reset port_, the event handles or on_read_.
+            return;
         }
     }
 }
@@ -506,6 +720,16 @@ void WinSerialBackend::poll_line_status() noexcept
     if (stat.fRlsdHold != 0U) {
         holds |= (1U << 3U);   // kLineStatusRlsdHold
     }
+    // CE_TXFULL and COMSTAT.fXoffSent deliberately get no dedicated category.
+    // CE_TXFULL is a transmit-side "queue full" condition, not a receive
+    // overrun, so folding it into overrun_errors would misreport data loss; it
+    // is still carried verbatim in SerialLineStatus.error_flags because the
+    // poll fires on any nonzero error mask. fXoffSent means the driver sent an
+    // XOFF to the peer (receive backpressure) and is distinct from fXoffHold
+    // (peer paused us); SerialLineStatus has no backpressure field and the
+    // runtime's rx_backpressure counter is fed elsewhere, so surfacing it would
+    // need a runtime change outside this backend. Recorded as a known
+    // observability gap rather than a counter nobody reads.
     const bool hold_edge = holds != last_holds_;
     last_holds_ = holds;
     if (errors == 0U && (!hold_edge || holds == 0U)) {
@@ -537,6 +761,109 @@ void WinSerialBackend::poll_line_status() noexcept
 // the REG_SZ values carry the COMx names. All Win32 registry types are
 // confined to this TU; the public signature is pure C++.
 // ---------------------------------------------------------------------------
+
+// One (COMx -> stable PnP hardware id) mapping read from the device tree.
+// `port` is the COMx as reported by the device's Device Parameters\PortName
+// value (the same name SERIALCOMM carries); `hardware_id` is the first string
+// of the SPDRP_HARDWAREID REG_MULTI_SZ, or empty when the property is absent.
+struct PortHardwareId final {
+    std::array<char, 64U> port{};
+    std::array<char, 96U> hardware_id{};   // XcomPortInfo.hardware_id
+};
+
+constexpr std::uint32_t kMaxPortHardwareIds = 64U;
+
+// Build the COMx -> hardware-id table from the PnP device tree.
+//
+// STABILITY: this is a REGISTRY/PROPERTY READ ONLY. It enumerates the Ports
+// setup class and, per device, opens that device's "Device Parameters" registry
+// key to read PortName and calls SetupDiGetDeviceRegistryPropertyA for
+// SPDRP_HARDWAREID. It never opens the serial port: no CreateFileW, no
+// SetCommState, no EscapeCommFunction, no I/O. Enumeration therefore cannot
+// pulse DTR/RTS or reset the target board, which is why it runs on the default
+// (non-probe) path.
+//
+// A missing SPDRP_HARDWAREID is expected for some composite/virtual ports and
+// is NOT an error: the entry is returned with an empty hardware_id so the
+// caller falls back to description matching.
+std::uint32_t collect_port_hardware_ids(PortHardwareId* out,
+                                        std::uint32_t capacity) noexcept
+{
+    if (out == nullptr || capacity == 0U) {
+        return 0U;
+    }
+    HDEVINFO devices = SetupDiGetClassDevsA(&GUID_DEVCLASS_PORTS, nullptr,
+                                            nullptr, DIGCF_PRESENT);
+    if (devices == INVALID_HANDLE_VALUE) {
+        return 0U;
+    }
+    std::uint32_t found = 0U;
+    for (DWORD index = 0U; found < capacity; ++index) {
+        SP_DEVINFO_DATA info{};
+        info.cbSize = sizeof(info);
+        if (SetupDiEnumDeviceInfo(devices, index, &info) == FALSE) {
+            break;
+        }
+        PortHardwareId entry{};
+        // PortName lives in the device's Device Parameters key; reading it is a
+        // registry read, not a port open.
+        HKEY params = SetupDiOpenDevRegKey(devices, &info, DICS_FLAG_GLOBAL, 0U,
+                                           DIREG_DEV, KEY_QUERY_VALUE);
+        if (params == INVALID_HANDLE_VALUE) {
+            continue;   // no Device Parameters key: not a serial port device
+        }
+        DWORD type = REG_NONE;
+        DWORD bytes = static_cast<DWORD>(entry.port.size());
+        const LSTATUS rc = RegQueryValueExA(
+            params, "PortName", nullptr, &type,
+            reinterpret_cast<BYTE*>(entry.port.data()), &bytes);
+        RegCloseKey(params);
+        if (rc != ERROR_SUCCESS || type != REG_SZ) {
+            continue;   // e.g. an LPT port, or a device without a PortName yet
+        }
+        entry.port[entry.port.size() - 1U] = '\0';
+
+        std::array<BYTE, 512U> raw{};
+        DWORD raw_bytes = 0U;
+        if (SetupDiGetDeviceRegistryPropertyA(
+                devices, &info, SPDRP_HARDWAREID, nullptr, raw.data(),
+                static_cast<DWORD>(raw.size()), &raw_bytes) != FALSE) {
+            // SPDRP_HARDWAREID is a REG_MULTI_SZ; the first string is the
+            // canonical id. copy_first_multi_sz is bounded and NUL-terminates;
+            // an absent/empty property leaves hardware_id "".
+            copy_first_multi_sz(raw.data(),
+                                static_cast<std::uint32_t>(raw.size()),
+                                entry.hardware_id.data(),
+                                entry.hardware_id.size());
+        }
+        out[found] = entry;
+        ++found;
+    }
+    SetupDiDestroyDeviceInfoList(devices);
+    return found;
+}
+
+// Copy the hardware id for `port_name` from the table, or leave an empty string
+// when there is no match or the property was absent.
+void copy_port_hardware_id(const char* port_name,
+                           const PortHardwareId* table, std::uint32_t count,
+                           char* out, std::size_t out_size) noexcept
+{
+    if (out == nullptr || out_size == 0U) {
+        return;
+    }
+    out[0] = '\0';
+    if (port_name == nullptr || table == nullptr) {
+        return;
+    }
+    for (std::uint32_t i = 0U; i < count; ++i) {
+        if (std::strcmp(table[i].port.data(), port_name) == 0) {
+            foundation::copy_text(table[i].hardware_id.data(), out, out_size);
+            return;
+        }
+    }
+}
+
 std::uint32_t enumerate_serial_ports_ex(XcomPortInfo* out,
                                         std::uint32_t capacity,
                                         bool probe_busy,
@@ -558,6 +885,17 @@ std::uint32_t enumerate_serial_ports_ex(XcomPortInfo* out,
         }
         error = static_cast<std::int32_t>(open_result);
         return 0U;
+    }
+
+    // Stable-identity lookup. Skipped for the capacity == 0 size query, which
+    // must stay free of device-tree work (the ABI size query must not touch a
+    // device). Registry-only and non-disturbing, so it runs on the default path.
+    std::array<PortHardwareId, kMaxPortHardwareIds> hardware_ids{};
+    std::uint32_t hardware_id_count = 0U;
+    if (capacity != 0U) {
+        hardware_id_count = collect_port_hardware_ids(
+            hardware_ids.data(),
+            static_cast<std::uint32_t>(hardware_ids.size()));
     }
 
     std::uint32_t found = 0U;
@@ -597,6 +935,9 @@ std::uint32_t enumerate_serial_ports_ex(XcomPortInfo* out,
             foundation::copy_text(port_name.data(), info.name, sizeof(info.name));
             foundation::copy_text(device_name.data(), info.description,
                                   sizeof(info.description));
+            copy_port_hardware_id(info.name, hardware_ids.data(),
+                                  hardware_id_count, info.hardware_id,
+                                  sizeof(info.hardware_id));
             // Probe only when a real output slot exists: the capacity == 0 size
             // query must stay side-effect free.
             info.busy = (probe_busy && probe_port_busy(info.name)) ? 1U : 0U;

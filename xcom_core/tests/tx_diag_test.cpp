@@ -4,7 +4,7 @@
 // Both features act on a real COM port with a non-reading peer, which no CI
 // has. What is exercisable without hardware:
 //   1. the COMSTAT hold-bit -> error-message mapping (describe_write_failure);
-//   2. the bounded grace constant stays inside the close budget;
+//   2. the bounded write-drain grace constant is positive and small;
 //   3. WinSerialBackend's guard paths on a never-opened port: write() is a
 //      parameter error and abort_pending_write()/close() return promptly
 //      instead of waiting on a nonexistent in-flight write.
@@ -70,12 +70,35 @@ int main()
                       "Win32 serial write failed") == 0,
           "non-timeout error keeps generic message");
 
-    // (2) The drain grace must be positive but small enough that a stalled
-    //     close cannot approach the runtime's 2000 ms ABI close budget.
+    // (2) The write-drain grace must be positive and bounded. It is one share
+    //     of the backend teardown: the read loop's cancelled-read grace
+    //     (1500 ms, serial_backend_win.cpp) adds to it, keeping the whole
+    //     teardown inside the ~2000 ms close budget the runtime reserves on the
+    //     exit path (the xcom_ffi.close default timeout). The shorter
+    //     core_close default (CLOSE_WAIT_MS = 200 ms, window.lua) can return
+    //     before that grace expires.
     CHECK(kTxDrainGraceMs > 0U && kTxDrainGraceMs <= 500U,
           "drain grace is bounded");
 
-    // (3) Guard paths on a never-opened backend.
+    // (3) The per-read tick bounds each overlapped ReadFile so an idle line
+    //     cannot spin the loop (the old ReadIntervalTimeout = MAXDWORD mode).
+    CHECK(kReadTickTimeoutMs > 0U && kReadTickTimeoutMs <= 1000U,
+          "read tick timeout is bounded");
+
+    // (4) Line-format legality enforced before the port is opened: 1.5 stop
+    //     bits exist only for a 5-data-bit word, and the ranges are closed.
+    CHECK(valid_line_format(5U, 1U), "5 data bits + 1.5 stop bits is legal");
+    CHECK(!valid_line_format(6U, 1U), "6 data bits + 1.5 stop bits is illegal");
+    CHECK(!valid_line_format(7U, 1U), "7 data bits + 1.5 stop bits is illegal");
+    CHECK(!valid_line_format(8U, 1U), "8 data bits + 1.5 stop bits is illegal");
+    CHECK(valid_line_format(5U, 0U) && valid_line_format(8U, 0U),
+          "1 stop bit is legal at 5 and 8 data bits");
+    CHECK(valid_line_format(8U, 2U), "2 stop bits is legal at 8 data bits");
+    CHECK(!valid_line_format(4U, 0U) && !valid_line_format(9U, 0U),
+          "out-of-range data bits rejected");
+    CHECK(!valid_line_format(8U, 3U), "out-of-range stop bits rejected");
+
+    // (5) Guard paths on a never-opened backend.
     WinSerialBackend backend;
     CHECK(!backend.is_open(), "default backend is not open");
 

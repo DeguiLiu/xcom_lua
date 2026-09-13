@@ -2,7 +2,7 @@
 //
 // All exported functions are no-throw across the boundary: every body is
 // wrapped so a C++ exception cannot escape (returns an XcomStatus error).
-// Only ONE caller thread (the CoreWorker QThread) may call into this ABI at a
+// Only ONE caller thread (the Lua UI thread) may call into this ABI at a
 // time; inside the core all work is serialized onto the coact Dispatcher.
 //
 // Synchronous contracts honored here:
@@ -25,13 +25,14 @@
 #include <xcom/xcom.h>
 
 #include "xcom_abi_internal.hpp"
+#include "open_failure_status.hpp"
 #include "xcom_core.hpp"
 // enumerate_serial_ports_ex: the ABI-level error/occupancy-aware port lister.
 // Only the function declaration is needed; no Win32 registry type leaks here
 // (xcom_core.hpp already pulls windows.h for the core context).
 #include "serial_backend_win.hpp"
 #include "foundation/text.hpp"
-#include "pal_windows.hpp"
+#include "coact/pal_windows.hpp"
 
 namespace xcom {
 namespace {
@@ -66,13 +67,23 @@ XcomStatus port_name_from_config(const XcomPortConfig* cfg,
     return XCOM_OK;
 }
 
-// Translate a failed open (FAULT/CLOSED) into the caller-visible status. The
-// detailed native serial/Win32 code was pushed to the error ring by the owner;
-// the boundary contract keeps open failures as XCOM_ERR_IO.
-XcomStatus port_state_2_status(CoreCtx* core) noexcept
+// Translate a failed open attempt into the caller-visible status. The verdict
+// comes from the recorded owner result, NOT from port_state: an open that never
+// established a session lands in CLOSED, and CLOSED alone cannot distinguish
+// "closed, never opened" from "closed because the attempt failed".
+// last_open_result encodes that distinction. It has a MIXED value domain: the
+// lifecycle writers store XCOM_OK / XCOM_ERR_* (0 or negative, with
+// XCOM_ERR_BUSY as the queued sentinel), while the serial owner sink stores the
+// raw POSITIVE Win32 code from the native open. XcomStatus is 0-or-negative by
+// contract, so the raw Win32 code MUST be mapped back onto an enumerator before
+// it crosses the ABI; open_failure_status_from_result() owns that mapping (and
+// documents why it never yields BUSY). Anything that is not a resolved failure
+// is reported as XCOM_ERR_IO, so a caller polling a CLOSED port can never read
+// a stale XCOM_OK from a previous successful session.
+XcomStatus open_failure_status(CoreCtx* core) noexcept
 {
-    (void)core;
-    return XCOM_ERR_IO;
+    return open_failure_status_from_result(
+        core->last_open_result.load(std::memory_order_acquire));
 }
 
 }  // namespace
@@ -174,11 +185,13 @@ XCOM_API XcomHandle xcom_create(const XcomCreateOptions* options)
 }
 
 // Shared prefix of both synchronous and async open: validate the config, check
-// the HSM precondition (CLOSED only), snapshot the serial options, and queue the
-// SIG_OPEN for the SerialAo on the Dispatcher.  On any failure the port_state is
-// untouched or rolled back to CLOSED and an XcomStatus is returned.  On success
-// XCOM_OK is returned and the open proceeds asynchronously on the owner; the
-// caller observes completion via port_state (see xcom_open / xcom_take_open_result).
+// the precondition against the AO-published view, snapshot the serial options,
+// and queue the SIG_OPEN for the SerialAo on the Dispatcher. The ABI never
+// writes port_state: the AO publishes OPENING itself as the first act of the
+// transition. last_open_result is parked at XCOM_ERR_BUSY as the "request
+// queued, owner has not resolved it yet" sentinel so the caller can tell a
+// genuinely-CLOSED port from one whose SIG_OPEN has not been dispatched yet.
+// On any failure an XcomStatus is returned and port_state is left alone.
 XcomStatus queue_open(CoreCtx* core, const XcomPortConfig* config,
                       std::array<char, 64U>& name) noexcept
 {
@@ -202,15 +215,30 @@ XcomStatus queue_open(CoreCtx* core, const XcomPortConfig* config,
     if (config->flow_control > 2U) {
         return XCOM_ERR_PARAM;
     }
+    // dtr_enable / rts_enable are a tri-state (see XcomPortConfig): 0 = drive
+    // deasserted, 1 = drive asserted, 2 = leave the line alone. Reject any other
+    // value rather than coercing it, so a mistyped 3 cannot silently become
+    // "drive low" and pulse a target's NRST/BOOT pin during open.
+    if (XCOM_LINE_LEAVE_ALONE < config->dtr_enable ||
+        XCOM_LINE_LEAVE_ALONE < config->rts_enable) {
+        return XCOM_ERR_PARAM;
+    }
     const uint16_t current_state =
         core->port_state.load(std::memory_order_acquire);
+    const bool open_pending =
+        core->last_open_result.load(std::memory_order_acquire) == XCOM_ERR_BUSY;
     if (current_state == XCOM_PORT_OPEN) {
         return XCOM_ERR_ALREADY_OPEN;
     }
+    // An earlier open whose SIG_OPEN has not been dispatched yet would make a
+    // second request a double open; refuse it the same way as an OPEN port.
+    if (open_pending) {
+        return XCOM_ERR_BUSY;
+    }
     // Retrying straight from FAULT is now a real transition, not a dead end.
-    // The HSM carries Fault --Open--> Open, and serial_do_open tears the failed
-    // session down through owner_open before configuring the new one, so this
-    // is the same work the Close-then-Open pair performed. It used to be
+    // The HSM carries Fault --Open--> OPENING, and serial_do_open tears the
+    // failed session down through owner_open before configuring the new one, so
+    // this is the same work the Close-then-Open pair performed. It used to be
     // rejected with XCOM_ERR_BUSY because the HSM had no edge out of Fault and
     // the request would have waited on an event nothing could consume — the
     // user-visible effect was "clicked Open and nothing happened", since the UI
@@ -233,17 +261,18 @@ XcomStatus queue_open(CoreCtx* core, const XcomPortConfig* config,
     core->cfg_stop_bits = config->stop_bits;
     core->cfg_parity = config->parity;
     core->cfg_flow_control = config->flow_control;
-    core->cfg_dtr_enable = config->dtr_enable != 0U ? 1U : 0U;
-    core->cfg_rts_enable = config->rts_enable != 0U ? 1U : 0U;
-    core->last_open_result.store(XCOM_ERR_IO, std::memory_order_release);
+    core->cfg_dtr_enable = config->dtr_enable;
+    core->cfg_rts_enable = config->rts_enable;
+    core->last_open_result.store(XCOM_ERR_BUSY, std::memory_order_release);
     core->cancel_open.store(0U, std::memory_order_release);
-    core->port_state.store(XCOM_PORT_OPENING, std::memory_order_release);
     core->errors.push(0, 0, "open requested");
 
     // SerialAo (owner) performs the open on the Dispatcher; the caller either
     // blocks (synchronous) or polls (async) until it reports OPEN or failed.
     if (!core->submit_control(to_signal(Signal::Open), 0U, false)) {
-        core->port_state.store(XCOM_PORT_CLOSED, std::memory_order_release);
+        // The request never reached the AO, so nothing will resolve the
+        // sentinel; port_state is untouched (still CLOSED/FAULT).
+        core->last_open_result.store(XCOM_ERR_IO, std::memory_order_release);
         core->errors.push(XCOM_ERR_FULL, 0, "open event rejected");
         return XCOM_ERR_FULL;
     }
@@ -267,12 +296,22 @@ XCOM_API XcomStatus xcom_open(XcomHandle hh, const XcomPortConfig* config)
         }
 
         for (int i = 0; i < 200; ++i) {   // up to ~2 s
-            const uint16_t st = core->port_state.load(std::memory_order_acquire);
-            if (st == XCOM_PORT_OPEN) {
-                return XCOM_OK;
+            const int32_t result =
+                core->last_open_result.load(std::memory_order_acquire);
+            if (result == XCOM_OK) {
+                // The owner open succeeded; wait for the AO to publish OPEN so
+                // a subsequent xcom_send observes a usable session.
+                if (core->port_state.load(std::memory_order_acquire) ==
+                    XCOM_PORT_OPEN) {
+                    return XCOM_OK;
+                }
             }
-            if (st == XCOM_PORT_FAULT || st == XCOM_PORT_CLOSED) {
-                return port_state_2_status(core);
+            else if (result != XCOM_ERR_BUSY) {
+                // Definitive owner failure. The recorded result may be a raw
+                // Win32 code; open_failure_status maps it onto a 0-or-negative
+                // XcomStatus (the raw code stays in the XcomError ring). A
+                // failed open publishes CLOSED, not FAULT.
+                return open_failure_status(core);
             }
             coact::pal::sleep_ms(10U);
         }
@@ -322,9 +361,18 @@ XCOM_API XcomStatus xcom_take_open_result(XcomHandle hh)
         if (st == XCOM_PORT_OPENING) {
             return XCOM_ERR_BUSY;   // still in progress; poll again
         }
-        // FAULT or CLOSED: the open failed (or was cancelled). Detailed error
-        // is in the error ring, matching the synchronous xcom_open contract.
-        return port_state_2_status(core);
+        // The ABI no longer publishes OPENING itself, so a SIG_OPEN that the
+        // Dispatcher has not picked up yet still reads CLOSED. Report BUSY
+        // while the queued request's sentinel is unresolved rather than a
+        // spurious failure.
+        if (core->last_open_result.load(std::memory_order_acquire) ==
+            XCOM_ERR_BUSY) {
+            return XCOM_ERR_BUSY;
+        }
+        // A resolved non-OK, non-BUSY recorded result: the open attempt failed
+        // (or was cancelled). Return the recorded cause mapped to an
+        // XcomStatus; the detailed Win32 code is also in the error ring.
+        return open_failure_status(core);
     }
     catch (...) {
         return XCOM_ERR_IO;
@@ -341,24 +389,26 @@ XCOM_API XcomStatus xcom_close(XcomHandle hh, uint32_t timeout_ms)
         }
         xcom::CoreCtx* core = xcom::xcom_handle_core(h);
         const uint16_t st = core->port_state.load(std::memory_order_acquire);
-        if (st == XCOM_PORT_CLOSED) {
-            return XCOM_OK;   // idempotent
+        // The ABI no longer publishes OPENING itself, so a close issued while
+        // the open's SIG_OPEN is still queued reads CLOSED. Treat that as
+        // "open pending" via the sentinel instead of a no-op, otherwise the
+        // queued open would complete after xcom_close returned OK.
+        const bool open_pending =
+            core->last_open_result.load(std::memory_order_acquire) ==
+            XCOM_ERR_BUSY;
+        if (st == XCOM_PORT_CLOSED && false == open_pending) {
+            return XCOM_OK;   // idempotent (includes post-failure CLOSED)
         }
-        if (st == XCOM_PORT_OPENING) {
+        if (st == XCOM_PORT_OPENING || open_pending) {
+            // Tell the SerialAo that any in-flight owner_open must not settle
+            // in OPEN: it takes the OPENING --Cancel--> CLOSING edge.
             core->cancel_open.store(1U, std::memory_order_release);
         }
-        // If the close cannot be delivered or drains too slowly, roll the
-        // published state back to a value the HSM can legally act on next.
-        // OPENING (the SerialAo HSM is still Closed) must become CLOSED and
-        // advance the session generation so any still-in-flight open event is
-        // invalidated; OPEN and FAULT simply return to themselves so a retry
-        // close (or explicit reopen) is not blocked by a stuck CLOSING.
-        auto rollback_state = [](std::uint16_t prev) noexcept -> std::uint16_t {
-            return prev == XCOM_PORT_OPENING ? XCOM_PORT_OPENING : prev;
-        };
-        core->port_state.store(XCOM_PORT_CLOSING, std::memory_order_release);
-        if (!core->submit_control(to_signal(Signal::Close), 0U, true /*critical*/)) {
-            core->port_state.store(rollback_state(st), std::memory_order_release);
+        // The AO owns port_state; the ABI only submits the Close signal and
+        // polls the published view. If the signal is rejected the state is left
+        // exactly as the AO published it (there is no ABI rollback write).
+        if (false == core->submit_control(to_signal(Signal::Close), 0U,
+                                          true /*critical*/)) {
             core->errors.push(XCOM_ERR_FULL, 0, "close event rejected");
             return XCOM_ERR_FULL;
         }
@@ -376,10 +426,9 @@ XCOM_API XcomStatus xcom_close(XcomHandle hh, uint32_t timeout_ms)
             coact::pal::sleep_ms(
                 static_cast<uint32_t>(remaining < 20U ? remaining : 20U));
         } while (true);
-        // Timeout: never leave port_state stuck in CLOSING. Roll back to the
-        // pre-close state. An opening session remains OPENING until its owner
-        // observes cancel_open and completes the legal HSM close transition.
-        core->port_state.store(rollback_state(st), std::memory_order_release);
+        // Timeout: the AO still owns the transition. An opening session stays
+        // OPENING until its owner observes cancel_open and completes the legal
+        // CLOSING -> CLOSED path; there is no ABI-side rollback write.
         return XCOM_ERR_TIMEOUT;
     }
     catch (...) {
@@ -389,8 +438,8 @@ XCOM_API XcomStatus xcom_close(XcomHandle hh, uint32_t timeout_ms)
 
 // v1.1: synchronous-copy + queue-and-return. The core copies data[0:size]
 // verbatim into a unique TxBlockPool slot before returning (the caller pointer
-// is never retained or re-encoded). Python has already pre-encoded the payload
-// (HEX via bytes.fromhex, optional CRLF applied), so neither the HEX flag nor
+// is never retained or re-encoded). The Lua client has already pre-encoded the
+// payload (HEX decoded, optional CRLF applied), so neither the HEX flag nor
 // CRLF is re-processed here. The function does NOT block for the actual serial
 // WriteResult; success/failure is reported asynchronously via snapshot/error.
 XCOM_API XcomStatus xcom_send(XcomHandle hh, const uint8_t* data,
@@ -432,10 +481,18 @@ XCOM_API XcomStatus xcom_send(XcomHandle hh, const uint8_t* data,
         const xcom::TxDescriptor desc{
             bid, static_cast<uint16_t>(size),
             core->generation.load(std::memory_order_acquire)};
-        if (!core->submit_write(desc)) {
+        const XcomStatus submit_status = core->submit_write(desc);
+        if (XCOM_OK != submit_status) {
             core->tx.release(bid);
             core->metrics.tx_rejected.fetch_add(1U, std::memory_order_relaxed);
-            return XCOM_ERR_FULL;
+            if (XCOM_ERR_BUSY == submit_status) {
+                // The Send AO's overload Breaker refused this event; the
+                // TxBlockPool is not full. Count it apart from capacity pressure
+                // so the two causes stay attributable.
+                core->metrics.tx_rejected_overload.fetch_add(
+                    1U, std::memory_order_relaxed);
+            }
+            return submit_status;
         }
         return XCOM_OK;   // queue-and-return: no blocking on the WriteResult
     }
@@ -478,10 +535,15 @@ XCOM_API XcomStatus xcom_set_options(XcomHandle hh,
 
 // v1.4: live modem-line hot switch. `dtr`/`rts` are 1 = asserted (physical
 // pin active), 0 = deasserted, matching XcomPortConfig.dtr_enable/rts_enable.
-// Applies immediately while the port is open; returns XCOM_ERR_NOT_OPEN when
-// there is no open physical session, and XCOM_ERR_UNSUPPORTED when RTS/CTS
-// flow control owns the RTS pin (the request is silently ignored rather than
-// fighting the driver).
+// Applies immediately while the port is open. Returns XCOM_ERR_NOT_OPEN when
+// there is no open physical session (virtual/closed).
+//
+// Under RTS/CTS flow control the driver owns RTS, so no manual RTS value can be
+// applied; that half is reported as XCOM_ERR_UNSUPPORTED and is NEVER reported
+// as success (a deassert request is refused symmetrically with an assert one).
+// The DTR half is not flow-controlled and is still driven first: on that path
+// XCOM_ERR_UNSUPPORTED means "DTR was applied, RTS was not", while a genuine
+// DTR failure still surfaces as XCOM_ERR_IO / XCOM_ERR_NOT_OPEN.
 XCOM_API XcomStatus xcom_set_lines(XcomHandle hh, uint8_t dtr, uint8_t rts)
 {
     try {
@@ -494,16 +556,34 @@ XCOM_API XcomStatus xcom_set_lines(XcomHandle hh, uint8_t dtr, uint8_t rts)
         if (core->port_state.load(std::memory_order_acquire) != XCOM_PORT_OPEN) {
             return XCOM_ERR_NOT_OPEN;
         }
-        // Refuse the RTS half up front under RTS/CTS so the caller gets a
-        // deterministic UNSUPPORTED rather than a driver-dependent silence.
-        if (rts != 0U && core->cfg_flow_control == 1U) {
+        if (core->sink.owner_set_lines == nullptr) {
+            return XCOM_ERR_NOT_OPEN;
+        }
+        // Drive both halves; the sink reports a driver-owned RTS separately from
+        // a failed Win32 write. DTR is applied here even when RTS will be
+        // refused below, which is the point of driving before the RTS check.
+        const XcomStatus applied =
+            core->sink.owner_set_lines(core, dtr != 0U, rts != 0U);
+        // RTS/CTS owns the RTS pin, so the requested RTS level was not applied.
+        // NEVER return OK for it: the rts=0 case used to fall through and report
+        // a success that never reached the pin.
+        //
+        // This is a PARTIAL success, not a total failure: the DTR half was
+        // already driven above. The code is readable per half - a DTR hard
+        // failure (device removed / closed) has its own code and outranks the
+        // routine RTS refusal - so XCOM_ERR_UNSUPPORTED here uniquely means
+        // "DTR was applied, RTS was not". Callers MUST treat it that way rather
+        // than as "nothing was applied" (see window.lua's DTR/RTS hot switch).
+        // A virtual session has no backend to observe the handshake, so its
+        // NOT_OPEN is upgraded to the same deterministic refusal instead.
+        if (core->cfg_flow_control == 1U) {
+            if (!core->virtual_port &&
+                (applied == XCOM_ERR_IO || applied == XCOM_ERR_NOT_OPEN)) {
+                return applied;
+            }
             return XCOM_ERR_UNSUPPORTED;
         }
-        if (core->sink.owner_set_lines == nullptr ||
-            !core->sink.owner_set_lines(core, dtr != 0U, rts != 0U)) {
-            return XCOM_ERR_NOT_OPEN;   // virtual session: no physical pin
-        }
-        return XCOM_OK;
+        return applied;
     }
     catch (...) {
         return XCOM_ERR_IO;
@@ -513,7 +593,7 @@ XCOM_API XcomStatus xcom_set_lines(XcomHandle hh, uint8_t dtr, uint8_t rts)
 // v1.1: configure the auto-send template. data is pre-encoded raw bytes; the
 // core copies it into a dedicated template slot before returning. interval_ms
 // == 0 disables auto-send. flags uses XCOM_SEND_TEXT (HEX/CRLF are pre-applied
-// by Python). Coalesced ticks increment auto_tick_coalesced.
+// by the Lua client). Coalesced ticks increment auto_tick_coalesced.
 XCOM_API XcomStatus xcom_set_auto_template(XcomHandle hh, const uint8_t* data,
                                            uint32_t size, uint32_t interval_ms,
                                            XcomSendFlags flags)
@@ -563,8 +643,8 @@ XCOM_API XcomStatus xcom_set_auto_template(XcomHandle hh, const uint8_t* data,
 }
 
 // NOTE (v1.1): there is deliberately NO exported xcom_wait_display. The DLL
-// keeps its own internal display wake event; the Python CoreWorker drives
-// display visibility with a 10 ms poll of xcom_drain_display.
+// keeps its own internal display wake event; the Lua UI thread drives display
+// visibility with a 10 ms poll of xcom_drain_display.
 
 XCOM_API XcomStatus xcom_drain_display(XcomHandle hh, char* output,
                                        uint32_t capacity, uint32_t* written)
@@ -578,7 +658,11 @@ XCOM_API XcomStatus xcom_drain_display(XcomHandle hh, char* output,
         *written = 0U;
         xcom::CoreCtx* core = xcom::xcom_handle_core(h);
         bool completed = false;
-        if (!core->display.drain_into(output, capacity, *written, completed)) {
+        uint32_t ingress_ignored = 0U;
+        if (!core->display.drain_into(
+                output, capacity,
+                core->generation.load(std::memory_order_acquire), *written,
+                completed, ingress_ignored)) {
             return XCOM_OK;   // nothing buffered
         }
         if (completed) {
@@ -598,6 +682,53 @@ XCOM_API XcomStatus xcom_drain_display(XcomHandle hh, char* output,
     }
 }
 
+// Timestamp-aware display drain (design §3): same batch semantics as
+// xcom_drain_display, but the byte count is the return value and the batch's
+// EARLIEST ingress time (monotonic ms) is written through out_ingress_ms.  A
+// zero-byte batch leaves *out_ingress_ms unchanged so the caller's wall-clock
+// anchor is never advanced by an empty poll.
+XCOM_API uint32_t xcom_drain_display_ts(XcomHandle hh, uint8_t* out,
+                                        uint32_t capacity,
+                                        uint32_t* out_ingress_ms)
+{
+    if (hh == nullptr || out == nullptr || out_ingress_ms == nullptr) {
+        return 0U;
+    }
+    xcom::Handle* h = xcom::xcom_handle_valid(hh) ?
+                          static_cast<xcom::Handle*>(hh) : nullptr;
+    if (h == nullptr) {
+        return 0U;
+    }
+    try {
+        xcom::CoreCtx* core = xcom::xcom_handle_core(h);
+        uint32_t written = 0U;
+        bool completed = false;
+        uint32_t ingress = 0U;
+        if (!core->display.drain_into(
+                reinterpret_cast<char*>(out), capacity,
+                core->generation.load(std::memory_order_acquire), written,
+                completed, ingress)) {
+            return 0U;   // nothing buffered; *out_ingress_ms untouched
+        }
+        if (written > 0U) {
+            *out_ingress_ms = ingress;
+        }
+        if (completed) {
+            core->metrics.display_pending.fetch_sub(
+                1U, std::memory_order_relaxed);
+        }
+        // Releasing a display buffer may unblock a deferred RxDesc; retrigger
+        // through coact rather than spinning the Dispatcher.
+        if (completed && core->kick_gate.try_arm()) {
+            core->submit_rx_kick();
+        }
+        return written;
+    }
+    catch (...) {
+        return 0U;
+    }
+}
+
 XCOM_API XcomStatus xcom_get_snapshot(XcomHandle hh, XcomSnapshot* output)
 {
     try {
@@ -610,6 +741,11 @@ XCOM_API XcomStatus xcom_get_snapshot(XcomHandle hh, XcomSnapshot* output)
             return XCOM_ERR_PARAM;
         }
         xcom::CoreCtx* core = xcom::xcom_handle_core(h);
+        // This ABI is the existing 250 ms UI status poll (design §4.2 item 3):
+        // sample the three monitored threads here rather than adding a timer.
+        // It only pushes ErrorRing entries on an episode edge; the returned
+        // snapshot below is unchanged.
+        xcom::check_thread_health(core);
         output->struct_size = sizeof(XcomSnapshot);
         output->rx_bytes = core->metrics.rx_bytes.load(std::memory_order_relaxed);
         output->tx_bytes = core->metrics.tx_bytes.load(std::memory_order_relaxed);
@@ -649,6 +785,9 @@ XCOM_API XcomStatus xcom_get_snapshot(XcomHandle hh, XcomSnapshot* output)
             core->metrics.rx_loss_offset.load(std::memory_order_relaxed);
         output->rx_backpressure_events =
             core->metrics.rx_backpressure_events.load(std::memory_order_relaxed);
+        // v1.6 flow-control stall counter (appended field; see XcomSnapshot).
+        output->flow_hold_events =
+            core->metrics.flow_hold_events.load(std::memory_order_relaxed);
         return XCOM_OK;
     }
     catch (...) {

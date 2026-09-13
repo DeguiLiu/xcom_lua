@@ -17,12 +17,13 @@
 // make_critical_section(pal) — see pool.hpp / pal.hpp comments.
 //
 // SPDX-License-Identifier: MIT
-#include "pal_windows.hpp"
+#include "coact/pal_windows.hpp"
 #include "periodic_timer.hpp"
 #include "foundation/static_object_slot.hpp"
 #include "log_writer.hpp"
 #include "xcom_ao.hpp"
 #include "xcom_core.hpp"
+#include "tx_submit_status.hpp"
 #include "diagnostic.hpp"
 
 #include "coact/coordinator.hpp"
@@ -32,7 +33,9 @@
 
 #include <array>
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <thread>
 
@@ -86,45 +89,29 @@ constexpr std::array<coact::TransitionDef<DiagCtx>, 1U> kDiagTransitions{{
      [](DiagCtx& c, const coact::Event& e) noexcept { xcom::diag_tick_action(c, e); }},
 }};
 
-constexpr std::array<coact::StateDef<SerialCtx>, 4U> kSerialStates{{
-    {-1, nullptr, nullptr, "root", -1},                        // 0 root
-    {0, nullptr, nullptr, "Closed", -1},                       // 1
-    {0, nullptr, nullptr, "Open", -1},                         // 2
-    {0, nullptr, nullptr, "Fault", -1},                        // 3
+// SerialAo's lifecycle authority is SerialCtx::state (a full 5-state machine in
+// xcom_ao.cpp driven by serial_transition()). The coact HSM here is reduced to
+// a single root state whose Internal transitions only route the three lifecycle
+// signals to the action wrappers; it deliberately owns NO port state, so there
+// is exactly one authority. Keeping the signal routing (rather than calling the
+// actions directly) preserves the control-pool backpressure/critical-reserve
+// behaviour.
+constexpr std::array<coact::StateDef<SerialCtx>, 1U> kSerialStates{{
+    {-1, nullptr, nullptr, "root", -1},                        // 0
 }};
-constexpr std::array<coact::TransitionDef<SerialCtx>, 7U> kSerialTransitions{{
-    {S_CLOSED, to_signal(Signal::Open), S_OPEN, coact::TransitionKind::External, nullptr,
-     serial_do_open},
-    {S_OPEN, to_signal(Signal::Close), S_CLOSED, coact::TransitionKind::External, nullptr,
-     serial_do_close},
-    {S_FAULT, to_signal(Signal::Close), S_CLOSED, coact::TransitionKind::External, nullptr,
-     serial_do_close},
-    {S_CLOSED, to_signal(Signal::Fault), S_FAULT, coact::TransitionKind::External, nullptr,
-     serial_do_fault},
-    {S_OPEN, to_signal(Signal::Fault), S_FAULT, coact::TransitionKind::External, nullptr,
-     serial_do_fault},
-    // Reopen straight from Fault. The ABI publishes FAULT and the UI offers
-    // Open there, so without this the user's request reached a state with no
-    // matching transition and was dropped silently — coact's dispatch() just
-    // returns false and the caller, having already queued the event, had no
-    // way to tell "accepted" from "discarded". That is the "clicked Open and
-    // nothing happened" report. serial_do_open already tears the failed
-    // session down through owner_open before configuring the new one, so
-    // entering it from Fault is the same work the Close-then-Open pair did.
-    {S_FAULT, to_signal(Signal::Open), S_OPEN, coact::TransitionKind::External, nullptr,
-     serial_do_open},
-    // Open while already Open: idempotent no-op. It exists only so the event
-    // has somewhere to land — an event with no matching transition is dropped
-    // by coact's dispatch() with a false return the caller cannot see, so a
-    // double-click or a retried request vanished without a trace. It must NOT
-    // re-run serial_do_open: that closes and reopens the port, clears the RX
-    // sequencing state and advances the generation, which drops any traffic
-    // already queued in the session (smoke_test pins exactly that: two queued
-    // sends keep their distinct descriptor lengths only if the session is not
-    // restarted underneath them). Internal kind means the action runs without
-    // leaving and re-entering the state.
-    {S_OPEN, to_signal(Signal::Open), S_OPEN, coact::TransitionKind::Internal, nullptr,
-     nullptr},
+constexpr std::array<coact::TransitionDef<SerialCtx>, 3U> kSerialTransitions{{
+    {0, to_signal(Signal::Open), 0, coact::TransitionKind::Internal, nullptr,
+     [](SerialCtx& c, const coact::Event& e) noexcept {
+         xcom::serial_do_open(c, e);
+     }},
+    {0, to_signal(Signal::Close), 0, coact::TransitionKind::Internal, nullptr,
+     [](SerialCtx& c, const coact::Event& e) noexcept {
+         xcom::serial_do_close(c, e);
+     }},
+    {0, to_signal(Signal::Fault), 0, coact::TransitionKind::Internal, nullptr,
+     [](SerialCtx& c, const coact::Event& e) noexcept {
+         xcom::serial_do_fault(c, e);
+     }},
 }};
 
 // ---------------------------------------------------------------------------
@@ -134,51 +121,8 @@ constexpr std::array<coact::TransitionDef<SerialCtx>, 7U> kSerialTransitions{{
 // ---------------------------------------------------------------------------
 struct CoreState;
 struct CoreCtx;
-struct RxIngressProgress {
-    RxIngressResult result = RxIngressResult::kAllAccepted;
-    uint32_t accepted_bytes = 0U;
-};
-[[nodiscard]] static RxIngressProgress rx_ingress_progress(
-    CoreCtx* core, const uint8_t* data, uint32_t size) noexcept;
 RxIngressResult rx_ingress(CoreCtx* core, const uint8_t* data,
                            uint32_t size) noexcept;
-
-// ---------------------------------------------------------------------------
-// Exceptional-only backpressure rendezvous for the WinSerialBackend read
-// thread. The normal callback -> RxIngress path stays lock-free; this wait is
-// entered only after every fixed RxBlock is already owned downstream.
-// ---------------------------------------------------------------------------
-class RxCapacityWaiter final {
-public:
-    RxCapacityWaiter() noexcept = default;
-    RxCapacityWaiter(const RxCapacityWaiter&) = delete;
-    RxCapacityWaiter& operator=(const RxCapacityWaiter&) = delete;
-
-    [[nodiscard]] bool valid() const noexcept { return wake_event_.valid(); }
-
-    void resume() noexcept
-    {
-        wake_event_.signal();
-    }
-
-    bool wait(CoreCtx& core) noexcept
-    {
-        while (core.callback_admission.load(std::memory_order_acquire) != 0U &&
-               !core.rx.has_free_block()) {
-            if (core.callback_admission.load(std::memory_order_acquire) == 0U ||
-                core.rx.has_free_block()) {
-                break;
-            }
-            if (!wake_event_.wait(0U)) {
-                return false;
-            }
-        }
-        return core.callback_admission.load(std::memory_order_acquire) != 0U;
-    }
-
-private:
-    coact::pal::WakeEvent wake_event_;
-};
 
 // ---------------------------------------------------------------------------
 // SessionWriter - P0-1 (W-P0-A2): offload the (possibly blocking)
@@ -372,15 +316,80 @@ private:
     std::thread thread_;
 };
 
+// ---------------------------------------------------------------------------
+// Dispatcher liveness PAL adapter (design §4.2 item 3). coact's Dispatcher is
+// templated on the PAL type and calls pal_.wait_dispatcher() on every blocking
+// wait, so a thin derived PAL can timestamp the Dispatcher thread without
+// modifying coact. wait_dispatcher is shadowed (not virtual): PalT is this
+// concrete type, so the Dispatcher's non-virtual call binds here.
+//
+// Beat placement (design decision 2): mark parked for the duration of the wait
+// so an INFINITE idle sleep is not read as a wedge, then beat on return - the
+// thread has provably come back to its loop. The park start is also stamped so
+// the observer can report a LONG park as a distinct informational signal; that
+// signal cannot distinguish healthy idleness from a lost-wakeup hang, which is
+// why the wait stays INFINITE and is deliberately not given a timeout sentinel
+// (that would reintroduce the idle wakeups removed for CPU reasons). A
+// sustained event stream may never park between batches, so xcom_ao.cpp also
+// beats per dispatched action; the observer suspends evaluation while the port
+// is OPENING/CLOSING/FAULT where a synchronous owner_open/close may
+// legitimately block for seconds.
+// ---------------------------------------------------------------------------
+class ThreadBeatPal final : public coact::pal::Windows {
+public:
+    void set_dispatcher_beat(std::atomic<std::uint32_t>* beat_ms,
+                             std::atomic<std::uint32_t>* parked,
+                             std::atomic<std::uint32_t>* parked_since_ms) noexcept
+    {
+        dispatcher_beat_ms_ = beat_ms;
+        dispatcher_parked_ = parked;
+        dispatcher_parked_since_ = parked_since_ms;
+    }
+
+    void wait_dispatcher(std::uint32_t timeout_ms) noexcept
+    {
+        if (dispatcher_parked_since_ != nullptr) {
+            dispatcher_parked_since_->store(
+                static_cast<std::uint32_t>(coact::pal::monotonic_ms()),
+                std::memory_order_relaxed);
+        }
+        if (dispatcher_parked_ != nullptr) {
+            dispatcher_parked_->store(1U, std::memory_order_release);
+        }
+        coact::pal::Windows::wait_dispatcher(timeout_ms);
+        // Order matters (design section 4.4 item 1): publish the fresh beat
+        // BEFORE clearing `parked`, and clear it with release. The observer
+        // acquire-loads `parked`; if it sees 0 it is then guaranteed to also
+        // see the new beat, so it can never pair a cleared park with a stale
+        // stamp and emit one spurious fault before the next real beat.
+        if (dispatcher_beat_ms_ != nullptr) {
+            dispatcher_beat_ms_->store(
+                static_cast<std::uint32_t>(coact::pal::monotonic_ms()),
+                std::memory_order_relaxed);
+        }
+        if (dispatcher_parked_ != nullptr) {
+            dispatcher_parked_->store(0U, std::memory_order_release);
+        }
+        if (dispatcher_parked_since_ != nullptr) {
+            dispatcher_parked_since_->store(0U, std::memory_order_relaxed);
+        }
+    }
+
+private:
+    std::atomic<std::uint32_t>* dispatcher_beat_ms_ = nullptr;
+    std::atomic<std::uint32_t>* dispatcher_parked_ = nullptr;
+    std::atomic<std::uint32_t>* dispatcher_parked_since_ = nullptr;
+};
+
 struct CoreState {
-    coact::pal::Windows pal;
+    ThreadBeatPal pal;
     coact::SpinCriticalSection ctl_spin;   // P0 spinlock for the control pool
     alignas(64) std::array<std::byte,
                            kCtlPoolCapacity * kCtlBlockSize> ctl_storage{};
     coact::EventPool<kCtlBlockSize, kCtlPoolCapacity, coact::HostSmpProfile>
         ctl_pool;
 
-    coact::Runtime<XcomCoactConfig, coact::pal::Windows, coact::HostSmpProfile>
+    coact::Runtime<XcomCoactConfig, ThreadBeatPal, coact::HostSmpProfile>
         runtime;
 
     ReceiveAo recv_ao;
@@ -389,15 +398,15 @@ struct CoreState {
     SerialAo serial_ao;
     DiagnosticAo diag_ao;
 
+    // Spinlock guarding the ref-counted RX block pool's free list. Declared
+    // before `core` so it outlives the pool that binds it as its
+    // CriticalSection ctx (see EventPool::init).
+    coact::SpinCriticalSection rx_spin;
+
     CoreCtx core;
 
     // The single static SIG_RX_KICK event (pool_id=0, never recycled).
     coact::Event static_rx_kick_evt{to_signal(Signal::RxKick), 0U, 1U};
-
-    // Exceptional-only rendezvous used when the fixed Rx pool is full. It is
-    // not a task queue: the backend read thread pauses until ReceiveAo returns
-    // a block or shutdown wakes it.
-    RxCapacityWaiter rx_capacity_waiter;
 
     // Per-session write worker that runs the potentially blocking Win32 write
     // off the Dispatcher. lifecycle: started in
@@ -440,7 +449,7 @@ struct CoreState {
                     static_cast<uint16_t>(kSerialStates.size()),
                     kSerialTransitions.data(),
                     static_cast<uint16_t>(kSerialTransitions.size()),
-                    S_CLOSED, 4),
+                    0, 4),
           diag_ao(kDiagStates.data(), static_cast<uint16_t>(kDiagStates.size()),
                   kDiagTransitions.data(),
                   static_cast<uint16_t>(kDiagTransitions.size()),
@@ -478,7 +487,6 @@ struct CoreState {
         core.sink.owner_open = &sink_owner_open;
         core.sink.owner_close = &sink_owner_close;
         core.sink.owner_write = &sink_owner_write;
-        core.sink.owner_resume_rx = &sink_owner_resume_rx;
         core.sink.owner_set_lines = &sink_owner_set_lines;
         core.sink.autosend_set = &sink_autosend_set;
         core.sink.log_open = &sink_log_open;
@@ -500,7 +508,14 @@ struct CoreState {
         serial_ao.context().core = &core;
         diag_ao.context().core = &core;
 
-        if (!core.init() || !rx_capacity_waiter.valid()) {
+        // Liveness: point the PAL adapter at the Dispatcher's heartbeat slots
+        // before the Dispatcher thread starts (design §4.2 item 3).
+        pal.set_dispatcher_beat(&core.heartbeats.dispatcher_ms,
+                                &core.heartbeats.dispatcher_parked,
+                                &core.heartbeats.dispatcher_parked_since_ms);
+
+        if (!core.init() ||
+            !core.init_rx(coact::make_spin_critical_section(rx_spin))) {
             return false;
         }
         // Best-effort diag log (optional; failure is not fatal to the core).
@@ -527,6 +542,10 @@ struct CoreState {
         if (!runtime.start()) {
             return false;
         }
+        // Liveness gate: only now is the Dispatcher expected to beat. Before
+        // this the observer must not read a missing beat as a wedge.
+        core.heartbeats.dispatcher_running.store(1U,
+                                                 std::memory_order_release);
         started = true;
         return true;
     }
@@ -538,8 +557,12 @@ struct CoreState {
         autosend_set_impl(&core, 0u);
         autosend_timer_.stop();
         // 2. Stop the Dispatcher first so no AO action can touch the physical
-        //    adapter while we close it below.
+        //    adapter while we close it below. Clear the liveness gate BEFORE
+        //    the join: a stopped thread's stale stamp would otherwise read as a
+        //    stall with no recovery once parked is cleared on its final return.
         if (started) {
+            core.heartbeats.dispatcher_running.store(0U,
+                                                     std::memory_order_release);
             runtime.stop();
             started = false;
         }
@@ -553,16 +576,38 @@ struct CoreState {
         // Runtime::stop drains staged control events. Unregister the pool now,
         // before CoreState storage can be reused by a later xcom_create.
         ctl_pool.shutdown();
+        // 2a. The Dispatcher is stopped, so ReceiveAo's deferred slot is no
+        //     longer touched by anyone. Release the RX reference it retained
+        //     across kicks, or that block would never return to the pool.
+        if (recv_ao.context().has_deferred) {
+            core.rx.release(recv_ao.context().deferred.event);
+            recv_ao.context().has_deferred = false;
+        }
         // 2b. Abort the physical write before joining the sole write worker.
         serial_backend.abort_pending_write();
         writer.stop_and_join();
         writer.release_leftover_jobs(&core);
-        log_writer.shutdown(2000U);
         // 3. Force-close the adapter. close() cancels and joins its read thread,
         // so no callback runs after it returns.
         core.callback_admission.store(0u, std::memory_order_release);
-        rx_capacity_waiter.resume();
+        core.rx.wake_blocked();
         serial_backend.close();
+        // 3a. Only now, with the read thread joined and both ready rings
+        //     quiescent, stop the log writer. Keeping it alive until here means
+        //     every raw RX reference already accepted is still written by the
+        //     Close drain (flush_rx_before_close) instead of being stranded.
+        //     A stalled disk surfaces through rx_file_block_events / the error
+        //     ring; anything the close could not persist is counted in
+        //     save_rejected_bytes by process_rx_ref / drain_raw below.
+        log_writer.shutdown(2000U);
+        const uint32_t stranded_raw = core.rx.drain_raw();
+        if (stranded_raw != 0U) {
+            core.metrics.save_rejected_bytes.fetch_add(
+                stranded_raw, std::memory_order_relaxed);
+            core.errors.push(XCOM_ERR_IO, 0U,
+                             "raw RX blocks stranded at shutdown (counted as loss)");
+        }
+        static_cast<void>(core.rx.drain_display());
         // 3b. Stop the diag log writer (join its thread) before releasing the
         //     CoreCtx so no producer can push a record during teardown.
         diag_writer.shutdown();
@@ -572,23 +617,35 @@ struct CoreState {
 
     // ---- sinks (static members) ----------------------------------------
 
-    static void sink_submit_rx_kick(CoreCtx* core) noexcept
+    static bool sink_submit_rx_kick(CoreCtx* core) noexcept
     {
         CoreState* st = static_cast<CoreState*>(core->sink.impl);
         if (st == nullptr) {
-            return;
+            return false;
         }
         // Non-blocking path for the producer thread; drains into the staging
-        // High/critical partition where ReceiveAo picks it up. The High
-        // critical reserve prevents ordinary writes from rejecting the single
-        // static receive wake under load.
-        st->runtime.coordinator().submit_from_task(
-            coact::TargetId(kTargetReceive), &st->static_rx_kick_evt,
-            coact::EventQos{true, false});
+        // High/critical partition where ReceiveAo picks it up. The High critical
+        // reserve only bounds ORDINARY High claims (kHighCapacity -
+        // kHighCriticalReserve); critical High traffic is not bounded by it, so
+        // a High ring filled with critical work still refuses this wake
+        // (RejectedFull). A closed or saturated submission admission refuses it
+        // too (RejectedState). Return the outcome so CoreCtx::submit_rx_kick()
+        // can release the latch rather than leave it armed with no wake in
+        // flight.
+        const coact::SubmitResult res =
+            st->runtime.coordinator().submit_from_task(
+                coact::TargetId(kTargetReceive), &st->static_rx_kick_evt,
+                coact::EventQos{true, false});
+        return res.disposition == coact::SubmitDisposition::Queued ||
+               res.disposition == coact::SubmitDisposition::Direct;
     }
 
+    // `word` is part of the DispatchSink::submit_control function-pointer
+    // contract (xcom_core.hpp) and is unfilled in v1.2 §6, so the parameter
+    // stays but is explicitly unused here rather than changing the signature.
     static bool sink_submit_control(CoreCtx* core, uint16_t signal,
-                                    uint32_t word, bool critical) noexcept
+                                    [[maybe_unused]] uint32_t word,
+                                    bool critical) noexcept
     {
         CoreState* st = static_cast<CoreState*>(core->sink.impl);
         if (st == nullptr) {
@@ -631,18 +688,20 @@ struct CoreState {
     // v1.2 §6: submit a SIG_SEND carrying its OWN typed TxDescriptor in the
     // pooled event payload. Every accepted Tx has a distinct descriptor, so a
     // queue-and-return second send cannot overwrite a still-queued first send.
-    static bool sink_submit_write(CoreCtx* core,
-                                  const TxDescriptor& desc) noexcept
+    // Returns XCOM_OK / XCOM_ERR_BUSY / XCOM_ERR_FULL so the ABI can report the
+    // real reason instead of collapsing every refusal into "buffer full".
+    static XcomStatus sink_submit_write(CoreCtx* core,
+                                        const TxDescriptor& desc) noexcept
     {
         CoreState* st = static_cast<CoreState*>(core->sink.impl);
         if (st == nullptr) {
-            return false;
+            return XCOM_ERR_NOT_OPEN;
         }
         TxWriteLayout* lay = st->ctl_pool.alloc_typed<
             TxWriteLayout, TxDescriptor, alignof(TxDescriptor)>(
                 to_signal(Signal::Send));
         if (lay == nullptr) {
-            return false;   // control pool exhausted
+            return XCOM_ERR_FULL;   // control pool exhausted (capacity, not state)
         }
         // The event's OWN payload region holds a copy of the descriptor. No
         // cross-event shared slot is used.
@@ -653,8 +712,7 @@ struct CoreState {
         const coact::SubmitResult res =
             st->runtime.coordinator().submit_from_task(
                 coact::TargetId(kTargetSend), &lay->event, qos);
-        return res.disposition == coact::SubmitDisposition::Queued ||
-               res.disposition == coact::SubmitDisposition::Direct;
+        return tx_submit_status(res.disposition);
     }
 
     static bool sink_submit_autosend_config(
@@ -717,51 +775,28 @@ struct CoreState {
             }
         } callback_exit{*core};
 
-        if (core->callback_admission.load(std::memory_order_acquire) == 0U) {
+        if (core->callback_admission.load(std::memory_order_acquire) == 0U ||
+            core->sink.impl == nullptr) {
+            // Closing: sink_owner_close (line 932) and CoreState::shutdown (line
+            // 592) zero admission BEFORE serial_backend.close() joins the read
+            // thread, so a read that completed concurrently with the stop and is
+            // now reaped and delivered by the backend (serial_backend_win.cpp
+            // :655-663) arrives here with no owner. It cannot be ingested -
+            // keeping admission open instead would let a reader blocked in
+            // rx_ingress's file-lane wait hold close() open - so count it in the
+            // loss ledger the UI shows rather than discard it silently. This is
+            // the close-window half of the no-silent-loss rule.
+            core->count_rejected_rx(size);
+            core->diag_emit(0U, static_cast<uint16_t>(DiagEvent::kRxDrop), size,
+                            core->metrics.save_rejected_bytes.load(
+                                std::memory_order_relaxed),
+                            0U, 0U);
             return;
         }
-        CoreState* const state = static_cast<CoreState*>(core->sink.impl);
-        if (state == nullptr) {
-            return;
-        }
-        core->metrics.callback_count.fetch_add(1U, std::memory_order_relaxed);
-        const uint8_t* cursor = data;
-        uint32_t remaining = size;
-        while (remaining != 0U) {
-            const RxIngressProgress progress =
-                rx_ingress_progress(core, cursor, remaining);
-            cursor += progress.accepted_bytes;
-            remaining -= progress.accepted_bytes;
-            if (remaining == 0U) {
-                return;
-            }
-            if (core->callback_admission.load(std::memory_order_acquire) == 0U ||
-                core->port_state.load(std::memory_order_acquire) !=
-                    XCOM_PORT_OPEN) {
-                return;
-            }
-
-            // All fully committed blocks were published before this wait, so
-            // ReceiveAo can return capacity while the serial backend keeps
-            // the unaccepted tail in its read callback. Backpressure is now
-            // expressed purely by withholding reads; RTS is not toggled here
-            // because RTS/CTS flow control is driver-owned (HANDSHAKE) and
-            // manual EscapeCommFunction calls would fight it.
-            //
-            // Edge-count the episode (0 -> 1): a rising count is the only
-            // host-side early warning that the RX pool is under pressure, and
-            // it is what precedes a driver-buffer CE_RXOVER when the stall
-            // outlasts the driver's FIFO. Counted here, cleared in
-            // rx_kick_action via the existing exchange(0).
-            if (core->rx_backpressured.exchange(
-                    1U, std::memory_order_acq_rel) == 0U) {
-                core->metrics.rx_backpressure_events.fetch_add(
-                    1U, std::memory_order_relaxed);
-            }
-            if (!state->rx_capacity_waiter.wait(*core)) {
-                return;
-            }
-        }
+        // Single non-blocking ingress shared with the injected test seam:
+        // accept what the RX pool can take, count any tail drop per lane, and
+        // keep draining the driver FIFO. No capacity wait exists any more.
+        static_cast<void>(rx_ingress(core, data, size));
     }
 
     static void serial_fault_callback(CoreCtx* core, int32_t error) noexcept
@@ -771,15 +806,25 @@ struct CoreState {
             return;
         }
         core->errors.push(error, 2U, "Win32 serial read fault");
-        // Publish FAULT directly as well as via the coact event: if the control
-        // pool is exhausted (submit_control rejected below) the signal never
-        // reaches serial_do_fault and the published state would stay OPEN with
-        // a dead handle, so every later send/status would lie. The store is
-        // idempotent with the Dispatcher's own FAULT transition.
+        // The Fault signal is the normal route: serial_do_fault() runs
+        // owner_close and publishes FAULT through serial_publish(). This
+        // callback runs on the backend read thread, so it cannot call
+        // serial_publish() (that mutates Dispatcher-owned SerialCtx::state).
+        // If the control pool is exhausted and the signal is rejected, the AO
+        // never runs. Publish FAULT directly as the only writer left (I1
+        // exception, design §2.3; idempotent because it only ever writes FAULT)
+        // so the view stops reporting a dead handle as OPEN, AND latch the fault
+        // so SerialAo reconciles the state and releases the handle on its next
+        // transition (CoreCtx::fault_pending). Calling owner_close here is NOT
+        // an option: this runs on the backend read thread and owner_close joins
+        // that same thread. Without the latch the local SerialCtx::state would
+        // stay OPEN while port_state reads FAULT, so the next Open would find no
+        // edge and silently time out.
         if (!core->submit_control(to_signal(Signal::Fault), 0U, true)) {
             core->errors.push(XCOM_ERR_IO, 0U,
                               "coact fault signal rejected");
             core->port_state.store(XCOM_PORT_FAULT, std::memory_order_release);
+            core->fault_pending.store(1U, std::memory_order_release);
         }
     }
 
@@ -792,6 +837,18 @@ struct CoreState {
         if (core == nullptr || state == nullptr) {
             return;
         }
+        // Liveness: the physical read thread stamps this slot once per loop
+        // iteration. Seed it now so a reopen is never judged against a stale
+        // stamp from the previous session; a null/virtual session never beats
+        // and is excluded by the observer's port-state gate.
+        core->heartbeats.serial_read_ms.store(
+            static_cast<std::uint32_t>(coact::pal::monotonic_ms()),
+            std::memory_order_relaxed);
+        state->serial_backend.set_read_beat([core]() noexcept {
+            core->heartbeats.serial_read_ms.store(
+                static_cast<std::uint32_t>(coact::pal::monotonic_ms()),
+                std::memory_order_relaxed);
+        });
         // Virtual port: there is no backend to open, so the session is up as
         // soon as this action runs. Publish that as success here because
         // serial_do_open judges the outcome by last_open_result, and the open
@@ -810,7 +867,8 @@ struct CoreState {
             const SerialPortOptions options{
                 core->port_name.data(), core->cfg_baud, core->cfg_data_bits,
                 core->cfg_stop_bits, core->cfg_parity, core->cfg_flow_control,
-                core->cfg_dtr_enable != 0U, core->cfg_rts_enable != 0U};
+                static_cast<LineDrive>(core->cfg_dtr_enable),
+                static_cast<LineDrive>(core->cfg_rts_enable)};
             int32_t error = kSerialSuccess;
             if (!state->serial_backend.open(
                     options,
@@ -832,8 +890,11 @@ struct CoreState {
                 core->last_open_result.store(
                     error != kSerialSuccess ? error : XCOM_ERR_IO,
                     std::memory_order_release);
-                core->port_state.store(XCOM_PORT_FAULT,
-                                       std::memory_order_release);
+                // No direct port_state write: this runs inside the SerialAo's
+                // kOwnerOpen action, and serial_do_open() observes the failed
+                // last_open_result and drives the OPENING --OpenDone--> CLOSED
+                // edge through serial_publish(). Storing a state here would
+                // publish the same transition twice and from two points.
                 return;
             }
         }
@@ -841,7 +902,8 @@ struct CoreState {
             state->serial_backend.close();
             core->errors.push(XCOM_ERR_IO, 0U, "serial writer start failed");
             core->last_open_result.store(XCOM_ERR_IO, std::memory_order_release);
-            core->port_state.store(XCOM_PORT_FAULT, std::memory_order_release);
+            // As above: serial_do_open() sees this failed result and publishes
+            // CLOSED through serial_publish(); no store here.
             return;
         }
         core->callback_admission.store(1U, std::memory_order_release);
@@ -889,7 +951,15 @@ struct CoreState {
         // before taking an Rx block and the waiter observes it before retrying.
         core->callback_admission.store(0u, std::memory_order_release);
         if (st != nullptr) {
-            st->rx_capacity_waiter.resume();
+            // Wake a reader blocked on the file-lane reserve so it re-checks
+            // admission and exits. The deferred RX reference is safe to release
+            // here: this sink runs on the Dispatcher, the same thread that owns
+            // ReceiveAo's deferred slot.
+            core->rx.wake_blocked();
+            if (st->recv_ao.context().has_deferred) {
+                core->rx.release(st->recv_ao.context().deferred.event);
+                st->recv_ao.context().has_deferred = false;
+            }
             st->serial_backend.abort_pending_write();
             if (st->writer.active()) {
                 st->writer.stop_and_join();
@@ -952,13 +1022,23 @@ struct CoreState {
                                error == ERROR_INVALID_HANDLE ||
                                error == ERROR_OPERATION_ABORTED;
             if (fatal || streak >= kTxFailStreakLimit) {
-                // Publish FAULT first so the status poller sees a dead session
-                // even if the coact event is delayed or rejected; the event
-                // still runs the owner_close/physical teardown path.
-                core->port_state.store(XCOM_PORT_FAULT, std::memory_order_release);
+                // Route the fault through the AO: this callback runs on the
+                // SessionWriter thread, so it cannot call serial_publish()
+                // (Dispatcher-owned SerialCtx::state), but the Fault signal
+                // does run serial_do_fault() -> owner_close + serial_publish().
+                // Publish directly ONLY when even the critical-reserve signal
+                // is rejected, since then the AO never runs; the store is an
+                // I1 exception (design §2.3), idempotent (writes only FAULT).
+                // Latch the fault too: this runs on the SessionWriter thread, so
+                // owner_close cannot run here (it joins this thread), and the
+                // local SerialCtx::state must be reconciled on the Dispatcher
+                // before the next Open (CoreCtx::fault_pending).
                 if (!core->submit_control(to_signal(Signal::Fault), 0U, true)) {
                     core->errors.push(XCOM_ERR_IO, 0U,
                                       "writer fault signal rejected");
+                    core->port_state.store(XCOM_PORT_FAULT,
+                                           std::memory_order_release);
+                    core->fault_pending.store(1U, std::memory_order_release);
                 }
             }
             return;
@@ -968,34 +1048,66 @@ struct CoreState {
         *result = XCOM_OK;
     }
 
-    static void sink_owner_resume_rx(CoreCtx* core) noexcept
-    {
-        if (core == nullptr || core->virtual_port) {
-            return;
-        }
-        CoreState* const state = static_cast<CoreState*>(core->sink.impl);
-        if (state != nullptr) {
-            // Reads resume; RTS is left to the driver's RTS/CTS handshake.
-            state->rx_capacity_waiter.resume();
-        }
-    }
-
     // Live DTR/RTS hot switch. Called from the ABI thread (not the Dispatcher):
     // the backend only issues EscapeCommFunction, which is thread-safe on an
-    // open handle, and set_rts() self-declines while RTS is flow-controlled.
-    static bool sink_owner_set_lines(CoreCtx* core, bool dtr_asserted,
-                                     bool rts_asserted) noexcept
+    // open handle. The result is reported per pin so a driver-owned RTS (under
+    // RTS/CTS) and a failed Win32 call are distinct from an applied level - a
+    // silent success on a pin that never moved is the defect this avoids.
+    static XcomStatus sink_owner_set_lines(CoreCtx* core, bool dtr_asserted,
+                                           bool rts_asserted) noexcept
     {
         if (core == nullptr || core->virtual_port) {
-            return false;
+            return XCOM_ERR_NOT_OPEN;
         }
         CoreState* const state = static_cast<CoreState*>(core->sink.impl);
         if (state == nullptr || !state->serial_backend.is_open()) {
-            return false;
+            return XCOM_ERR_NOT_OPEN;
         }
-        state->serial_backend.set_dtr(dtr_asserted);
-        state->serial_backend.set_rts(rts_asserted);
-        return true;
+        XcomStatus result = XCOM_OK;
+        switch (state->serial_backend.set_dtr(dtr_asserted)) {
+        case LineApplyResult::Applied:
+            break;
+        case LineApplyResult::Failed:
+            result = XCOM_ERR_IO;
+            break;
+        case LineApplyResult::Closed:
+            result = XCOM_ERR_NOT_OPEN;
+            break;
+        default:
+            // DTR is never flow-control owned; treat any future outcome as a
+            // failed write rather than a silent success.
+            result = XCOM_ERR_IO;
+            break;
+        }
+        switch (state->serial_backend.set_rts(rts_asserted)) {
+        case LineApplyResult::Applied:
+            break;
+        case LineApplyResult::DriverOwned:
+            // RTS/CTS owns the pin: the requested level was NOT applied. Report
+            // it only if nothing worse happened to DTR - a real DTR failure
+            // (device gone) must outrank the routine RTS refusal, otherwise the
+            // caller would lose a genuine fault.
+            if (result == XCOM_OK) {
+                result = XCOM_ERR_UNSUPPORTED;
+            }
+            break;
+        case LineApplyResult::Failed:
+            if (result == XCOM_OK) {
+                result = XCOM_ERR_IO;
+            }
+            break;
+        case LineApplyResult::Closed:
+            if (result == XCOM_OK) {
+                result = XCOM_ERR_NOT_OPEN;
+            }
+            break;
+        default:
+            if (result == XCOM_OK) {
+                result = XCOM_ERR_IO;
+            }
+            break;
+        }
+        return result;
     }
 
     // ---- auto-send periodic timer ---------------------------------------
@@ -1025,8 +1137,12 @@ struct CoreState {
             return;
         }
         if (!core->submit_control(to_signal(Signal::Autosend), 0U, false)) {
-            // coact v1 has no merge cell. A rejected event must release the
-            // local last-value-wins gate or later ticks would be suppressed.
+            // A rejected event must release the local last-value-wins gate or
+            // later ticks would be suppressed. coact does ship a MergeCell and a
+            // PolicyOps merge hook, but its submit pipeline drives no per-signal
+            // merge registry (the coordinator leaves the merge hint
+            // unimplemented), so coalescing has to stay local to this AO rather
+            // than being handed to the framework.
             core->autosend_armed.store(0U, std::memory_order_release);
             core->metrics.tx_rejected.fetch_add(1U, std::memory_order_relaxed);
         }
@@ -1053,7 +1169,21 @@ struct CoreState {
                                       uint32_t size) noexcept
     {
         CoreState* st = static_cast<CoreState*>(core->sink.impl);
-        return st != nullptr ? st->log_writer.append(data, size) : XCOM_ERR_IO;
+        if (st == nullptr) {
+            return XCOM_ERR_IO;
+        }
+        const XcomStatus status = st->log_writer.append(data, size);
+        if (status == XCOM_ERR_FULL) {
+            /* Logging was requested and the writer had no room, so these bytes
+               never reach the file. Count them: the status return is the only
+               signal and the drain path does not inspect it, so without this the
+               capture would lose data silently while the snapshot still claimed
+               a clean run. Deliberately not counted for a closed/unopened log,
+               where nothing was asked to be persisted. */
+            core->metrics.save_rejected_bytes.fetch_add(
+                size, std::memory_order_relaxed);
+        }
+        return status;
     }
 
     static XcomStatus sink_log_flush(CoreCtx* core, uint32_t timeout_ms) noexcept
@@ -1169,87 +1299,165 @@ struct CoreState {
 
 // ---------------------------------------------------------------------------
 // RX ingress - shared by the real serial-backend callback and the injected
-// test seam. Copies the borrowed buffer into owned RxBlockPool slots (one copy
-// per <=4096 B segment), publishes RxDescriptors, then arms the kick gate and
-// submits the static SIG_RX_KICK (P0 wake bridge).
+// test seam. One copy per <=4096 B segment into a ref-counted block that is
+// fanned out to the display lane and (when a log is open) the raw/file lane.
+//
+// Loss policy: the file lane is LOSSLESS. When it cannot claim a block the
+// read thread BLOCKS on the lane wake and retries - visible as a storage stall
+// (rx_file_block_events / rx_file_blocked_ms), never a drop. The display lane
+// never blocks the reader: when it cannot take a segment (the file reserve
+// must stay intact) those bytes are counted as DISPLAY BACKLOG
+// (rx_pool_exhausted_bytes) and the reader continues; the file log keeps the
+// authoritative complete stream. With NO log open there is no authoritative
+// copy, so a segment the display cannot take is real loss and is counted in
+// save_rejected_bytes (the ledger the UI shows as DATA LOSS), never as backlog.
 // ---------------------------------------------------------------------------
-RxIngressProgress rx_ingress_progress(CoreCtx* core, const uint8_t* data,
-                                      uint32_t size) noexcept
-{
-    if (core == nullptr || data == nullptr || size == 0U) {
-        return {RxIngressResult::kAllAccepted, size};
-    }
-    if (core->port_state.load(std::memory_order_acquire) != XCOM_PORT_OPEN) {
-        return {RxIngressResult::kPartialAccepted, 0U};
-    }
-
-    // Accept the payload block-by-block. There is no up-front free-block
-    // pre-check: a second producer can drain the free ring between a check and
-    // the first acquire (TOCTOU). Each block is acquired individually; any
-    // tail that cannot be committed is counted exactly (never the whole size).
-    uint32_t remaining = size;
-    const uint8_t* p = data;
-    while (remaining > 0U) {
-        uint16_t bid = 0U;
-        uint8_t* dst = core->rx.try_acquire_block(bid);
-        if (dst == nullptr) {
-            break;
-        }
-        const uint32_t n =
-            (remaining > kRxBlockBytes) ? kRxBlockBytes : remaining;
-        std::memcpy(dst, p, n);
-        RxDesc d;
-        d.block = bid;
-        d.len = static_cast<uint16_t>(n);
-        d.seq = core->metrics.rx_seq.fetch_add(1U, std::memory_order_relaxed);
-        d.gen = static_cast<uint16_t>(
-            core->generation.load(std::memory_order_relaxed));
-        if (!core->rx.push_ready(d)) {
-            core->rx.release_block(bid);
-            break;
-        }
-        core->metrics.rx_bytes.fetch_add(n, std::memory_order_relaxed);
-        remaining -= n;
-        p += n;
-    }
-
-    // Publish the static kick after every non-empty committed prefix, not only
-    // after an all-or-nothing callback. The serial callback may be waiting for
-    // capacity to accept its remaining bytes, and this is what frees it.
-    const uint32_t accepted = size - remaining;
-    if (accepted != 0U && core->kick_gate.try_arm()) {
-        core->submit_rx_kick();
-    }
-    return {remaining == 0U ? RxIngressResult::kAllAccepted
-                            : RxIngressResult::kPartialAccepted,
-            accepted};
-}
-
 RxIngressResult rx_ingress(CoreCtx* core, const uint8_t* data,
                            uint32_t size) noexcept
 {
     if (core == nullptr || data == nullptr || size == 0U) {
         return RxIngressResult::kAllAccepted;
     }
+    if (core->port_state.load(std::memory_order_acquire) != XCOM_PORT_OPEN) {
+        // The read thread starts inside owner_open (serial_backend_win.cpp:224)
+        // while the AO has already published OPENING, so a device that is
+        // already transmitting can deliver a completed read before OPEN is
+        // published; a late batch after a close lands here too. Neither has an
+        // owner, and a silent return here was the open-path twin of the
+        // close-window loss. Count it in the loss ledger the UI shows.
+        core->count_rejected_rx(size);
+        core->diag_emit(0U, static_cast<uint16_t>(DiagEvent::kRxDrop), size,
+                        core->metrics.save_rejected_bytes.load(
+                            std::memory_order_relaxed),
+                        0U, 0U);
+        return RxIngressResult::kPartialAccepted;
+    }
     core->metrics.callback_count.fetch_add(1U, std::memory_order_relaxed);
-    const RxIngressProgress progress = rx_ingress_progress(core, data, size);
-    if (progress.result == RxIngressResult::kPartialAccepted) {
-        const uint32_t unaccepted = size - progress.accepted_bytes;
+
+    CoreState* const state = static_cast<CoreState*>(core->sink.impl);
+    // Lease the file lane for the whole ingress. close() closes admission and
+    // waits for every in-flight lease before it drains the raw ring and resets
+    // the file, so a segment that sampled a file owner can never publish after
+    // the final drain. A refused lease means close began: the segment has no
+    // file owner, and any drop of it is counted as loss below.
+    const bool file_lane =
+        (state != nullptr) && state->log_writer.acquire_lease();
+
+    uint32_t remaining = size;
+    const uint8_t* p = data;
+    uint32_t display_backlog = 0U;
+    uint32_t unowned_drop = 0U;
+    bool block_episode = false;
+    std::chrono::steady_clock::time_point block_start{};
+
+    while (remaining > 0U) {
+        bool display_ok = false;
+        coact::Event* const ev = core->rx.try_alloc(file_lane, display_ok);
+        if (ev == nullptr) {
+            if (file_lane) {
+                // File-lane reserve exhausted: the disk has stalled for
+                // seconds. Block until the writer releases a block; NEVER drop.
+                if (!block_episode) {
+                    block_episode = true;
+                    block_start = std::chrono::steady_clock::now();
+                    core->metrics.rx_file_block_events.fetch_add(
+                        1U, std::memory_order_relaxed);
+                    if (core->rx_backpressured.exchange(
+                            1U, std::memory_order_acq_rel) == 0U) {
+                        core->metrics.rx_backpressure_events.fetch_add(
+                            1U, std::memory_order_relaxed);
+                    }
+                    core->errors.push(XCOM_ERR_IO, 0U,
+                                      "storage stalled: RX file lane full");
+                }
+                if (core->callback_admission.load(std::memory_order_acquire) ==
+                        0U ||
+                    core->port_state.load(std::memory_order_acquire) !=
+                        XCOM_PORT_OPEN) {
+                    // Session closing: the tail has no owner. Count it too, so
+                    // a close boundary never silently swallows accepted bytes.
+                    unowned_drop += remaining;
+                    break;
+                }
+                static_cast<void>(core->rx.wait_for_free(50U));
+                continue;
+            }
+            // No log owner: there is no authoritative copy of these bytes, so
+            // they are true loss, not display backlog. Count them in the loss
+            // ledger the UI surfaces; rx_pool_exhausted_bytes stays reserved
+            // for display backlog that a log still holds.
+            unowned_drop += remaining;
+            break;
+        }
+
+        const uint32_t n =
+            (remaining > kRxBlockBytes) ? kRxBlockBytes : remaining;
+        std::memcpy(core->rx.payload(ev), p, n);
+
+        RxDesc ref;
+        ref.event = ev;
+        ref.len = static_cast<uint16_t>(n);
+        ref.gen = static_cast<uint16_t>(
+            core->generation.load(std::memory_order_relaxed));
+        ref.ingress_ms =
+            static_cast<uint32_t>(coact::pal::monotonic_ms());
+        // rx_sequence stays the ABI's committed-block counter.
+        static_cast<void>(
+            core->metrics.rx_seq.fetch_add(1U, std::memory_order_relaxed));
+
+        if (!core->rx.publish(ref, file_lane, display_ok)) {
+            display_backlog += n;   // display skipped this segment
+        }
+        if (file_lane && state != nullptr) {
+            state->log_writer.wake_rx();
+        }
+        core->metrics.rx_bytes.fetch_add(n, std::memory_order_relaxed);
+        remaining -= n;
+        p += n;
+    }
+
+    if (block_episode) {
+        const auto elapsed =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - block_start)
+                .count();
+        core->metrics.rx_file_blocked_ms.fetch_add(
+            static_cast<uint32_t>(elapsed), std::memory_order_relaxed);
+    }
+
+    const uint32_t accepted = size - remaining;
+    if (display_backlog != 0U) {
         core->metrics.rx_pool_exhausted_bytes.fetch_add(
-            unaccepted, std::memory_order_relaxed);
-        // Locate the gap: rx_bytes already includes this call's accepted
-        // prefix, so this is the absolute accepted-byte offset at which the
-        // dropped tail begins. Pool drops only occur on the injected path
-        // (rx_ingress); the live serial callback waits for capacity instead.
+            display_backlog, std::memory_order_relaxed);
+        // Locate the display gap in the accepted stream. This is display
+        // backlog, not file loss: the raw lane still holds every byte.
         core->metrics.rx_loss_offset.store(
             core->metrics.rx_bytes.load(std::memory_order_relaxed),
             std::memory_order_relaxed);
         core->diag_emit(0U, static_cast<uint16_t>(DiagEvent::kRxDrop),
-                        unaccepted,
+                        display_backlog,
                         core->metrics.rx_pool_exhausted_bytes.load(
                             std::memory_order_relaxed), 0U, 0U);
     }
-    return progress.result;
+    if (unowned_drop != 0U) {
+        // No file and no display slot: these bytes are gone. Ledger them where
+        // the UI already looks for loss so accepted != persisted is visible.
+        core->count_rejected_rx(unowned_drop);
+        core->diag_emit(0U, static_cast<uint16_t>(DiagEvent::kRxDrop),
+                        unowned_drop,
+                        core->metrics.save_rejected_bytes.load(
+                            std::memory_order_relaxed), 0U, 0U);
+    }
+    if (accepted != 0U && core->kick_gate.try_arm()) {
+        core->submit_rx_kick();
+    }
+    if (file_lane && state != nullptr) {
+        // Every reference is on the raw ring before the lease drops, which is
+        // what makes the Close drain see it.
+        state->log_writer.release_lease();
+    }
+    return remaining == 0U ? RxIngressResult::kAllAccepted
+                            : RxIngressResult::kPartialAccepted;
 }
 
 void line_status_ingress(CoreCtx* core, uint32_t framing_errors,
@@ -1390,6 +1598,129 @@ CoreCtx* xcom_handle_core(Handle* h) noexcept
         return nullptr;
     }
     return &h->state.core;
+}
+
+// ---------------------------------------------------------------------------
+// Thread liveness observer (design §4.2 item 3). Runs on the existing 250 ms
+// snapshot poll; it only REPORTS (one ErrorRing entry per fault episode and one
+// per recovery) and never kills a thread or drops data (design §4.3).
+// ---------------------------------------------------------------------------
+namespace {
+
+// `parked` also carries "not expected to run right now" (port closed, or the
+// thread has not started); `running` is false once the thread has stopped, so a
+// stale stamp is not read as an endless stall. The state is owned by the single
+// snapshot-poll observer.
+void report_thread_health(CoreCtx* core, const char* name,
+                          LivenessState& state, std::uint32_t last_beat_ms,
+                          std::uint32_t timeout_ms, bool running,
+                          bool parked) noexcept
+{
+    state.last_beat_ms = last_beat_ms;
+    const LivenessResult result = liveness_evaluate(
+        state, static_cast<std::uint32_t>(coact::pal::monotonic_ms()),
+        timeout_ms, running, parked);
+    std::array<char, 256U> message{};
+    if (result.edge == LivenessEdge::kFault) {
+        std::snprintf(
+            message.data(), message.size(),
+            "thread stalled: %s no beat for %u ms (reported, not killed)",
+            name, result.elapsed_ms);
+        core->errors.push(XCOM_ERR_TIMEOUT, 0U, message.data());
+    }
+    else if (result.edge == LivenessEdge::kRecovery) {
+        std::snprintf(message.data(), message.size(),
+                      "thread recovered: %s beating again", name);
+        core->errors.push(XCOM_OK, 0U, message.data());
+    }
+}
+
+// Distinct from report_thread_health: a long park is NOT a stall. It is pushed
+// with XCOM_OK (non-alarming) and worded so the operator can see "parked" and
+// know this signal cannot tell healthy idleness from a lost-wakeup hang.
+void report_dispatcher_park(CoreCtx* core, std::uint32_t parked_since_ms,
+                            bool running) noexcept
+{
+    ParkWatchState& state = core->heartbeats.dispatcher_park_state;
+    const LivenessResult result = liveness_evaluate_park(
+        state, static_cast<std::uint32_t>(coact::pal::monotonic_ms()),
+        parked_since_ms, kDispatcherParkedInfoMs, running);
+    std::array<char, 256U> message{};
+    if (result.edge == LivenessEdge::kFault) {
+        std::snprintf(message.data(), message.size(),
+                      "dispatcher parked %u ms: idle (healthy) or lost wakeup "
+                      "- this signal cannot distinguish",
+                      result.elapsed_ms);
+        core->errors.push(XCOM_OK, 0U, message.data());
+    }
+    else if (result.edge == LivenessEdge::kRecovery) {
+        core->errors.push(XCOM_OK, 0U,
+                          "dispatcher left a long parked wait");
+    }
+}
+
+}  // namespace
+
+void check_thread_health(CoreCtx* core) noexcept
+{
+    if (core == nullptr) {
+        return;
+    }
+    const uint16_t port_state =
+        core->port_state.load(std::memory_order_relaxed);
+
+    // Serial read: only while a physical read thread is expected to run. A
+    // virtual session owns no read thread and a closed port's thread has exited,
+    // so an absent beat is healthy there, not a wedge.
+    const bool read_active =
+        (port_state == XCOM_PORT_OPEN) && (!core->virtual_port);
+    report_thread_health(
+        core, "serial read", core->heartbeats.serial_read_state,
+        core->heartbeats.serial_read_ms.load(std::memory_order_relaxed),
+        kSerialReadBeatTimeoutMs, true, !read_active);
+
+    // Dispatcher: a synchronous owner_open/owner_close may legitimately block
+    // for seconds while the port is OPENING/CLOSING/FAULT (the ABI open caller
+    // waits up to ~2 s), so suspend the check during a transition rather than
+    // misreport a legitimate block as a wedge. The lifecycle gate suppresses
+    // the stale stamp a stopped Dispatcher leaves behind.
+    const bool dispatcher_running =
+        (core->heartbeats.dispatcher_running.load(std::memory_order_acquire) != 0U);
+    const bool dispatcher_transitioning =
+        (port_state == XCOM_PORT_OPENING) ||
+        (port_state == XCOM_PORT_CLOSING) ||
+        (port_state == XCOM_PORT_FAULT);
+    const bool dispatcher_parked =
+        dispatcher_running &&
+        (dispatcher_transitioning ||
+         (core->heartbeats.dispatcher_parked.load(std::memory_order_acquire) != 0U));
+    report_thread_health(
+        core, "dispatcher", core->heartbeats.dispatcher_state,
+        core->heartbeats.dispatcher_ms.load(std::memory_order_relaxed),
+        kDispatcherBeatTimeoutMs, dispatcher_running, dispatcher_parked);
+
+    // Parked-watch: a park is not a stall, so this is a separate informational
+    // signal. Only a REAL wait-park is watched here (a transition park is a
+    // synchronous action, already exempt above).
+    const bool wait_parked =
+        (core->heartbeats.dispatcher_parked.load(std::memory_order_acquire) != 0U);
+    const std::uint32_t parked_since_ms = wait_parked
+        ? core->heartbeats.dispatcher_parked_since_ms.load(std::memory_order_acquire)
+        : 0U;
+    report_dispatcher_park(core, parked_since_ms, dispatcher_running);
+
+    // Log writer: its lifecycle gate is 0 until the writer thread starts and
+    // after it has stopped, so a zero stamp is skipped and a stale one is not a
+    // wedge. It parks around its INFINITE idle wake, so a merely-quiet writer
+    // stays healthy. A writer retrying a dead disk keeps beating; the
+    // storage-stall episode - not this check - reports that.
+    const bool log_writer_running =
+        (core->heartbeats.log_writer_running.load(std::memory_order_acquire) != 0U);
+    report_thread_health(
+        core, "log writer", core->heartbeats.log_writer_state,
+        core->heartbeats.log_writer_ms.load(std::memory_order_relaxed),
+        kLogWriterBeatTimeoutMs, log_writer_running,
+        core->heartbeats.log_writer_parked.load(std::memory_order_acquire) != 0U);
 }
 
 bool xcom_handle_valid(const void* p) noexcept

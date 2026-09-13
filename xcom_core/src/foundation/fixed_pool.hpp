@@ -40,14 +40,25 @@ public:
 
     void* allocate() noexcept
     {
-        std::uint64_t head = head_.load(std::memory_order_relaxed);
+        // The acquire load (and the acquire CAS failure ordering below) is not
+        // decoration. `load_next` reads a block's non-atomic free-list link,
+        // which a concurrent release publishes with a PLAIN store BEFORE its
+        // release CAS. A relaxed head load observes the index without an
+        // acquire edge to that store, so on a weakly-ordered target the link
+        // can be read stale and an already-claimed block handed out again. The
+        // acquire edge on the head load orders the link read after the
+        // releaser's store; the failure ordering must be acquire too, because a
+        // failed CAS refreshes `head` and the next iteration reads the new
+        // head's link. Do NOT relax either ordering back.
+        std::uint64_t head = head_.load(std::memory_order_acquire);
         while (index(head) != kEmpty) {
             const std::uint32_t current = index(head);
             const std::uint32_t next = load_next(current);
             const std::uint64_t desired = pack(next, tag(head) + 1U);
             if (head_.compare_exchange_weak(head, desired,
                                             std::memory_order_acq_rel,
-                                            std::memory_order_relaxed)) {
+                                            std::memory_order_acquire)) {
+                debug_mark_allocated(current);
                 return block_ptr(current);
             }
         }
@@ -58,6 +69,7 @@ public:
     {
         COACT_ASSERT(owns(block));
         const std::uint32_t current = block_index(block);
+        debug_check_allocated(current);
         std::uint64_t head = head_.load(std::memory_order_relaxed);
         for (;;) {
             store_next(current, index(head));
@@ -122,10 +134,36 @@ private:
         std::memcpy(&next, storage_.data() + (stride() * block), sizeof(next));
         return next;
     }
+    // Debug-only owner tracking. A double release of a VALID block id silently
+    // pushes the block twice, after which two consumers can hold the same id
+    // and write one buffer. Detecting it needs per-block allocated state, whose
+    // atomic store would sit on the allocate/release hot path, so it is
+    // compiled out of release builds (NDEBUG) and costs nothing in production.
+    // Do not promote this to a release check without weighing that cost.
+#ifndef NDEBUG
+    void debug_mark_allocated(std::uint32_t block) noexcept
+    {
+        allocated_[block] = true;
+    }
+    void debug_check_allocated(std::uint32_t block) noexcept
+    {
+        COACT_ASSERT(allocated_[block]);
+        allocated_[block] = false;
+    }
+#else
+    void debug_mark_allocated(std::uint32_t) noexcept {}
+    void debug_check_allocated(std::uint32_t) noexcept {}
+#endif
 
     alignas(std::max_align_t)
         std::array<std::byte, stride() * BlockCount> storage_{};
     std::atomic<std::uint64_t> head_;
+#ifndef NDEBUG
+    // Distinct indices are written by different threads only under valid
+    // ownership (one owner per block), so plain bools suffice; the same index
+    // is only touched concurrently by the double-release bug being detected.
+    std::array<bool, BlockCount> allocated_{};
+#endif
 };
 
 }  // namespace xcom::foundation

@@ -4,10 +4,12 @@
 #ifndef XCOM_SERIAL_BACKEND_WIN_HPP_
 #define XCOM_SERIAL_BACKEND_WIN_HPP_
 
+#include <cstddef>
 #include <cstdint>
 #include <atomic>
 #include <string_view>
 #include <thread>
+#include <utility>   // std::move
 
 #include "foundation/fixed_function.hpp"
 #include "foundation/unique_handle.hpp"
@@ -31,9 +33,25 @@ inline constexpr std::int32_t kSerialSuccess = 0;
 // deliberately small: one 4096-byte frame takes ~3.6 ms at 115200 baud and
 // ~43 ms at 9600 baud, so 200 ms covers the tail of an already-started frame
 // (the case that matters for a half-frame wedging a bootloader) without letting
-// a stalled peer stall shutdown. Keep this well under the 2000 ms ABI close
-// budget the runtime reserves.
+// a stalled peer stall shutdown. This is only the write-drain share of teardown;
+// the read loop's cancelled-read grace (kCancelledReadGraceMs = 1500 ms,
+// serial_backend_win.cpp) adds to it, so the whole backend teardown can hold the
+// Dispatcher for up to ~1.7 s. That still fits the ~2000 ms close budget the
+// runtime reserves on the exit path (the xcom_ffi.close default timeout). A
+// shorter wait does not cover it: core_close defaults to CLOSE_WAIT_MS = 200 ms
+// (window.lua), which can return before this grace expires and leaves the close
+// to finish asynchronously, with the poll_status CLOSING watchdog covering a
+// teardown that never confirms.
 inline constexpr std::uint32_t kTxDrainGraceMs = 200U;
+
+// Bounded per-read tick (ms). Each overlapped ReadFile is allowed at most this
+// long, so an idle line completes the IRP with 0 bytes roughly every 50 ms
+// instead of the read returning immediately and spinning the loop (the old
+// ReadIntervalTimeout = MAXDWORD / zero-totals combination). The trade-off is a
+// 50 ms ceiling on receive latency; in exchange the read thread never
+// busy-polls and the per-completion ClearCommError is bounded to ~20 Hz when
+// idle. See configure() for the exact COMMTIMEOUTS triple.
+inline constexpr std::uint32_t kReadTickTimeoutMs = 50U;
 
 // COMSTAT.f*Hold bits mirrored out of a stalled transmit (see write()'s
 // `line_status` out-parameter). A timed-out send is frequently not a broken
@@ -68,6 +86,30 @@ inline constexpr std::uint32_t kLineStatusXoffHold = 1U << 2U;  // peer sent XOF
     return "Win32 serial write timeout: peer not reading (TX buffer full)";
 }
 
+// Extract the first NUL-terminated string of a REG_MULTI_SZ property buffer as
+// SetupDiGetDeviceRegistryPropertyA returns SPDRP_HARDWAREID. Pure, bounded (at
+// most `out_size - 1` bytes copied, always NUL-terminated), and free of Win32
+// types so the hardware-free host test covers the parse without SetupAPI. An
+// empty property - which some composite/virtual ports expose - yields "".
+inline void copy_first_multi_sz(const std::uint8_t* raw,
+                                std::uint32_t raw_bytes, char* out,
+                                std::size_t out_size) noexcept
+{
+    if (out == nullptr || out_size == 0U) {
+        return;
+    }
+    out[0] = '\0';
+    if (raw == nullptr) {
+        return;
+    }
+    std::size_t i = 0U;
+    while (i + 1U < out_size && i < raw_bytes && raw[i] != 0U) {
+        out[i] = static_cast<char>(raw[i]);
+        ++i;
+    }
+    out[i] = '\0';
+}
+
 // Enumerate Windows serial ports from the registry
 // (HKEY_LOCAL_MACHINE\HARDWARE\DEVICEMAP\SERIALCOMM). Fills `out` up to its
 // caller-provided capacity and returns the total number discovered, preserving
@@ -75,7 +117,8 @@ inline constexpr std::uint32_t kLineStatusXoffHold = 1U << 2U;  // peer sent XOF
 // Win32 types leak past this TU boundary.
 //
 // Backward-compatible wrapper: never probes occupancy and discards any
-// enumeration error (busy stays 0). Prefer enumerate_serial_ports_ex when the
+// enumeration error (busy stays 0). It DOES fill hardware_id, which is a
+// non-disturbing registry read. Prefer enumerate_serial_ports_ex when the
 // caller needs the failure reason or the busy flag.
 std::uint32_t enumerate_serial_ports(XcomPortInfo* out, std::uint32_t capacity);
 
@@ -86,12 +129,22 @@ std::uint32_t enumerate_serial_ports(XcomPortInfo* out, std::uint32_t capacity);
 // SERIALCOMM key is the normal "no ports present" state, NOT an error, so it
 // returns count 0 with *error == 0.
 //
+// Every returned entry also carries its stable PnP hardware id
+// (XcomPortInfo.hardware_id, v1.6): the first string of SetupAPI
+// SPDRP_HARDWAREID for the matching device, or "" when the property is absent
+// (expected for some composite/virtual ports). This is a REGISTRY-ONLY property
+// read - it NEVER opens the port, programs a DCB, or issues a line IOCTL - so it
+// runs on the default path without risking a target reset and gives reconnect a
+// key that survives COMx renumbering.
+//
 // When `probe_busy` is true each discovered port is probed for exclusive
 // occupancy: CreateFileW(share mode 0) is attempted and, on success, the handle
 // is closed immediately. The probe never calls SetCommState or
 // EscapeCommFunction and never performs I/O, so the DCB is not programmed and
 // no SET_DTR/SET_RTS IOCTL is issued. A failed probe with
-// GetLastError() == ERROR_ACCESS_DENIED sets info.busy = 1.
+// GetLastError() == ERROR_ACCESS_DENIED (or ERROR_SHARING_VIOLATION, which
+// some filter/redirector drivers return for the same exclusive occupancy) sets
+// info.busy = 1.
 //
 // STABILITY: probe_busy must be false for the default/safe path. A plain open
 // still delivers an open IRP and some USB-UART bridges assert DTR on open,
@@ -103,6 +156,46 @@ std::uint32_t enumerate_serial_ports_ex(XcomPortInfo* out,
                                         bool probe_busy,
                                         std::int32_t& error);
 
+// Tri-state modem-line drive requested at open. A bool could only express
+// "drive the pin active" or "drive it inactive", and BOTH move a target line
+// that a developer may have wired to a control pin (DTR is commonly on an MCU
+// NRST/BOOT input), so there was no way to ask the open path to leave the line
+// untouched. The numeric values match XcomPortConfig.dtr_enable / rts_enable so
+// the ABI-to-backend mapping is a plain static_cast; the enum keeps intent named
+// inside the core.
+//
+// LIMITATION (do not overstate): even LeaveAlone cannot stop CreateFileW itself
+// from changing the pin. Some USB-UART bridges (CP210x/CH340 auto-reset
+// circuits) drive DTR on the open IRP before any DCB is programmed, which is
+// outside user-mode control. LeaveAlone suppresses only the transition THIS
+// backend would otherwise issue (SetCommState fDtrControl plus the explicit
+// EscapeCommFunction replay). Whether a target actually stops resetting must be
+// confirmed on real hardware with a logic analyser on the bridge DTR/RTS and
+// the target NRST/BOOT.
+enum class LineDrive : std::uint8_t {
+    Deassert = 0U,    // drive inactive: CLRxxx, DCB *_CONTROL_DISABLE
+    Assert = 1U,      // drive active: SETxxx, DCB *_CONTROL_ENABLE
+    LeaveAlone = 2U,  // do not drive: skip EscapeCommFunction (DCB still
+                      // programs *_CONTROL_DISABLE, the least-driving value
+                      // available, but that is NOT a high-impedance state)
+};
+
+// True when `drive` is one of the three defined states. Used by the backend's
+// pre-open validation so an out-of-range value can never reach EscapeCommFunction
+// or a DCB write. Header-inline, like valid_line_format, so the hardware-free
+// host test covers it without an adapter.
+[[nodiscard]] inline bool valid_line_drive(LineDrive drive) noexcept
+{
+    switch (drive) {
+    case LineDrive::Deassert:
+    case LineDrive::Assert:
+    case LineDrive::LeaveAlone:
+        return true;
+    default:
+        return false;
+    }
+}
+
 struct SerialPortOptions final {
     std::string_view port_name;
     std::uint32_t baud = 0U;
@@ -110,9 +203,31 @@ struct SerialPortOptions final {
     std::uint8_t stop_bits = 0U;
     std::uint8_t parity = 0U;
     std::uint8_t flow_control = 0U;
-    bool dtr_enabled = false;
-    bool rts_enabled = false;
+    LineDrive dtr_drive = LineDrive::Deassert;
+    LineDrive rts_drive = LineDrive::Deassert;
 };
+
+// Line-format legality this backend enforces BEFORE opening the port. The Win32
+// driver does not reject an illegal request, it silently coerces it (e.g. an
+// unsupported baud rounds off, and 1.5 stop bits with 8 data bits becomes 1 stop
+// bit), which would make open() report success for a port that was not actually
+// configured as asked. 1.5 stop bits exist only for a 5-data-bit word; the
+// ABI/config encoding of stop_bits is 0 = 1, 1 = 1.5, 2 = 2. Header-inline so
+// the hardware-free host test can cover the cross-check without an adapter.
+[[nodiscard]] inline bool valid_line_format(std::uint8_t data_bits,
+                                            std::uint8_t stop_bits) noexcept
+{
+    if (data_bits < 5U || data_bits > 8U) {
+        return false;
+    }
+    if (stop_bits > 2U) {
+        return false;
+    }
+    if (stop_bits == 1U && data_bits != 5U) {
+        return false;
+    }
+    return true;
+}
 
 // v1.5 line-status report from ClearCommError, classified inside the Win32
 // layer so no CE_*/COMSTAT constant leaks upward. Each category is 0/1 per
@@ -130,6 +245,19 @@ struct SerialLineStatus final {
     std::uint32_t error_flags = 0U;      // raw ClearCommError lpErrors
     std::uint32_t cb_in_que = 0U;        // COMSTAT.cbInQue
     std::uint32_t cb_out_que = 0U;       // COMSTAT.cbOutQue
+};
+
+// Outcome of one manual modem-line write. A bare void made three different
+// outcomes indistinguishable: the pin was driven, the driver owns the pin under
+// flow control so the request was deliberately not applied, or the Win32 call
+// failed outright. The first must be reported as success and the other two must
+// not - reporting a driver-owned or failed write as applied is the false
+// success this enum exists to prevent.
+enum class LineApplyResult : std::uint8_t {
+    Applied = 0U,   // EscapeCommFunction succeeded; the driver accepted the level
+    DriverOwned,    // RTS under RTS/CTS: the driver toggles the pin, request skipped
+    Failed,         // EscapeCommFunction returned FALSE (e.g. device removed)
+    Closed,         // no open port handle
 };
 
 class WinSerialBackend final {
@@ -176,14 +304,28 @@ public:
     // Manual modem-line control. `asserted` is the physical pin state the UI
     // exposes: true drives the line active (EscapeCommFunction SETxxx), false
     // drives it inactive (CLRxxx). Safe to call from any thread while the port
-    // is open; no-ops once it has closed.
+    // is open. The caller MUST inspect the result: a failed or driver-owned
+    // write must never be surfaced as an applied one.
     //
     // Under RTS/CTS hardware flow control the driver owns RTS
-    // (fRtsControl = RTS_CONTROL_HANDSHAKE), so set_rts() is a no-op then.
-    void set_rts(bool asserted) noexcept;
-    void set_dtr(bool asserted) noexcept;
+    // (fRtsControl = RTS_CONTROL_HANDSHAKE), so set_rts() returns DriverOwned
+    // and issues no IOCTL; set_dtr() is never affected by flow control.
+    [[nodiscard]] LineApplyResult set_rts(bool asserted) noexcept;
+    [[nodiscard]] LineApplyResult set_dtr(bool asserted) noexcept;
 
     [[nodiscard]] bool is_open() const noexcept;
+
+    // Liveness sink (design §4.2 item 3): the read loop calls `on_beat` once per
+    // iteration - including the ~20 Hz zero-byte completions of an idle line -
+    // so the core can tell "quiet line" from "read thread wedged". An empty
+    // callback disables the stamp (and keeps this TU free of any coact/clock
+    // dependency, so the hardware-free tx_diag_test still links without it). Set
+    // by the owner before open(); the callback must outlive the read thread.
+    using BeatCallback = foundation::FixedFunction<void()>;
+    void set_read_beat(BeatCallback on_beat) noexcept
+    {
+        on_beat_ = std::move(on_beat);
+    }
 
 
 private:
@@ -213,6 +355,9 @@ private:
     std::thread read_thread_;
     std::atomic<bool> stop_requested_{false};
     std::atomic<bool> open_{false};
+    // Core-installed liveness stamp called once per read-loop iteration; empty
+    // until the owner installs it (see set_read_beat).
+    BeatCallback on_beat_;
     // True while a WriteFile is pending on write_overlapped_. Lets the bounded
     // teardown drain distinguish "a frame is in flight, give it grace" from
     // "nothing to drain, cancel immediately". Set on ERROR_IO_PENDING and

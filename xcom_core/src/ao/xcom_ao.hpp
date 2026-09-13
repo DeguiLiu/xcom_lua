@@ -35,20 +35,20 @@ namespace xcom {
 struct RxCtx {
     CoreCtx* core = nullptr;
     // A block that could not enter DisplayLane remains owned by ReceiveAo.
-    // It is retried after the CoreWorker drains a display batch; it is never
-    // converted into ui_trimmed_bytes merely because the UI is briefly slow.
+    // It is retried after the ABI drain caller (the Lua UI thread) drains a
+    // display batch; it is never converted into ui_trimmed_bytes merely because
+    // the UI is briefly slow.
     RxDesc deferred{};
     bool has_deferred = false;
 };
 
-// Write the `[HH:MM:SS.mmm] ` timestamp prefix (15 bytes) into `out` when the
-// `timestamp` display option is enabled. Returns the number of chars written
-// (0 when disabled). Defined in xcom_ao.cpp.
-uint32_t rx_timestamp_prefix(const CoreCtx* core, uint8_t* out) noexcept;
-
 // Format one received block [bytes..bytes+len) into the display lane per the
-// current view. The block is released by the caller. Defined in xcom_ao.cpp.
-bool rx_format_block(RxCtx* self, const uint8_t* bytes, uint32_t len);
+// current view.  `ingress_ms` is the block's arrival time (monotonic ms),
+// carried onto the display descriptor for the Lua timestamp stage.  The block
+// is released by the caller.  No timestamp text is injected.  Defined in
+// xcom_ao.cpp.
+bool rx_format_block(RxCtx* self, const uint8_t* bytes, uint32_t len,
+                     uint32_t ingress_ms);
 
 // Handle a SIG_RX_KICK (P0 wake bridge): drain up to 4 blocks on the
 // Dispatcher, then run the disarm -> acquire-recheck -> arm -> resubmit
@@ -116,13 +116,22 @@ struct AutoSendTraits {
 };
 
 // ---------------------------------------------------------------------------
-// DiagnosticAo - periodic snapshot / heartbeat accounting.
+// DiagnosticAo - the periodic diag-tick sink.
+//
+// NOT CURRENTLY ARMED: nothing submits Signal::Diag, so diag_tick_action never
+// runs and no periodic snapshot is emitted. The routing (Signal::Diag ->
+// kTargetDiag), the Diag state table and the kDiagTick log record are kept as
+// the wiring for a periodic snapshot; the counters themselves reach the client
+// through XcomSnapshot polling. The dispatcher heartbeat does NOT depend on this
+// path - beat_dispatcher() is also called from the SerialAo/ReceiveAo/SendAo
+// actions in xcom_ao.cpp.
 // ---------------------------------------------------------------------------
 struct DiagCtx {
     CoreCtx* core = nullptr;
 };
 
-// Periodic heartbeat: surface key saturated counters. Defined in xcom_ao.cpp.
+// The Diag target's only action. Defined in xcom_ao.cpp; currently unreachable
+// because no code submits Signal::Diag (see above).
 void diag_tick_action(DiagCtx& ctx, const coact::Event& evt) noexcept;
 
 struct DiagTraits {
@@ -140,38 +149,82 @@ struct DiagTraits {
 };
 
 // ---------------------------------------------------------------------------
-// SerialAo - the single owner of the port. HSM: Closed/Open/Fault (a
-// documented simplification of the plan's Closed/Opening/Open/Closing/Fault;
-// Opening/Closing are short-lived intermediate states driven off the same
-// owner thread and the authoritative reflection of the port is the CoreCtx
-// port_state atomic). It owns lifecycle/configuration; SessionWriter is the
-// only caller of potentially blocking native serial writes.
+// SerialAo - the single owner of the port and the SOLE authority for the port
+// lifecycle. SerialCtx::state carries the full 5-state machine (Closed /
+// Opening / Open / Closing / Fault); CoreCtx::port_state is a publish-only
+// VIEW written exclusively by serial_transition() and never read as a guard.
+// It owns lifecycle/configuration; SessionWriter is the only caller of
+// potentially blocking native serial writes.
 // ---------------------------------------------------------------------------
+// Numeric values deliberately equal the XCOM_PORT_* ABI values so publishing
+// the local state is a plain cast and any consumer sees the same encoding.
+enum SerialState : int8_t {
+    S_CLOSED = XCOM_PORT_CLOSED,     // 0
+    S_OPENING = XCOM_PORT_OPENING,   // 1
+    S_OPEN = XCOM_PORT_OPEN,         // 2
+    S_CLOSING = XCOM_PORT_CLOSING,   // 3
+    S_FAULT = XCOM_PORT_FAULT        // 4
+};
+
+static_assert(static_cast<int>(S_CLOSED) == XCOM_PORT_CLOSED, "state/ABI drift");
+static_assert(static_cast<int>(S_OPENING) == XCOM_PORT_OPENING, "state/ABI drift");
+static_assert(static_cast<int>(S_OPEN) == XCOM_PORT_OPEN, "state/ABI drift");
+static_assert(static_cast<int>(S_CLOSING) == XCOM_PORT_CLOSING, "state/ABI drift");
+static_assert(static_cast<int>(S_FAULT) == XCOM_PORT_FAULT, "state/ABI drift");
+
+// Inputs accepted by serial_transition(). Open/Close/Fault arrive as coact
+// signals; OpenDone/CloseDone complete the intermediate opening/closing states,
+// and Cancel is the ABI's timed-out/close-request handoff.
+enum class SerialEvent : uint8_t {
+    kOpen = 0,
+    kClose = 1,
+    kFault = 2,
+    kOpenDone = 3,
+    kCloseDone = 4,
+    kCancel = 5
+};
+
 struct SerialCtx {
     CoreCtx* core = nullptr;
+    // AO-local authoritative port state. Only serial_transition() mutates it,
+    // and only on the SerialAo thread (the coact Dispatcher).
+    SerialState state = S_CLOSED;
 };
 
-enum SerialState : int8_t {
-    S_ROOT = 0,
-    S_CLOSED = 1,
-    S_OPEN = 2,
-    S_FAULT = 3
-};
+// The one table-driven transition function (design §2.2). It resolves the
+// (state, event) edge, runs the edge action and publishes port_state exactly
+// once per transition; intermediate states are published on entry, before the
+// blocking owner action. Unsupported (state, event) pairs leave the state
+// unchanged and publish nothing. Defined in xcom_ao.cpp.
+void serial_transition(SerialCtx& ctx, SerialEvent event) noexcept;
 
-// SIG_OPEN: transition Closed -> Open (or Fault on a failed real open) and
-// claim the session generation. Defined in xcom_ao.cpp.
+// coact action callbacks. Each delegates to serial_transition() rather than
+// reading or writing port_state. Defined in xcom_ao.cpp.
 void serial_do_open(SerialCtx& ctx, const coact::Event& evt) noexcept;
-
-// SIG_CLOSE: transition back to Closed and advance the generation. Defined in
-// xcom_ao.cpp.
 void serial_do_close(SerialCtx& ctx, const coact::Event& evt) noexcept;
-
-// SIG_FAULT: transition Closed/Open -> Fault and reflect the fault in the
-// port_state atomic (and error ring). Defined in xcom_ao.cpp.
 void serial_do_fault(SerialCtx& ctx, const coact::Event& evt) noexcept;
 
 struct SerialTraits {
-    static constexpr uint64_t kRtcBudgetNs = 2000000ULL;   // 2 ms
+    // Budget rule: the RTC budget must exceed the AO's DOCUMENTED worst-case
+    // legitimate dispatch, not the other way round. This AO's own transition
+    // contract (above) says the intermediate OPENING/CLOSING state is published
+    // "before the blocking owner action", and the blocking owner actions are
+    // documented: xcom_open polls its lifecycle result for ~2 s
+    // (xcom_abi.cpp: 200 x 10 ms) and close reserves the same ~2 s budget
+    // (serial_backend_win.hpp keeps kTxDrainGraceMs "well under the 2000 ms ABI
+    // close budget"). A 2 ms budget therefore made EVERY legitimate open/close
+    // over-budget; three in a row (idle open/close, or reconnect churn) pushed
+    // the Breaker to BrokenL2 and started dropping user sends as
+    // "buffer full". 5 s gives clear headroom over the ~2 s legal bound.
+    //
+    // This does not weaken the real protection. The Dispatcher measures elapsed
+    // time only AFTER try_dispatch_queued() returns (dispatcher.hpp), so
+    // rtc_timeout_consec advances only for a dispatch that COMPLETED slowly. An
+    // AO that is truly wedged never returns, never reaches the measurement
+    // point, and never advances this counter - detecting that is the heartbeat's
+    // job (thread_health.hpp), not the Breaker's. The budget only has to
+    // separate "slow but legal" from "returned pathologically late".
+    static constexpr uint64_t kRtcBudgetNs = 5000000000ULL;   // 5 s > ~2 s legal
     static coact::LogicalPrio logical_prio() noexcept
     {
         return static_cast<coact::LogicalPrio>(

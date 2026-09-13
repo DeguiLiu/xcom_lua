@@ -215,7 +215,7 @@ int main()
           "xcom_test_inject_rx");
 
     // Wait for + drain the formatted display batch via the v1.1 poll contract
-    // (no exported xcom_wait_display; CoreWorker polls xcom_drain_display).
+    // (no exported xcom_wait_display; the client polls xcom_drain_display).
     // xcom_drain_display supports a prefix when the caller buffer is smaller;
     // this buffer uses the full maximum batch size for the smoke assertion.
     constexpr uint32_t kDrainBufBytes = 65536U;

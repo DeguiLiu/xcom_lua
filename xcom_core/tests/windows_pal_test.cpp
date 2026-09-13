@@ -9,7 +9,7 @@
 #include "coact/event.hpp"
 #include "coact/hsm.hpp"
 #include "coact/runtime.hpp"
-#include "pal_windows.hpp"
+#include "coact/pal_windows.hpp"
 
 namespace {
 

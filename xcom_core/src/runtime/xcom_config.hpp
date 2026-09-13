@@ -36,6 +36,21 @@ inline constexpr std::uint32_t kRxBlockCount = 128U;  // 128 × 4 KiB = 512 KiB
 inline constexpr std::uint32_t kRxBlockBytes = 4096U;
 inline constexpr std::uint32_t kSerialReadBufferBytes =
     kRxBlockCount * kRxBlockBytes;
+// Hard reservation for the raw/file lane. The display lane may only hold a
+// reference to a block while the pool would still be left with MORE than this
+// many free blocks, so a stalled display can never consume the file lane's
+// reserve and the file lane can never be starved by the display.
+//
+// Arithmetic at the peak supported rate (921600 baud, 8N1 + start = 10
+// bits/byte -> 92160 B/s ≈ 90 KiB/s): one 4096 B block covers ~44.4 ms, so the
+// reserve of 96 blocks = 384 KiB ≈ 4.27 s of file backlog. The display is left
+// kRxBlockCount - kRxRawReserveBlocks = 32 blocks (~1.42 s) before it falls
+// behind and starts counting display backlog (the file log keeps the complete
+// stream, so this is a display lag, not data loss).
+inline constexpr std::uint32_t kRxRawReserveBlocks = 96U;
+static_assert(kRxRawReserveBlocks > 0U &&
+                  kRxRawReserveBlocks < kRxBlockCount,
+              "the raw/file reserve must leave the display some headroom");
 inline constexpr std::uint32_t kTxBlockCount = 32U;
 inline constexpr std::uint32_t kTxBlockBytes = 4096U;
 inline constexpr std::uint32_t kDisplayBatchCount = 32U;  // 32 × 16 KiB = 512 KiB
@@ -53,7 +68,11 @@ enum class Signal : std::uint16_t {
     AutosendConfig = 8U, // typed template -> AutoSendAo (Low)
     // 9 remains unassigned: v1.2 routes typed user Tx directly to SendAo.
     Fault = 10U,
-    Diag = 11U     // -> DiagnosticAo (Low)
+    Diag = 11U,    // -> DiagnosticAo (Low)
+    // Logical signal marker for an RX pool block's coact::Event header. The
+    // valid RX byte length lives only in RxBlockRef.len; this keeps
+    // event->signal meaningful instead of leaking the length into it.
+    RxBlock = 12U
 };
 
 [[nodiscard]] constexpr std::uint16_t to_signal(Signal signal) noexcept

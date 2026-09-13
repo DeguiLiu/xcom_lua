@@ -47,6 +47,40 @@
  *    and rx_backpressure_events (appended after the line-error counters) so the
  *    client can show WHERE in the accepted stream a loss occurred and warn
  *    before the driver FIFO overruns.
+ *
+ * v1.5 extension (2026-09-13):
+ *  - XcomPortConfig.dtr_enable / rts_enable gain the third value
+ *    XCOM_LINE_LEAVE_ALONE (2). The fields were already uint8_t, so struct_size
+ *    and every FFI offset are unchanged and existing 0/1 callers keep their
+ *    exact behaviour; 2 makes the open path issue NO EscapeCommFunction for
+ *    that line. The version macros are deliberately NOT bumped: no layout,
+ *    size, or offset changed.
+ *
+ * v1.6 (2026-09-13):
+ *  - XcomPortInfo gains char hardware_id[96], appended AFTER busy/_pad so every
+ *    existing offset is unchanged. It carries the bridge's stable PnP identity
+ *    (SetupAPI SPDRP_HARDWAREID, first string of the REG_MULTI_SZ, e.g.
+ *    "USB\VID_1A86&PID_7523&REV_0254"), populated read-only during enumeration.
+ *    Reconnect keys on this instead of the COM name, which re-enumeration
+ *    changes. Empty string when the property is absent (some composite/virtual
+ *    ports); callers fall back to description matching.
+ *  - XcomSnapshot gains uint32_t flow_hold_events, appended AFTER the v1.5
+ *    counters. The counter already existed in the core's internal metrics
+ *    (rising flow-control holds: CTS/DSR/RLSD/XOFF); this only exports it.
+ *
+ *  !!! LIST_BOUNDARY HAZARD (read before changing either side) !!!
+ *  XcomPortInfo has NO struct_size field (unlike XcomCreateOptions,
+ *  XcomPortConfig, XcomSnapshot and XcomError), and xcom_list_ports takes an
+ *  ENTRY COUNT, not a byte size. A caller compiled against the old 324-byte
+ *  struct that passes its buffer to a v1.6 DLL will have 420 bytes written per
+ *  entry: an out-of-bounds write of 96 bytes per entry. There is no runtime
+ *  guard possible. The version bump makes the mismatch DETECTABLE via
+ *  xcom_version(); the DLL and its client MUST ship in lockstep (the LuaJIT
+ *  binding pins sizeof(XcomPortInfo) at module load and refuses to load on a
+ *  drift). A client that only READS (new struct + old DLL) is safe: the older
+ *  DLL writes fewer bytes and the appended field stays zero. Do NOT add an
+ *  entry point or call xcom_list_ports with a buffer sized for a different
+ *  struct revision.
  */
 #ifndef XCOM_H_
 #define XCOM_H_
@@ -68,7 +102,7 @@ extern "C" {
 #endif
 
 #define XCOM_VERSION_MAJOR 1
-#define XCOM_VERSION_MINOR 5
+#define XCOM_VERSION_MINOR 6
 #define XCOM_VERSION_PATCH 0
 
 /* ---------------------------------------------------------------------------
@@ -103,7 +137,26 @@ typedef struct XcomCreateOptions {
 
 /* ---------------------------------------------------------------------------
  * Port configuration
+ *
+ * dtr_enable / rts_enable are a tri-state, not a bool. Values 0 and 1 are the
+ * v1.0 behaviour and BOTH drive the pin to a level (0 = inactive, 1 = active);
+ * a target board with DTR wired to NRST or RTS wired to BOOT is disturbed by
+ * either one. XCOM_LINE_LEAVE_ALONE (2) is therefore a distinct third state
+ * meaning "do not drive this line at open". The field is uint8_t, so the struct
+ * layout is unchanged; any value outside 0..2 is rejected with XCOM_ERR_PARAM.
+ *
+ * HONEST LIMIT: LeaveAlone can only suppress the levels THIS core would program
+ * (DCB line control plus the explicit EscapeCommFunction replay). It cannot
+ * prevent CreateFileW itself from changing the pin - some USB-UART bridges
+ * assert DTR on the open IRP before any DCB is written. Whether a board stops
+ * resetting with LeaveAlone must be confirmed on real hardware, not assumed.
  * ------------------------------------------------------------------------- */
+enum {
+  XCOM_LINE_DEASSERT = 0,     /* drive the line inactive at open (CLRxxx) */
+  XCOM_LINE_ASSERT = 1,       /* drive the line active at open (SETxxx) */
+  XCOM_LINE_LEAVE_ALONE = 2,  /* issue no EscapeCommFunction for this line */
+};
+
 typedef struct XcomPortConfig {
   uint32_t struct_size;   /* sizeof(XcomPortConfig) */
   const char* port;       /* e.g. "COM3"; UTF-8, NUL-terminated, borrowed for call */
@@ -112,8 +165,10 @@ typedef struct XcomPortConfig {
   uint8_t  stop_bits;     /* 0 = 1, 1 = 1.5, 2 = 2 */
   uint8_t  parity;        /* 0 = none, 1 = odd, 2 = even, 3 = mark, 4 = space */
   uint8_t  flow_control;  /* 0 = none, 1 = hw(RTS/CTS), 2 = sw(XON/XOFF) */
-  uint8_t  dtr_enable;    /* 0/1 */
-  uint8_t  rts_enable;    /* 0/1 */
+  uint8_t  dtr_enable;    /* XCOM_LINE_*: 0 = deassert, 1 = assert at open,
+                           * 2 = leave alone; else XCOM_ERR_PARAM. */
+  uint8_t  rts_enable;    /* XCOM_LINE_*: same encoding as dtr_enable. 2 is
+                           * ignored under RTS/CTS flow control, which owns RTS. */
   uint8_t  _pad[2];
 } XcomPortConfig;
 
@@ -143,11 +198,22 @@ enum {
 typedef struct XcomDisplayOptions {
   uint32_t struct_size;   /* sizeof(XcomDisplayOptions) */
   uint8_t  hex_view;      /* 0 = text, 1 = hex */
-  uint8_t  timestamp;     /* 0 = off, 1 = prefix [HH:MM:SS.mmm] */
+  uint8_t  timestamp;     /* ACCEPTED BUT IGNORED.  The core no longer injects
+                           * [HH:MM:SS.mmm]; design §4 item 2 moved stamping to
+                           * the Lua display stage so the display/file buffer
+                           * stays pure data.  Kept for ABI size/offset
+                           * compatibility. */
   uint8_t  pause_display; /* 0 = off, 1 = freeze view; retained Rx applies backpressure */
   uint8_t  _pad0;
-  uint32_t auto_clear_bytes;   /* 0 = off; else trim threshold on the widget */
-  uint32_t max_display_bytes;  /* default 2 MiB */
+  uint32_t auto_clear_bytes;   /* ACCEPTED BUT IGNORED by the core.  The
+                                * auto-clear threshold is enforced by the client
+                                * (window.lua's [display] auto_clear_bytes). */
+  uint32_t max_display_bytes;  /* ABI-reserved display cap.  NOT enforced by the
+                                * core today (xcom_set_options stores only
+                                * hex_view/timestamp/pause_display); the effective
+                                * receive-view bound is the client's
+                                * [display] receive_window_bytes.  Kept so layout
+                                * and offsets stay stable. */
 } XcomDisplayOptions;
 
 /* NOTE: the v1.0 XcomAutoSendConfig struct / xcom_set_autosend have been
@@ -162,11 +228,21 @@ typedef struct XcomSnapshot {
   uint32_t struct_size;        /* sizeof(XcomSnapshot) */
   uint32_t rx_bytes;           /* bytes read from the port, always counted */
   uint32_t tx_bytes;           /* bytes written to the port */
-  uint32_t rx_pool_exhausted_bytes;
+  uint32_t rx_pool_exhausted_bytes; /* DISPLAY BACKLOG: bytes not rendered
+                                     * because the raw/file lane's reserve was
+                                     * preserved while a log was open. The log
+                                     * still holds the complete stream, so this
+                                     * is display lag, not lost serial data.
+                                     * With no log open a drop is charged to
+                                     * save_rejected_bytes instead. */
   uint32_t tx_rejected;
   uint32_t auto_tick_coalesced;
   uint32_t ui_trimmed_bytes;
-  uint32_t save_rejected_bytes;
+  uint32_t save_rejected_bytes;    /* accepted RX bytes that no consumer kept:
+                                     * no log was open, a queued segment could
+                                     * not be written before shutdown, or the
+                                     * writer queue was full. Monotonic; UI loss
+                                     * ledger. */
   uint32_t display_paused_bytes;   /* bytes retained at the paused display boundary */
   uint32_t callback_count;
   uint32_t generation;             /* session generation (increments per open) */
@@ -184,15 +260,21 @@ typedef struct XcomSnapshot {
   /* v1.5 loss-observability counters (appended AFTER the line-error block so
    * every previous offset is unchanged; struct_size drives compatibility).
    * rx_sequence is the monotonic count of committed Rx blocks; rx_loss_offset
-   * is the accepted-byte offset at which the most recent receive loss (pool
-   * drop or driver overrun) was observed, so a gap can be located in the
-   * received stream. rx_backpressure_events counts episodes where the live
-   * read callback found every Rx block in use and withheld reads: no bytes are
-   * lost on that path, but a rising count is the host-side early warning that
-   * the driver FIFO is what fills next (and then overruns, overrun_errors). */
+   * is the accepted-byte offset at which the most recent receive loss (display
+   * backlog or driver overrun) was observed, so a gap can be located in the
+   * received stream. rx_backpressure_events counts episodes where the read
+   * callback found every Rx block in use: the file lane is lossless, so the
+   * reader BLOCKS for the disk to catch up rather than dropping. A rising count
+   * is the visible "storage stalled" signal; the file stream stays complete. */
   uint32_t rx_sequence;
   uint32_t rx_loss_offset;
   uint32_t rx_backpressure_events;
+  /* v1.6 flow-control stall counter, appended AFTER the v1.5 block. Rising
+   * edges into a CTS/DSR/RLSD/XOFF hold on the read side (ClearCommError ->
+   * COMSTAT.*Hold). Diagnostic-only: a hold is a throughput stall, not data
+   * corruption, so it never faults the link. The matching internal metric
+   * (CoreCtx::metrics.flow_hold_events) predates this export. */
+  uint32_t flow_hold_events;
 } XcomSnapshot;
 
 enum {
@@ -225,6 +307,16 @@ typedef struct XcomPortInfo {
                                * with XCOM_LIST_PORTS_PROBE_BUSY; the legacy
                                * xcom_list_ports leaves it 0. */
   uint8_t  _pad[3];
+  /* v1.6 stable hardware identity, appended AFTER busy/_pad (existing offsets
+   * unchanged; see the LIST_BOUNDARY HAZARD note in the header banner). Filled
+   * during enumeration from SetupAPI SPDRP_HARDWAREID - the first string of the
+   * REG_MULTI_SZ, e.g. "USB\VID_1A86&PID_7523&REV_0254". This is the reconnect
+   * key: the COM name changes on re-enumeration, the hardware id does not.
+   * Registry/property read only - enumeration never opens the port, programs a
+   * DCB, or issues a line IOCTL. Empty string when the property is missing,
+   * which is expected for some composite/virtual ports; callers then fall back
+   * to description matching. */
+  char     hardware_id[96];
 } XcomPortInfo;
 
 /* Flags for xcom_list_ports_ex. */
@@ -249,7 +341,12 @@ XCOM_API uint32_t xcom_version(void);
 /* Enumerate available serial ports into out[0..capacity). `count` always
  * receives the total discovered. A nullptr `out` with capacity == 0 is a valid
  * size query; insufficient capacity returns XCOM_ERR_FULL without writing past
- * the supplied buffer. */
+ * the supplied buffer.
+ *
+ * `out` MUST be an array of the XcomPortInfo THIS header defines. There is no
+ * per-entry byte size in the ABI (see LIST_BOUNDARY HAZARD above): the DLL
+ * writes sizeof(XcomPortInfo) bytes per entry, so a buffer sized for a
+ * different struct revision is an out-of-bounds write. */
 XCOM_API XcomStatus xcom_list_ports(XcomPortInfo* out, uint32_t capacity,
                                     uint32_t* count);
 
@@ -289,7 +386,11 @@ XCOM_API XcomStatus xcom_close(XcomHandle h, uint32_t timeout_ms);
  * NOT block for the actual serial WriteResult: it returns as soon as the
  * payload is queued (hence "queue-and-return"); the eventual write success or
  * failure is reported asynchronously via xcom_get_snapshot / xcom_take_error.
- * The caller may freely release/reuse its buffer after return. */
+ * The caller may freely release/reuse its buffer after return.
+ * Rejection codes are distinct: XCOM_ERR_FULL means a pool or the dispatcher
+ * queue is out of capacity (send less); XCOM_ERR_BUSY means the scheduler
+ * refused the event (Send AO overload breaker / state / policy) and the pool may
+ * be empty, so retry later. XCOM_ERR_NOT_OPEN means no session is open. */
 XCOM_API XcomStatus xcom_send(XcomHandle h, const uint8_t* data,
                               uint32_t size, XcomSendFlags flags);
 
@@ -303,8 +404,12 @@ XCOM_API XcomStatus xcom_set_options(XcomHandle h,
  * rts_enable.  Applied immediately with EscapeCommFunction on an open port so
  * the pin level is deterministic, unlike the driver-dependent DCB DISABLE
  * value.  Returns XCOM_ERR_NOT_OPEN when no physical session is open, and
- * XCOM_ERR_UNSUPPORTED when RTS/CTS flow control is active (the driver owns
- * RTS and the request is ignored, not fought). */
+ * XCOM_ERR_UNSUPPORTED when RTS/CTS flow control is active: the driver owns
+ * RTS, so NEITHER rts=1 NOR rts=0 is applied and neither is reported as
+ * success.  The DTR half is not flow-controlled and is still applied on that
+ * path, so this is a PARTIAL success: XCOM_ERR_UNSUPPORTED there means "DTR
+ * was applied, RTS was not" and MUST NOT be treated as "nothing was applied";
+ * a genuine DTR failure still returns XCOM_ERR_IO / XCOM_ERR_NOT_OPEN. */
 XCOM_API XcomStatus xcom_set_lines(XcomHandle h, uint8_t dtr, uint8_t rts);
 
 /* Configure auto-send template.  data is the pre-encoded payload (same
@@ -320,12 +425,23 @@ XCOM_API XcomStatus xcom_set_auto_template(XcomHandle h, const uint8_t* data,
 
 /* Copy up to `capacity` bytes of the next formatted display batch into
  * output.  On success *written is the byte count (0 = none).  The bytes are
- * UTF-8 text: in text view the raw bytes (optionally timestamp-prefixed), in
- * hex view "AA BB CC " sequences.  May be called repeatedly until
+ * UTF-8 text: normalised receive bytes (CR/CRLF folded, ANSI/C0 stripped) in
+ * text view, "AA BB CC " sequences in hex view.  No timestamp is injected by
+ * the core (see XcomDisplayOptions.timestamp).  May be called repeatedly until
  * snapshot.display_pending == 0.  The client polls this with a 10 ms luv
  * timer on its UI thread. */
 XCOM_API XcomStatus xcom_drain_display(XcomHandle h, char* output,
                                        uint32_t capacity, uint32_t* written);
+
+/* Timestamp-aware variant (design §3).  Same batch semantics as
+ * xcom_drain_display, but returns the byte count directly and back-fills the
+ * batch's EARLIEST ingress time (monotonic ms) through out_ingress_ms.  A
+ * zero-byte batch leaves *out_ingress_ms unchanged.  Declared so a newer
+ * xcom_core.dll is usable; the Lua accessor probes for the symbol at call time
+ * and DISABLES gap stamping when an older DLL lacks it. */
+XCOM_API uint32_t xcom_drain_display_ts(XcomHandle h, uint8_t* out,
+                                        uint32_t capacity,
+                                        uint32_t* out_ingress_ms);
 
 /* Cheap non-blocking snapshot for the status bar. */
 XCOM_API XcomStatus xcom_get_snapshot(XcomHandle h, XcomSnapshot* output);

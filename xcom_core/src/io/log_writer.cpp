@@ -3,11 +3,12 @@
 
 #include "foundation/fixed_pool.hpp"
 #include "foundation/static_object_slot.hpp"
+#include "foundation/rx_block_lane.hpp"
 #include "foundation/unique_handle.hpp"
 #include "xcom_core.hpp"
 
 #include "coact/spsc_ring.hpp"
-#include "pal_windows.hpp"
+#include "coact/pal_windows.hpp"
 
 #include <windows.h>
 
@@ -96,6 +97,14 @@ struct LogWriter::Impl {
     };
 
     struct FileJob {
+        // Explicit noexcept default ctor: GCC cannot compute the implicit
+        // default constructor's exception specification for a nested type with
+        // NSDMIs while the enclosing Impl is still incomplete, so
+        // std::is_nothrow_default_constructible<FileJob> is a false negative
+        // when coact::SpscRing<FileJob, ...> is instantiated at the member
+        // declaration below. This declaration is behaviour- and ABI-identical
+        // to the implicit one and keeps the type an aggregate in C++17.
+        FileJob() noexcept = default;
         Kind kind = Kind::Append;
         std::uint16_t block_id = kInvalidBlockId;
         std::uint32_t size = 0U;
@@ -110,6 +119,9 @@ struct LogWriter::Impl {
     };
 
     struct AtomicCompletion {
+        // See FileJob above: the explicit noexcept default ctor works around
+        // the same GCC false negative on is_nothrow_default_constructible.
+        AtomicCompletion() noexcept = default;
         std::uint64_t request_id = 0U;
         XcomStatus status = XCOM_ERR_IO;
     };
@@ -175,9 +187,10 @@ struct LogWriter::Impl {
     };
 
     using FilePool = foundation::FixedPool<kFileBlockBytes, kFileBlockCount>;
-    // The public ABI serializes every call through one CoreWorker, while this
-    // dedicated writer thread is the sole consumer.  Keep this path SPSC so
-    // high-rate log append avoids the MPSC per-cell probe and ticket scan.
+    // The public ABI serializes every call through one caller thread (the Lua
+    // UI thread), while this dedicated writer thread is the sole consumer.
+    // Keep this path SPSC so high-rate log append avoids the MPSC per-cell
+    // probe and ticket scan.
     using JobQueue = coact::SpscRing<FileJob, kFileJobCapacity>;
     using CompletionQueue = coact::SpscRing<AtomicCompletion,
                                             kCompletionCapacity>;
@@ -315,6 +328,41 @@ struct LogWriter::Impl {
         }
     }
 
+    // Liveness (design §4.2 item 3). The writer thread stores its monotonic-ms
+    // once per loop iteration and marks itself parked around the INFINITE idle
+    // wake. PROGRESS is a different axis and must not be folded in: a writer
+    // retrying a dead disk is ALIVE and keeps beating here; the storage-stall
+    // episode below is what reports that it is making no progress. Do not
+    // "fix" beat() to require progress.
+    void beat() noexcept
+    {
+        if (core != nullptr) {
+            core->heartbeats.log_writer_ms.store(
+                static_cast<std::uint32_t>(coact::pal::monotonic_ms()),
+                std::memory_order_relaxed);
+        }
+    }
+
+    void set_parked(bool parked) noexcept
+    {
+        if (core != nullptr) {
+            core->heartbeats.log_writer_parked.store(
+                parked ? 1U : 0U, std::memory_order_release);
+        }
+    }
+
+    // Lifecycle gate for the observer: 1 from the writer thread's first
+    // iteration until it exits (and from shutdown() once teardown starts), 0
+    // otherwise. A stopped writer leaves a stale stamp, which the observer
+    // would otherwise read as an endless stall (design section 4.4 item 3).
+    void set_running(bool up) noexcept
+    {
+        if (core != nullptr) {
+            core->heartbeats.log_writer_running.store(
+                up ? 1U : 0U, std::memory_order_release);
+        }
+    }
+
     [[nodiscard]] bool enqueue(FileJob&& job) noexcept
     {
         if (!running.load(std::memory_order_acquire) ||
@@ -363,18 +411,127 @@ struct LogWriter::Impl {
         return job.borrowed ? job.borrowed_data : block_data(job.block_id);
     }
 
+    // Write one raw RX block directly from its pool payload (no extra copy)
+    // and release its single owned reference. Mirrors Kind::Append's no-loss
+    // retry: a temporary disk failure never converts to a drop; if shutdown is
+    // requested mid-retry the unwritten tail is surfaced, never silently
+    // persisted as complete.
+    void process_rx_ref(const foundation::RxBlockRef& ref) noexcept
+    {
+        if (ref.event == nullptr) {
+            return;
+        }
+        const std::uint8_t* const data =
+            foundation::RxBlockLane::payload(ref.event);
+        std::uint32_t offset = 0U;
+        if (ref.len != 0U) {
+            if (!log_file.valid()) {
+                if (core != nullptr) {
+                    // Close admission now quiesces the reader, so this should be
+                    // unreachable; kept as the loss ledger of last resort. An
+                    // error-ring line alone is not a ledger.
+                    core->metrics.save_rejected_bytes.fetch_add(
+                        ref.len, std::memory_order_relaxed);
+                    core->errors.push(XCOM_ERR_NOT_OPEN, 2U,
+                                      "raw RX with no open file (counted as loss)");
+                }
+            }
+            else {
+                while (offset < ref.len &&
+                       !stopping.load(std::memory_order_acquire)) {
+                    // Alive while retrying a stalled raw-RX write: keep beating
+                    // so a slow disk is not misreported as a wedged writer.
+                    beat();
+                    unsigned long written = 0U;
+                    const unsigned long remaining =
+                        static_cast<unsigned long>(ref.len - offset);
+                    if (!WriteFile(log_file.get(), data + offset, remaining,
+                                   &written, nullptr) ||
+                        written == 0U) {
+                        if (stopping.load(std::memory_order_acquire)) {
+                            break;
+                        }
+                        coact::pal::sleep_ms(50U);
+                        continue;
+                    }
+                    offset += static_cast<std::uint32_t>(written);
+                }
+                if (offset < ref.len && core != nullptr) {
+                    core->metrics.save_rejected_bytes.fetch_add(
+                        ref.len - offset, std::memory_order_relaxed);
+                    core->errors.push(XCOM_ERR_IO, 2U,
+                                      "raw RX log tail unwritten at stop (counted as loss)");
+                }
+            }
+        }
+        if (core != nullptr) {
+            core->rx.release(ref.event);   // wakes a blocked reader
+        }
+        else {
+            coact::event_gc(ref.event);
+        }
+    }
+
+    // Best-effort drain used at shutdown/cancel: process_rx_ref releases every
+    // reference and does not write once `stopping` is set.
+    void cancel_pending_rx() noexcept
+    {
+        if (core == nullptr) {
+            return;
+        }
+        foundation::RxBlockRef ref{};
+        while (core->rx.pop_raw(ref)) {
+            process_rx_ref(ref);
+        }
+    }
+
+    // Flush queued raw RX to the currently open file before it is closed, so a
+    // normal Close never strands already-accepted raw bytes.
+    void flush_rx_before_close() noexcept
+    {
+        if (core == nullptr || !log_file.valid()) {
+            return;
+        }
+        foundation::RxBlockRef ref{};
+        while (core->rx.pop_raw(ref)) {
+            process_rx_ref(ref);
+        }
+    }
+
     [[nodiscard]] XcomStatus write_all(FileJob& job,
-                                       foundation::UniqueHandle& file) noexcept
+                                       foundation::UniqueHandle& file,
+                                       std::int32_t* win32_error = nullptr) noexcept
     {
         while (job.offset < job.size) {
+            // Liveness (design section 4.2 item 3): beat before EVERY WriteFile.
+            // Without this, a write_all that loops over many short writes (a
+            // large atomic/stream write) could run past the writer timeout with
+            // no signal, and so could a caller that never beats around it
+            // (process_atomic / stream append). The ONLY un-beated span left is
+            // one synchronous WriteFile call itself, which the platform cannot
+            // bound (no per-call timeout): a single call into a wedged
+            // redirector may still trip one false "stalled" episode. That is
+            // accepted on purpose - liveness and progress are different axes,
+            // and the storage-stall episode reports the progress axis.
+            beat();
             // `unsigned long` is the exact native Win32 counter type WriteFile
             // expects; using it directly keeps the boundary cast-free.
             unsigned long written = 0U;
             const unsigned long remaining =
                 static_cast<unsigned long>(job.size - job.offset);
-            if (!WriteFile(file.get(), job_data(job) + job.offset,
-                           remaining, &written, nullptr) ||
-                written == 0U) {
+            const BOOL written_ok =
+                WriteFile(file.get(), job_data(job) + job.offset, remaining,
+                          &written, nullptr);
+            if (written_ok == FALSE || written == 0U) {
+                // Surface the Win32 cause so the Append retry loop can name the
+                // storage failure instead of retrying silently. A WriteFile
+                // that succeeded yet wrote nothing has no GetLastError of its
+                // own, so report the device-write code for that case.
+                if (win32_error != nullptr) {
+                    *win32_error = written_ok == FALSE
+                        ? static_cast<std::int32_t>(GetLastError())
+                        : static_cast<std::int32_t>(ERROR_WRITE_FAULT);
+                }
                 return XCOM_ERR_IO;
             }
             job.offset += static_cast<std::uint32_t>(written);
@@ -492,29 +649,55 @@ struct LogWriter::Impl {
             accepting_log.store(status == XCOM_OK, std::memory_order_release);
             break;
         }
-        case Kind::Append:
+        case Kind::Append: {
             if (!log_file.valid()) {
                 status = XCOM_ERR_NOT_OPEN;
                 break;
             }
             // Accepted log data remains in its owned block until every byte is
             // written. A temporary disk failure never converts to a drop.
+            // Report the stall ONCE per failure run (not once per 50 ms retry)
+            // so a dead disk is visible in the error ring without flooding it,
+            // then report the recovery once when the run finally succeeds.
+            bool stall_reported = false;
+            std::int32_t write_error = 0;
             do {
-                status = write_all(job, log_file);
-                if (status != XCOM_OK &&
-                    !stopping.load(std::memory_order_acquire)) {
-                    coact::pal::sleep_ms(50U);
+                // Alive while retrying a stalled log write: the 50 ms retry
+                // beat keeps a dead disk from looking like a wedged thread.
+                beat();
+                status = write_all(job, log_file, &write_error);
+                if (status != XCOM_OK) {
+                    if (!stall_reported) {
+                        stall_reported = true;
+                        if (core != nullptr) {
+                            core->errors.push(
+                                write_error, 2U,
+                                "storage stalled: log write retrying (disk slow or device gone)");
+                        }
+                    }
+                    if (!stopping.load(std::memory_order_acquire)) {
+                        coact::pal::sleep_ms(50U);
+                    }
                 }
             } while (status != XCOM_OK &&
                      !stopping.load(std::memory_order_acquire));
+            if (stall_reported && status == XCOM_OK && core != nullptr) {
+                core->errors.push(XCOM_OK, 2U,
+                                  "storage recovered: log write resumed");
+            }
             break;
+        }
         case Kind::Flush:
             if (!log_file.valid() || !FlushFileBuffers(log_file.get())) {
                 status = XCOM_ERR_IO;
             }
             break;
         case Kind::Close:
+            // Stop admitting raw RX first, then drain queued references to the
+            // still-open file: already accepted bytes must reach disk even if
+            // the Close raced them.
             accepting_log.store(false, std::memory_order_release);
+            flush_rx_before_close();
             if (log_file.valid()) {
                 if (!FlushFileBuffers(log_file.get())) {
                     status = XCOM_ERR_IO;
@@ -587,13 +770,19 @@ bool LogWriter::start(CoreCtx* core) noexcept
             // Normal priority still drains retained log batches under pressure.
             static_cast<void>(SetThreadPriority(GetCurrentThread(),
                                                 THREAD_PRIORITY_NORMAL));
+            // Liveness gate up: from here the observer may judge this thread.
+            impl_->set_running(true);
             for (;;) {
+                // Liveness: a completed iteration means the loop came back to
+                // its wait point, regardless of whether a job arrived.
+                impl_->beat();
                 // Shutdown takes precedence over queued work. In particular,
                 // a permanently failing Append retries until `stopping` is
                 // set; processing the queued Close before setting that flag
                 // would otherwise make destruction wait forever.
                 if (impl_->stopping.load(std::memory_order_acquire)) {
                     impl_->cancel_pending();
+                    impl_->cancel_pending_rx();
                     break;
                 }
                 Impl::FileJob job{};
@@ -601,16 +790,60 @@ bool LogWriter::start(CoreCtx* core) noexcept
                     impl_->process(job);
                     continue;
                 }
+                // Raw RX lane: the read thread is the sole producer, this
+                // thread the sole consumer. Prefer queued jobs (Open/Close/
+                // Flush control ordering) over the byte stream.
+                foundation::RxBlockRef rx_ref{};
+                if (impl_->core != nullptr &&
+                    impl_->core->rx.pop_raw(rx_ref)) {
+                    impl_->process_rx_ref(rx_ref);
+                    continue;
+                }
+                // No work: park in the INFINITE wake. The park flag keeps the
+                // idle writer healthy (design §4.1: parked is not a wedge).
+                impl_->set_parked(true);
                 impl_->wake_event.wait(kInfiniteTimeout);
+                impl_->set_parked(false);
             }
             impl_->log_file.reset();
             impl_->atomic_stream.reset();
+            // Liveness gate down before the thread object is joined, so a
+            // leftover stamp is never reported as a stall.
+            impl_->set_running(false);
         });
     } catch (...) {
         impl_->running.store(false, std::memory_order_release);
         return false;
     }
     return true;
+}
+
+bool LogWriter::accepting() const noexcept
+{
+    return impl_ != nullptr &&
+           impl_->accepting_log.load(std::memory_order_acquire);
+}
+
+bool LogWriter::acquire_lease() noexcept
+{
+    // Reuses the append admission pair: close_append_admission() waits for this
+    // counter to reach zero, so a raw-RX publish that passed admission is
+    // guaranteed to complete before the Close handler drains the raw ring.
+    return impl_ != nullptr && impl_->acquire_append_lease();
+}
+
+void LogWriter::release_lease() noexcept
+{
+    if (impl_ != nullptr) {
+        impl_->release_append_lease();
+    }
+}
+
+void LogWriter::wake_rx() noexcept
+{
+    if (impl_ != nullptr && impl_->running.load(std::memory_order_acquire)) {
+        impl_->wake_event.signal();
+    }
 }
 
 namespace {
@@ -885,6 +1118,10 @@ void LogWriter::shutdown(std::uint32_t timeout_ms) noexcept
         impl_->accepting_log.store(false, std::memory_order_release);
     }
     impl_->stopping.store(true, std::memory_order_release);
+    // Teardown is underway and the queue is settled: stop the observer from
+    // judging this thread, so the stale stamp left before the join is never a
+    // stall. The worker also clears the gate on its own exit.
+    impl_->set_running(false);
     impl_->wake_event.signal();
     if (impl_->thread.joinable()) {
         impl_->thread.join();

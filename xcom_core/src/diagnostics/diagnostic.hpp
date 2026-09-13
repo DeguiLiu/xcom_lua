@@ -1,7 +1,7 @@
 // diagnostic.hpp - XCOM diagnostic log writer built on coact::diag.
 //
 // task #5: a Windows writer adapter over the frozen header-only
-// coact::diag::Logger (xcom_core/framework/coact/include/coact/diag/log.hpp). The Logger is
+// coact::diag::Logger (external coact checkout, include/coact/diag/log.hpp). The Logger is
 // the platform-independent core (two CS-guarded lanes, admission-only drop,
 // QPC counter, wake hooks); this TU supplies the Windows-specific FILE* sink,
 // the QPC clock, an auto-reset wake event and a dedicated writer thread. It
@@ -37,7 +37,7 @@ enum class DiagEvent : uint16_t {
     kRxDrop = 6,       // rx_pool_exhausted / oversize accounting
     kTxRejected = 7,
     kErrPushed = 8,    // any error-ring entry
-    kDiagTick = 9,     // periodic heartbeat snapshot (DiagnosticAo)
+    kDiagTick = 9,     // periodic snapshot; no submitter yet, so never emitted
     kDiagStart = 10,   // writer started / configured
     kDiagRotate = 11,  // file rotated on size bound
     // ClearCommError line-error counters (framing / parity / overrun / break).
