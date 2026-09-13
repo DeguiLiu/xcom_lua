@@ -79,4 +79,5 @@ runtime\xcom.exe               # packaged launcher (main.ljbc, no console)
 to point at a specific `xcom_core.dll`.
 
 Design docs: `docs/architecture.md` (architecture) and
-`docs/design-summary.md` (design summary).
+`docs/design-summary.md` (design summary). For a narrative overview of the
+LuaJIT + C++ split and the plugin model, see `docs/technical-overview.md`.
