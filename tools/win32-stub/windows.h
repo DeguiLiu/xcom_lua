@@ -4,6 +4,8 @@
 #include <cstdio>
 #include <cstring>
 typedef void* HANDLE; typedef void* HWND; typedef void* HKEY;
+typedef void* HINSTANCE; typedef void* HMODULE;
+typedef wchar_t* PWSTR; typedef const wchar_t* PCWSTR;
 typedef unsigned long DWORD; typedef unsigned int UINT; typedef int BOOL;
 typedef unsigned char BYTE; typedef unsigned short WORD; typedef long LONG;
 typedef unsigned long ULONG; typedef long long LONG_PTR; typedef unsigned long long ULONG_PTR;
@@ -134,13 +136,87 @@ ULONGLONG WINAPI GetTickCount64(void);
 #define FILE_SHARE_WRITE 2UL
 #define FILE_SHARE_DELETE 4UL
 #define MOVEFILE_REPLACE_EXISTING 1UL
+#define MOVEFILE_WRITE_THROUGH 8UL
+#define MAX_PATH 260
+#define FILE_END 2UL
 BOOL WINAPI MoveFileExA(const char*, const char*, DWORD);
+BOOL WINAPI MoveFileExW(const wchar_t*, const wchar_t*, DWORD);
 BOOL WINAPI DeleteFileA(const char*);
+BOOL WINAPI DeleteFileW(const wchar_t*);
+BOOL WINAPI SetFilePointerEx(HANDLE, LARGE_INTEGER, LARGE_INTEGER*, DWORD);
+DWORD WINAPI GetTempPathA(DWORD, char*);
+HANDLE WINAPI GetCurrentProcess(void);
+BOOL WINAPI GetProcessHandleCount(HANDLE, DWORD*);
 
 // MSVC spells the x86 calling convention __stdcall; GCC needs the attribute.
 #define __stdcall __attribute__((stdcall))
 
 #define THREAD_PRIORITY_NORMAL 0
+#define THREAD_PRIORITY_BELOW_NORMAL -1
 #define THREAD_PRIORITY_LOWEST -2
 #define THREAD_PRIORITY_HIGHEST 2
 BOOL WINAPI SetThreadPriority(HANDLE, int);
+
+// ---- coact Windows PAL sync-primitive additions ---------------------------
+// Minimal stubs for the Win32 primitives the coact PAL (pal_windows.{hpp,cpp})
+// uses. Layouts are not ABI-accurate; they exist only so the PAL type-checks
+// under g++ -fsyntax-only against this stub. The real Windows SDK provides the
+// authoritative definitions.
+typedef struct _RTL_CRITICAL_SECTION {
+    void* DebugInfo;
+    LONG  LockCount;
+    LONG  RecursionCount;
+    HANDLE OwningThread;
+    HANDLE LockSemaphore;
+    ULONG_PTR SpinCount;
+} CRITICAL_SECTION;
+typedef CRITICAL_SECTION* PCRITICAL_SECTION;
+typedef CRITICAL_SECTION* LPCRITICAL_SECTION;
+
+typedef struct _RTL_CONDITION_VARIABLE { void* Ptr; } CONDITION_VARIABLE;
+typedef CONDITION_VARIABLE* PCONDITION_VARIABLE;
+
+BOOL WINAPI InitializeCriticalSectionAndSpinCount(CRITICAL_SECTION*, DWORD);
+void WINAPI EnterCriticalSection(CRITICAL_SECTION*);
+void WINAPI LeaveCriticalSection(CRITICAL_SECTION*);
+void WINAPI DeleteCriticalSection(CRITICAL_SECTION*);
+
+void WINAPI InitializeConditionVariable(CONDITION_VARIABLE*);
+BOOL WINAPI SleepConditionVariableCS(CONDITION_VARIABLE*, CRITICAL_SECTION*, DWORD);
+void WINAPI WakeConditionVariable(CONDITION_VARIABLE*);
+void WINAPI WakeAllConditionVariable(CONDITION_VARIABLE*);
+
+HANDLE WINAPI CreateSemaphoreW(SECURITY_ATTRIBUTES*, LONG, LONG, const wchar_t*);
+BOOL WINAPI ReleaseSemaphore(HANDLE, LONG, LONG*);
+
+// CRT thread creation. The real declaration lives in <process.h>; declared here
+// so the PAL compiles against this stub without the MSVC CRT.
+unsigned long long __stdcall _beginthreadex(void*, unsigned,
+                                            unsigned (__stdcall*)(void*),
+                                            void*, unsigned, unsigned*);
+
+// ---- process-launch API used by the shipped launcher ----------------------
+// xcom_lua/native/launcher/xcom_launcher.cpp resolves its own path, locates the
+// interpreter beside it and CreateProcessW's it with a hidden console window.
+// Only the fields that TU reads are modelled; layouts are not ABI-accurate.
+struct STARTUPINFOW {
+    DWORD cb;
+    DWORD dwFlags;
+    WORD wShowWindow;
+};
+struct PROCESS_INFORMATION {
+    HANDLE hProcess;
+    HANDLE hThread;
+    DWORD dwProcessId;
+    DWORD dwThreadId;
+};
+#define STARTF_USESHOWWINDOW 0x00000001UL
+#define SW_HIDE 0
+#define CREATE_NO_WINDOW 0x08000000UL
+#define ERROR_BUFFER_OVERFLOW 111UL
+DWORD WINAPI GetModuleFileNameW(HMODULE, wchar_t*, DWORD);
+DWORD WINAPI GetFileAttributesW(const wchar_t*);
+BOOL WINAPI CreateProcessW(const wchar_t*, wchar_t*, SECURITY_ATTRIBUTES*,
+                           SECURITY_ATTRIBUTES*, BOOL, DWORD, void*,
+                           const wchar_t*, STARTUPINFOW*, PROCESS_INFORMATION*);
+BOOL WINAPI GetExitCodeProcess(HANDLE, DWORD*);

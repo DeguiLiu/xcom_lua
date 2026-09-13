@@ -13,6 +13,20 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# The coact revision this product builds against, pinned to a COMMIT rather than
+# a branch. xcom_core needs the windows branch specifically (it carries the Win32
+# PAL), but a branch is a moving target: the same commit here would build against
+# different coact bytes tomorrow, and a coact change that silently drops a
+# capability xcom_core relies on - the High critical reserve in XcomCoactConfig
+# is one - would pass review unnoticed because the source of the regression is
+# not in this repository.
+#
+# Bump deliberately: change the commit below, run CI, and say in the commit
+# message which coact change is being taken. Keep it a full 40-character SHA so
+# the pin is unambiguous.
+env:
+  COACT_REF: a0ddd9590678f30a6a1ca727058dbf72ced3594f
+
 jobs:
   # ---------------------------------------------------------------------------
   # Pure-Lua suites. These need no DLL, no serial hardware and no Windows: the
@@ -54,15 +68,30 @@ jobs:
           # Every file listed here must pass on a machine with no Windows DLL
           # and no serial port. Tests needing luv / xcom_core.dll / hardware are
           # intentionally absent — they run in the Windows job or not at all.
+          # Suites that stub luv through package.preload DO qualify and belong
+          # here: a suite is only excluded when it actually requires a host
+          # facility, not when it merely exercises host-facing code.
           SUITES="
             test_ansi
             test_charset
             test_config
+            test_device_profiles
+            test_event_delivery
+            test_log_save_report
             test_multi_send
+            test_open_line_tristate
             test_port_enum
+            test_receive_copy
+            test_reconnect_known_peers
             test_reconnect_port
+            test_reset_overlay
+            test_reset_sequencer
             test_rx_charset_batch
+            test_rx_display_caps
+            test_rx_display_pipeline
+            test_script_budget
             test_script_meta
+            test_send_file_retry
             test_shipped_scripts
             test_view_model
             test_wave_ring
@@ -88,6 +117,18 @@ jobs:
           done
           exit $fail
 
+      - name: Lint for accidental globals
+        working-directory: xcom_lua
+        # A read of a name that is never declared local is almost always a typo
+        # or a forward reference whose declaration lost its hoist.  One such
+        # case shipped here: three frame-pacing constants were declared ~1400
+        # lines below their first call sites, so those sites read nil globals
+        # and the receive cadence silently ran at the interactive interval
+        # instead of the coalesced one — a CPU regression no suite caught.
+        # This step is what makes that class of defect fail the build.
+        run: |
+          "${{ steps.lj.outputs.bin }}" tests/lint_fields.lua
+
   # ---------------------------------------------------------------------------
   # Native core + ImGui bridge. CMakeLists.txt hard-requires WIN32 (the serial
   # backend is Win32-native and the front-end is DirectX 11), so this job can
@@ -96,14 +137,29 @@ jobs:
   native:
     name: Native build + C++ tests (Windows)
     runs-on: windows-latest
+    env:
+      # xcom_core is built against the coact framework from its own repository —
+      # the vendored copy under xcom_core/framework/ was removed. COACT_REF must
+      # resolve to a commit on coact's `windows` branch, which is the one carrying
+      # the Win32 platform layer (pal_windows.hpp).
+      # The default resolution would look one level ABOVE this checkout
+      # (xcom_core/../../coact), so point at the sibling path explicitly.
+      XCOM_COACT_ROOT: ${{ github.workspace }}/coact
     steps:
       - uses: actions/checkout@v4
+
+      - name: Check out coact at the pinned revision
+        uses: actions/checkout@v4
+        with:
+          repository: DeguiLiu/coact
+          ref: ${{ env.COACT_REF }}
+          path: coact
 
       - name: Configure
         # No -G/-A: the runner image ships a moving VS version, and pinning
         # "Visual Studio 17 2022" fails once the image moves on. Let CMake pick
         # whatever MSVC the image provides.
-        run: cmake -S . -B build -DBUILD_TESTING=ON
+        run: cmake -S . -B build -DBUILD_TESTING=ON -DXCOM_COACT_ROOT="${{ github.workspace }}/coact"
 
       # The ImGui front-end DLL has its own CMakeLists and is NOT referenced by
       # the root one, so it would otherwise go untested — and it is where the
@@ -159,7 +215,19 @@ jobs:
   cpp-syntax:
     name: C++ syntax check (Linux + win32 stub)
     runs-on: ubuntu-latest
+    env:
+      # Same reason as the native job: the vendored coact tree is gone, and the
+      # script's default would resolve one level above this checkout.
+      XCOM_COACT_ROOT: ${{ github.workspace }}/coact
     steps:
       - uses: actions/checkout@v4
+
+      - name: Check out coact at the pinned revision
+        uses: actions/checkout@v4
+        with:
+          repository: DeguiLiu/coact
+          ref: ${{ env.COACT_REF }}
+          path: coact
+
       - name: Parse serial / ABI translation units
         run: tools/check_cpp_syntax.sh
