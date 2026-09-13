@@ -66,11 +66,14 @@ static XcomSnapshot snapshot(XcomHandle handle)
 
 int main()
 {
-    // (1) version + appended-field layout. The fields must sit AFTER every
-    // v1.0..v1.4 field so old offsets are unchanged; the pre-v1.5 struct was
-    // 52 bytes. v1.5 also appends the loss-observability counters at 68..79.
-    CHECK(xcom_version() == 0x010500U, "version is 1.5.0");
-    CHECK(sizeof(XcomSnapshot) == 80U, "snapshot grew by 12 bytes");
+    // (1) version + appended-field layout. Every field is appended AFTER the
+    // previous ABI's, so old offsets stay put: v1.5 added the
+    // loss-observability counters at 68..79, v1.6 appends flow_hold_events at
+    // 80. Pinning the version here is deliberate - the assertion is the
+    // tripwire that makes an ABI change require someone to re-read this list
+    // rather than let the layout drift unnoticed.
+    CHECK(xcom_version() == 0x010600U, "version is 1.6.0");
+    CHECK(sizeof(XcomSnapshot) == 84U, "snapshot ends at 84 after v1.6");
     CHECK(offsetof(XcomSnapshot, port_state) == 48U,
           "port_state offset unchanged");
     CHECK(offsetof(XcomSnapshot, framing_errors) == 52U,
@@ -87,6 +90,8 @@ int main()
           "rx_loss_offset at 72");
     CHECK(offsetof(XcomSnapshot, rx_backpressure_events) == 76U,
           "rx_backpressure_events at 76");
+    CHECK(offsetof(XcomSnapshot, flow_hold_events) == 80U,
+          "flow_hold_events appended at 80 (v1.6)");
 
     XcomHandle handle = create_handle();
     if (handle == nullptr) {
