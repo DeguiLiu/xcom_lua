@@ -578,10 +578,15 @@ struct CoreState {
         ctl_pool.shutdown();
         // 2a. The Dispatcher is stopped, so ReceiveAo's deferred slot is no
         //     longer touched by anyone. Release the RX reference it retained
-        //     across kicks, or that block would never return to the pool.
-        if (recv_ao.context().has_deferred) {
-            core.rx.release(recv_ao.context().deferred.event);
-            recv_ao.context().has_deferred = false;
+        //     across kicks, or that block would never return to the pool. An
+        //     unlogged block (its source segment had no file lane) was popped
+        //     off the display ring, so the close reset can no longer see it;
+        //     release_deferred_rx charges its bytes to the loss ledger before
+        //     the pool slot is returned. A file-backed block is left to the
+        //     raw ring, so it is never charged here.
+        {
+            RxCtx& rx_ctx = recv_ao.context();
+            core.release_deferred_rx(rx_ctx.deferred, rx_ctx.has_deferred);
         }
         // 2b. Abort the physical write before joining the sole write worker.
         serial_backend.abort_pending_write();
@@ -968,12 +973,13 @@ struct CoreState {
             // Wake a reader blocked on the file-lane reserve so it re-checks
             // admission and exits. The deferred RX reference is safe to release
             // here: this sink runs on the Dispatcher, the same thread that owns
-            // ReceiveAo's deferred slot.
+            // ReceiveAo's deferred slot. release_deferred_rx charges an unlogged
+            // block (no file lane) to the loss ledger first, because it was
+            // popped off the display ring and the close reset cannot see it; a
+            // file-backed block stays owned by the raw ring and is not charged.
             core->rx.wake_blocked();
-            if (st->recv_ao.context().has_deferred) {
-                core->rx.release(st->recv_ao.context().deferred.event);
-                st->recv_ao.context().has_deferred = false;
-            }
+            RxCtx& rx_ctx = st->recv_ao.context();
+            core->release_deferred_rx(rx_ctx.deferred, rx_ctx.has_deferred);
             st->serial_backend.abort_pending_write();
             if (st->writer.active()) {
                 st->writer.stop_and_join();

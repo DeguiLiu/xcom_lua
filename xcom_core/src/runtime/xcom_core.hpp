@@ -965,6 +965,50 @@ struct CoreCtx {
         return drained;
     }
 
+    // Account the bytes of a ReceiveAo-deferred display descriptor that is being
+    // released without rx_format_block ever having stored it (the display ring
+    // was full, or display was paused). The descriptor was popped off the
+    // display ready ring by rx_kick_action, so the session-boundary reset can
+    // no longer see it: without this charge its bytes leave the pool with no
+    // ledger entry. Only a descriptor whose source segment had NO file lane is
+    // charged - its bytes exist in no other lane, so releasing it is real loss.
+    // A file-backed descriptor's bytes are still owned by the raw ring (the
+    // LogWriter writes them, or the shutdown raw drain counts a stranded tail),
+    // so charging them here would double count a byte that WAS persisted. The
+    // descriptor is the display-ring copy, whose low 15 bits carry the SOURCE
+    // RX length and whose high bit is the no-file-lane flag (RxBlockLane::
+    // publish tags the display copy); this mirrors reset_display_committed's
+    // rx_meta charge exactly. Inline so the accounting is host-testable without
+    // linking xcom_core.cpp.
+    uint32_t count_deferred_display_loss(const RxDesc& deferred) noexcept
+    {
+        if ((deferred.len & foundation::RxBlockLane::kDisplayUnloggedBit) == 0U) {
+            return 0U;
+        }
+        const uint32_t bytes = static_cast<uint32_t>(
+            deferred.len & foundation::RxBlockLane::kFileBackedLenMask);
+        count_rejected_rx(bytes);
+        return bytes;
+    }
+
+    // Release ReceiveAo's deferred display reference at a session boundary
+    // (close commit or shutdown), first charging the loss ledger for an
+    // unlogged block so its bytes do not vanish with the pool slot. Returns
+    // true when a deferred reference was released. Idempotent: a cleared slot
+    // releases and charges nothing, so a close followed by shutdown (or a
+    // repeated idempotent owner_close) cannot double count.
+    bool release_deferred_rx(RxDesc& deferred, bool& has_deferred) noexcept
+    {
+        if (!has_deferred) {
+            return false;
+        }
+        count_deferred_display_loss(deferred);
+        rx.release(deferred.event);
+        deferred = RxDesc{};
+        has_deferred = false;
+        return true;
+    }
+
     void diag_emit(uint16_t source, uint16_t event_id, uint32_t a0,
                    uint32_t a1, uint32_t a2, uint32_t a3) noexcept
     {
