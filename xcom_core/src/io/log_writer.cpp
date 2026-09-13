@@ -400,6 +400,16 @@ struct LogWriter::Impl {
             publish_atomic_completion(job.request_id, status);
         }
         if (status != XCOM_OK && core != nullptr) {
+            if (job.kind == Kind::Append && job.offset < job.size) {
+                // An accepted log block that never fully reached the file is
+                // charged to the loss ledger before its pool slot is returned,
+                // mirroring process_rx_ref's raw-RX tail account. This covers a
+                // batch that failed part-way (offset > 0), one still queued when
+                // stop was set (offset == 0), and a write aborted by shutdown
+                // cancellation; none of them may be a silent drop.
+                core->metrics.save_rejected_bytes.fetch_add(
+                    job.size - job.offset, std::memory_order_relaxed);
+            }
             core->errors.push(status, 2U, "dedicated file writer failed");
         }
         release_block(job.block_id);
@@ -1124,6 +1134,21 @@ void LogWriter::shutdown(std::uint32_t timeout_ms) noexcept
     impl_->set_running(false);
     impl_->wake_event.signal();
     if (impl_->thread.joinable()) {
+        // The worker performs synchronous file I/O with no per-call timeout, so
+        // it can be parked inside a single WriteFile/FlushFileBuffers on a
+        // wedged disk, redirector or device and never observe `stopping`; an
+        // unconditional join would then hold teardown for as long as the OS
+        // takes. Cancel the outstanding synchronous I/O on that thread so the
+        // call returns ERROR_OPERATION_ABORTED and the worker reaches its loop
+        // head, sees `stopping` and exits. Best-effort by design: a driver that
+        // does not support cancellation leaves the call parked and the join
+        // blocks exactly as it does today, so this can only shorten teardown,
+        // never lengthen it. A cancelled write is charged to the loss ledger -
+        // the raw-RX tail in process_rx_ref, the batch tail in finish() - so it
+        // is never a silent drop. The handle must have THREAD_TERMINATE access;
+        // a std::thread's native handle does.
+        static_cast<void>(CancelSynchronousIo(reinterpret_cast<HANDLE>(
+            impl_->thread.native_handle())));
         impl_->thread.join();
     }
     impl_->running.store(false, std::memory_order_release);
