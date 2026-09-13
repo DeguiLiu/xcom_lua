@@ -16,7 +16,10 @@
 -- window.new() -- NO window/DLL/port needed.  window.new does not create
 -- Win32 handles; without hwnd/build_ui the instance has no self.recv and
 -- self.imgui stays nil unless a fake bridge is installed, which is exactly
--- the harness below.
+-- the harness below.  Each fed chunk goes through the local feed() helper,
+-- which force-flushes the whole-line bridge (design §2): a partial line is now
+-- held until a frame boundary, and these cases assert the displayed result of
+-- that boundary, not immediate partial display.
 --
 -- Asserts:
 --   A) auto-clear OFF (0): the view accumulates across batches, no clear.
@@ -49,10 +52,25 @@ package.path = "./ui/?.lua;./core/?.lua;" .. package.path
 -- at load time, so the patch must already be installed.  uv.now is the
 -- loop-cached monotonic clock; it only advances from uv.run(), which a
 -- pure-logic test cannot drive, so elapsed gaps are made deterministic here.
+-- luv is a Windows-runtime binary module, absent on the Linux review host, so
+-- inject a minimal stub through package.preload (uv.now is all this pure
+-- display path touches); win32.lua likewise refuses to load its DLLs off
+-- Windows, so patch load() on the REAL module and stub the lazy kernel32 handle
+-- it would otherwise touch.  Same harness as tests/test_rx_charset_batch.lua
+-- and tests/test_rx_display_pipeline.lua.
 -- ---------------------------------------------------------------------------
 local fake_now = 1000000
+package.preload["luv"] = function()
+    return { now = function() return fake_now end }
+end
 local uv = require("luv")
 uv.now = function() return fake_now end
+
+local real_win32 = require("win32")
+real_win32.load = function() return true end
+real_win32.kernel32 = setmetatable({}, {
+    __index = function() return function() return 0 end end,
+})
 
 local window_mod = require("window")
 
@@ -108,12 +126,24 @@ local function view_text(win)
     return win._imgui_receive
 end
 
+-- Whole-line bridge (design §2): _process_rx_batch now holds an unterminated
+-- tail across batches so scripts see whole lines, so a partial is only
+-- displayed when a frame boundary forces it out.  These cases assert immediate
+-- display of each fed chunk, so feed() emulates that boundary with the same
+-- force-flush the idle/new-segment paths use.  It delivers exactly the bytes
+-- the old immediate path displayed, so every counter/clear assertion is
+-- unchanged.
+local function feed(win, text)
+    win:_process_rx_batch(text)
+    win:_flush_rx_lines(false)
+end
+
 -- ===========================================================================
 -- A) auto-clear disabled: plain accumulation, no clears
 -- ===========================================================================
 local w1 = new_fake_window({ auto_clear_bytes = 0 })
-w1:_process_rx_batch("hello ")
-w1:_process_rx_batch("world\n")
+feed(w1,"hello ")
+feed(w1,"world\n")
 eq("A1 disabled: tail accumulates", view_text(w1), "hello world\n")
 eq("A2 disabled: accumulator grows", w1._imgui_receive_total, 12)
 eq("A3 disabled: no bridge pushes", #w1.imgui.pushes, 0)
@@ -122,10 +152,10 @@ eq("A3 disabled: no bridge pushes", #w1.imgui.pushes, 0)
 -- B) threshold boundary: < threshold survives, == threshold clears
 -- ===========================================================================
 local w2 = new_fake_window({ auto_clear_bytes = 10 })
-w2:_process_rx_batch("123456789")            -- 9 < 10: keep
+feed(w2,"123456789")            -- 9 < 10: keep
 eq("B1 9/10 bytes: view kept", view_text(w2), "123456789")
 eq("B2 9/10 bytes: no pushes", #w2.imgui.pushes, 0)
-w2:_process_rx_batch("0")                    -- 10 == 10: fire exactly at threshold
+feed(w2,"0")                    -- 10 == 10: fire exactly at threshold
 eq("B3 10/10 bytes: accumulator reset", w2._imgui_receive_total, 0)
 eq("B4 10/10 bytes: retained tail cleared", w2._imgui_receive, "")
 eq("B5 10/10 bytes: chunks cleared", #w2._imgui_receive_chunks, 0)
@@ -138,12 +168,12 @@ ok("B8 10/10 bytes: empty push reached the view",
 -- A batch that crosses (overshoots) the threshold also clears, and display
 -- continues from empty afterwards.
 local w2b = new_fake_window({ auto_clear_bytes = 5 })
-w2b:_process_rx_batch("abcdefgh")            -- 8 > 5: overshoot clears too
+feed(w2b,"abcdefgh")            -- 8 > 5: overshoot clears too
 eq("B9 crossed batch: view empty", w2b._imgui_receive_total, 0)
-w2b:_process_rx_batch("xyz")
+feed(w2b,"xyz")
 eq("B10 continues after clear", view_text(w2b), "xyz")
 eq("B11 post-clear accumulator counts fresh", w2b._imgui_receive_total, 3)
-w2b:_process_rx_batch("12")                  -- total 5 == threshold: fire
+feed(w2b,"12")                  -- total 5 == threshold: fire
 eq("B12 re-crossed: cleared again", w2b._imgui_receive_total, 0)
 
 -- ===========================================================================
@@ -174,12 +204,12 @@ ok("C6 no core interaction from display path",
 -- D/E) frame-gap disabled: no separators ever
 -- ===========================================================================
 local w4 = new_fake_window({ auto_clear_bytes = 0, frame_gap_ms = 0 })
-fake_now = 5000; w4:_process_rx_batch("abc")
-fake_now = 99000; w4:_process_rx_batch("def")
+fake_now = 5000; feed(w4,"abc")
+fake_now = 99000; feed(w4,"def")
 eq("D1 gap disabled: halves glue together", view_text(w4), "abcdef")
 eq("D2 gap disabled: anchor tracks open tail", w4._view_tail_open, true)
-fake_now = 99999; w4:_process_rx_batch("\n")
-fake_now = 999999; w4:_process_rx_batch("x")
+fake_now = 99999; feed(w4,"\n")
+fake_now = 999999; feed(w4,"x")
 eq("D3 gap disabled: still no break", view_text(w4), "abcdef\nx")
 eq("D4 gap flag off keeps anchor timestamp unarmed", w4._rx_last_batch_ms, nil)
 
@@ -188,26 +218,26 @@ eq("D4 gap flag off keeps anchor timestamp unarmed", w4._rx_last_batch_ms, nil)
 -- ===========================================================================
 local w5 = new_fake_window({ auto_clear_bytes = 0, frame_gap_ms = 50 })
 -- First batch: nothing precedes it, so no break regardless of `now`.
-fake_now = 1000; w5:_process_rx_batch("abc")
+fake_now = 1000; feed(w5,"abc")
 eq("F1 first batch: no break", view_text(w5), "abc")
 -- Same fake now (two batches drained inside ONE poll_display round): even
 -- with the flag on, elapsed 0 must not break.
-fake_now = 1000; w5:_process_rx_batch("X")
+fake_now = 1000; feed(w5,"X")
 eq("F2 same-poll batch: no break", view_text(w5), "abcX")
 -- Exactly at the threshold: 1050 - 1000 == 50, need strictly MORE.
-fake_now = 1050; w5:_process_rx_batch("Y")
+fake_now = 1050; feed(w5,"Y")
 eq("F3 elapsed == N: no break", view_text(w5), "abcXY")
 -- One ms over: 1101 - 1050 = 51 > 50, tail open -> break before the batch.
-fake_now = 1101; w5:_process_rx_batch("def")
+fake_now = 1101; feed(w5,"def")
 eq("F4 elapsed > N, open tail: break inserted", view_text(w5), "abcXY\ndef")
 -- Tail now ends mid-line again; a gap arriving when the tail is CLOSED
 -- (ends '\n') must NOT insert a duplicate blank line.
-fake_now = 1101; w5:_process_rx_batch("done\n")          -- same poll: no break
-fake_now = 5000; w5:_process_rx_batch("next")            -- big gap, tail closed
+fake_now = 1101; feed(w5,"done\n")          -- same poll: no break
+fake_now = 5000; feed(w5,"next")            -- big gap, tail closed
 ok("F5 elapsed > N, closed tail: no break",
    view_text(w5):find("done\nnext", 1, true) ~= nil)
 -- Mid-line tail + gap again -> second break.
-fake_now = 9000; w5:_process_rx_batch("!")
+fake_now = 9000; feed(w5,"!")
 ok("F6 second gap: break again", view_text(w5):find("next\n!", 1, true) ~= nil)
 
 -- ===========================================================================
@@ -216,8 +246,8 @@ ok("F6 second gap: break again", view_text(w5):find("next\n!", 1, true) ~= nil)
 --    itself unless the threshold is reached through the SAME funnel.
 -- ===========================================================================
 local w6 = new_fake_window({ auto_clear_bytes = 1000, frame_gap_ms = 20 })
-fake_now = 1000; w6:_process_rx_batch("aaaa")
-fake_now = 2000; w6:_process_rx_batch("bbbb")           -- break + bbbb
+fake_now = 1000; feed(w6,"aaaa")
+fake_now = 2000; feed(w6,"bbbb")           -- break + bbbb
 eq("G1 combined tail", view_text(w6), "aaaa\nbbbb")
 eq("G2 accumulator counts break byte", w6._imgui_receive_total, 9)
 eq("G3 far from threshold: no clear", w6._imgui_receive, "aaaa\nbbbb")

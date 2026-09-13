@@ -102,6 +102,17 @@ local flushed = charset.flush()
 -- honest representation of a torn byte at stream end.
 eq("flush emits default char", flushed, "?")
 
+-- flush() must leave NOTHING pending, including the UTF-16 path where
+-- utf16_to_utf8() re-arms `pending` for an odd/lone byte.  Otherwise a
+-- disconnect flush would still leak the orphan into the next session's first
+-- bytes.  After flushing an odd byte, a fresh 2-byte unit must decode clean.
+charset.set("UTF-16")
+charset.reset()
+eq("utf16 flush input pending", charset.convert("\45"), nil)
+eq("utf16 flush emits the odd byte", charset.flush(), "\45")
+eq("utf16 flush leaves nothing pending", charset.convert("\45\78"),
+   "\228\184\173")   -- 中, not a garbage pairing with the flushed orphan
+
 charset.set("ASCII")
 print(string.format("charset: %d passed, %d failed", passed, failed))
 if failed > 0 then os.exit(1) end

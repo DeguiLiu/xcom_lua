@@ -91,6 +91,30 @@ ok("autosend_enabled true when OPEN", state.autosend_enabled)
 ok("params still disabled when OPEN", not state.params_enabled)
 eq("port_state_code OPEN", state.port_state_code, 2)
 
+-- 7b) Presence is an ORTHOGONAL input: it withholds Open for an absent port but
+-- never forces a close or overrides OPEN, and is not part of the state set.
+local pv = vm_mod.new()
+eq("presence defaults true", pv:ui_state().port_present, true)
+eq("set_port_present(true) unchanged -> false", pv:set_port_present(true), false)
+eq("set_port_present(false) changed -> true", pv:set_port_present(false), true)
+local ps = pv:ui_state()
+eq("absent: port_present false", ps.port_present, false)
+eq("absent: open_enabled false", ps.open_enabled, false)
+eq("absent: state still CLOSED", ps.state, pv.STATE_CLOSED)
+eq("absent: params still enabled", ps.params_enabled, true)
+-- Presence must not force a close or cut a live session: from OPEN, an absent
+-- port leaves close/send enabled and the state OPEN.
+pv:intent_open()
+pv:on_port_state(2, 1)
+pv:set_port_present(false)
+local live = pv:ui_state()
+eq("absent while OPEN: state OPEN", live.state, pv.STATE_OPEN)
+eq("absent while OPEN: close_enabled true", live.close_enabled, true)
+eq("absent while OPEN: send_enabled true", live.send_enabled, true)
+eq("absent while OPEN: open_enabled false", live.open_enabled, false)
+pv:set_port_present(true)
+eq("re-plug: open not offered while OPEN anyway", pv:ui_state().open_enabled, false)
+
 -- 8) on_snapshot: stale generation rejected; identical snapshot+state -> false.
 local vm2 = vm_mod.new()
 vm2:intent_open()
@@ -375,6 +399,80 @@ ok("settled send enabled", lat:ui_state().send_enabled)
 -- so a successful reset-close leaves the HSM stuck in RECONNECTING (or CLOSING
 -- after a user close).  Fix both in window.lua together, then expose the
 -- constants here.
+
+-- 20) Reused-buffer producer safety (xcom_ffi.get_snapshot now hands out a
+--     module-level table).  on_snapshot MUST copy what it retains, or the next
+--     poll would overwrite the "previous" values in place and every change
+--     would be missed.  Simulate a producer that mutates ONE table in place.
+local rb = vm_mod.new()
+local buf = { port_state = 2, generation = 1, rx_bytes = 0 }
+ok("reused buf: first snapshot is a change", rb:on_snapshot(buf) == true)
+ok("reused buf: identical re-send is a no-op", rb:on_snapshot(buf) == false)
+buf.rx_bytes = 42
+ok("reused buf: in-place field change detected", rb:on_snapshot(buf) == true)
+ok("reused buf: identical after change is a no-op", rb:on_snapshot(buf) == false)
+-- Mutating the producer's buffer after acceptance must NOT rewrite the retained
+-- snapshot: proves on_snapshot copied rather than aliased.
+buf.rx_bytes = 99
+eq("retained snapshot is a copy (not aliased)", rb.snapshot.rx_bytes, 42)
+
+-- 21) A subset snapshot must not leave stale fields from a previous one.
+local sub = vm_mod.new()
+sub:on_snapshot({ port_state = 2, generation = 1, rx_bytes = 7 })
+sub:on_snapshot({ port_state = 2, generation = 2 })
+eq("stale key dropped on subset snapshot", sub.snapshot.rx_bytes, nil)
+
+-- 26) Generation three-tier rule.  A strictly newer generation means the core
+--     ran a whole open/close round the mirror never observed (open and close
+--     each advance it), so local residue from the previous session must be
+--     dropped at that boundary.
+--     (a) stale (lower) generation: discarded, the mirror does not move.
+local gt = vm_mod.new()
+gt:intent_open(); gt:on_port_state(2, 4)                 -- OPEN, gen 4
+ok("stale gen discarded", not gt:on_port_state(0, 3))    -- CLOSED at gen 3
+eq("stale gen leaves the state OPEN", gt.hsm.state, vm_mod.STATE_OPEN)
+eq("stale gen leaves the generation", gt.hsm.generation, 4)
+--     (b) equal generation: idempotent.
+ok("equal gen same state is a no-op", not gt:on_port_state(2, 4))
+eq("equal gen leaves the generation", gt.hsm.generation, 4)
+--     (c) strictly greater generation with RECONNECTING residue: the rollback
+--     target and fault flag are dropped and `effective` takes the core state,
+--     but the grace window itself stays -- a recovery candidate must keep
+--     latching until settle_recovering() commits it (see on_port_state).
+local gh = vm_mod.new()
+gh:intent_open()                                         -- _return_to = CLOSED
+gh:on_port_state(2, 1)                                   -- OPEN, gen 1 (resync clears it)
+gh:enter_reconnecting(2)                                 -- RECONNECTING, faulted
+gh.hsm._return_to = vm_mod.STATE_OPEN                    -- residue from the last session
+ok("resync precondition: rollback target armed", gh.hsm._return_to ~= nil)
+ok("resync precondition: faulted set", gh.hsm.faulted)
+ok("greater gen resync accepted", gh:on_port_state(0, 5))  -- CLOSED, gen 5
+eq("greater gen clears the rollback target", gh.hsm._return_to, nil)
+eq("greater gen clears faulted", gh.hsm.faulted, false)
+eq("greater gen keeps the grace window", gh.hsm.state, vm_mod.STATE_RECONNECTING)
+eq("greater gen latches effective to the core state", gh.hsm.effective, vm_mod.STATE_CLOSED)
+--     (d) a strictly greater-generation FAULT outside the grace window still
+--     lands on FAULT (the resync does not soften it).
+local gf = vm_mod.new()
+gf:intent_open(); gf:on_port_state(2, 1)                 -- OPEN, gen 1
+ok("greater-gen FAULT accepted", gf:on_port_state(4, 3)) -- FAULT, gen 3
+eq("greater-gen FAULT lands on FAULT", gf.hsm.state, vm_mod.STATE_FAULT)
+eq("greater-gen FAULT sets effective", gf.hsm.effective, vm_mod.STATE_FAULT)
+
+-- 27) A consumed rollback target must not linger: reject_open/reject_close
+--     restore the pre-intent state and then clear `_return_to`, so it can never
+--     be reused to roll back into a stale state a second time.
+local ro = vm_mod.new()
+ro:intent_open()
+ok("intent_open arms the rollback target", ro.hsm._return_to ~= nil)
+ok("reject_open restores CLOSED", ro:reject_open() and ro.hsm.state == vm_mod.STATE_CLOSED)
+eq("reject_open consumed _return_to", ro.hsm._return_to, nil)
+local rcg = vm_mod.new()
+rcg:intent_open(); rcg:on_port_state(2, 1); rcg:enter_reconnecting(2)
+rcg:intent_close()                                       -- _return_to = RECONNECTING
+ok("reject_close restores RECONNECTING", rcg:reject_close())
+eq("reject_close consumed _return_to", rcg.hsm._return_to, nil)
+eq("reject_close restored the grace window", rcg.hsm.state, vm_mod.STATE_RECONNECTING)
 
 print(string.format("\nview_model tests: %d passed, %d failed", passed, failed))
 os.exit(failed == 0 and 0 or 1)

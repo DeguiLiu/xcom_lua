@@ -201,6 +201,22 @@ do -- 时间戳前缀
     ok("timestamp format", out:find("^%[%d%d:%d%d:%d%d%.%d%d%d%] OK\n") ~= nil, out)
     ok("second line stamped",
         out:find("\n%[%d%d:%d%d:%d%d%.%d%d%d%] ERROR\n") ~= nil, out)
+
+    -- A line split across two batches must carry ONE stamp, at its true start.
+    -- Stamping every non-newline segment would give the continuation its own
+    -- timestamp and present one event as two, which is the defect this pins.
+    local h2 = { now = 1699999999123 }
+    ok("时间戳前缀 reloads", run_script("时间戳前缀.lua", h2))
+    local first = h2.recv("PART")
+    local second = h2.recv("IAL\n")
+    local stamps = 0
+    for _ in first:gmatch("%[%d%d:%d%d:%d%d%.%d%d%d%]") do stamps = stamps + 1 end
+    for _ in second:gmatch("%[%d%d:%d%d:%d%d%.%d%d%d%]") do stamps = stamps + 1 end
+    eq("split line stamped exactly once", stamps, 1)
+    ok("continuation carries no stamp",
+        second:find("%[%d%d:%d%d:%d%d%.%d%d%d%]") == nil, second)
+    ok("split line reassembles",
+        (first .. second):find("PARTIAL\n", 1, true) ~= nil, first .. second)
 end
 
 do -- 大小写转换

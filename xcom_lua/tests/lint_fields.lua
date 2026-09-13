@@ -19,10 +19,12 @@ package.path = "./ui/?.lua;./core/?.lua;" .. package.path
 local LUAJIT = arg[-1] or "luajit"
 local FILES = {
     "main.lua",
-    "core/ansi.lua", "core/config.lua", "core/view_model.lua", "core/xcom_ffi.lua",
-    "ui/win32.lua", "ui/controls.lua", "ui/window.lua",
-    "ui/connection_panel.lua", "ui/receive_view.lua",
-    "ui/send_panel.lua", "ui/status_bar.lua",
+    "core/ansi.lua", "core/charset.lua", "core/config.lua",
+    "core/receive_copy.lua", "core/script_engine.lua", "core/serial_sim.lua",
+    "core/view_model.lua", "core/waveform.lua", "core/xcom_ffi.lua",
+    "ui/connection_panel.lua", "ui/controls.lua", "ui/imgui_bridge.lua",
+    "ui/receive_view.lua", "ui/send_panel.lua", "ui/status_bar.lua",
+    "ui/win32.lua", "ui/window.lua",
 }
 
 -- Names legitimately read from _G by this codebase.
@@ -56,10 +58,29 @@ end
 local function check_globals(path)
     local pipe = io.popen(string.format("%q -bl %q 2>/dev/null", LUAJIT, path))
     if not pipe then
+        fail("%s: could not run %q -bl", path, LUAJIT)
         return
     end
     local dump = pipe:read("*a")
-    pipe:close()
+    -- close() mirrors os.execute(): true/"exit"/0 on success, nil/"exit"/N on
+    -- failure.  This status MUST be checked.  A file that does not compile
+    -- produces an empty dump, which scans as "no undefined globals" -- the gate
+    -- would report clean on a module that cannot even load.  main.lua is the
+    -- entry point and no test suite requires it, so without this check a syntax
+    -- error there reaches a release build that will not start, with CI green.
+    local ok, why, code = pipe:close()
+    if not (ok == true and (code or 0) == 0) then
+        -- The diagnostic was suppressed above; re-run to capture it.
+        local err = io.popen(
+            string.format("%q -bl %q 2>&1 >/dev/null", LUAJIT, path))
+        local detail = err and err:read("*a") or ""
+        if err then
+            err:close()
+        end
+        fail("%s does not compile (%s %s): %s", path, tostring(why),
+             tostring(code), (detail:gsub("%s+$", "")))
+        return
+    end
     local seen = {}
     for name in dump:gmatch('GGET%s+%d+%s+%d+%s*;%s*"([^"]+)"') do
         if not BUILTINS[name] and not seen[name] then

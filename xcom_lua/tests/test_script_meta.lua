@@ -95,6 +95,24 @@ do
         meta.display_name("scope.lua", { desc = "some desc" }), "scope.lua")
 end
 
+-- ---- 2b) tooltip: @desc -> @name -> nothing (no empty tooltip) -------------
+-- The script-list hover text.  Unlike the label this prefers the long-form
+-- @desc, falls back to @name, and returns nil when a script declared neither
+-- (the renderer must show NO tooltip rather than an empty box).
+do
+    ok("meta.tooltip exposed", type(meta.tooltip) == "function")
+    eq("tooltip prefers desc",
+        meta.tooltip({ name = "绘制曲线", desc = "解析串口数值行" }),
+        "解析串口数值行")
+    eq("tooltip falls back to name",
+        meta.tooltip({ name = "绘制曲线" }), "绘制曲线")
+    eq("tooltip skips empty desc",
+        meta.tooltip({ name = "绘制曲线", desc = "" }), "绘制曲线")
+    eq("tooltip skips empty name too", meta.tooltip({ name = "" }), nil)
+    eq("tooltip nil when neither", meta.tooltip({}), nil)
+    eq("tooltip nil-safe on nil", meta.tooltip(nil), nil)
+end
+
 -- ---- 3) debounce scheduler: coalesce rapid events per name ------------------
 do
     ok("debounce module exposed", debounce ~= nil)
@@ -190,6 +208,22 @@ do
     -- pump() with no watcher is a safe no-op returning an empty list.
     local reloaded = engine:pump()
     eq("pump without watcher -> 0 reloads", #reloaded, 0)
+
+    -- Hover text: desc wins, name is the fallback, none -> "" in the array.
+    eq("script_tooltip prefers desc",
+        engine:script_tooltip("scope_demo.lua"), "解析串口数值行")
+    eq("script_tooltip unknown -> nil", engine:script_tooltip("ghost.lua"), nil)
+    eq("script_tooltip no meta -> nil", engine:script_tooltip("raw.lua"), nil)
+    engine.scripts["name_only.lua"] = { enabled = false,
+        meta = { name = "仅名称" }, label = "仅名称" }
+    engine.order = { "raw.lua", "name_only.lua", "scope_demo.lua" }
+    eq("script_tooltip falls back to name",
+        engine:script_tooltip("name_only.lua"), "仅名称")
+    local tips = engine:script_tooltips()
+    eq("tooltips count", #tips, 3)
+    eq("tooltips[1] none -> empty (no empty tooltip)", tips[1], "")
+    eq("tooltips[2] name fallback", tips[2], "仅名称")
+    eq("tooltips[3] desc", tips[3], "解析串口数值行")
 end
 
 -- ---- 6) real shipped scripts: every one declares a usable @name ------------

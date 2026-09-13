@@ -120,14 +120,16 @@ end
 -- ===========================================================================
 -- 1) DBCS character torn across two drain batches: lead byte ends batch 1,
 --    trail byte opens batch 2.  Batch 1 must display NOTHING (held pending),
---    batch 2 must display the fully converted character.
+--    batch 2 must deliver the whole line, fully converted.  Note the LF is in
+--    batch 2: the whole-line bridge (design §2) also holds batch 1's "A",
+--    because a line without its terminator is not handed to the viewport yet.
 -- ===========================================================================
 charset.reset()
 local w = new_fake_window()
 w:_process_rx_batch("A\214")      -- 'A' + lead of 中 (D6 D0): D6 held
-eq("1a torn batch1: hold, no raw leak", view_text(w), "A")
-w:_process_rx_batch("\208B")      -- trail D0 completes 中, then 'B'
-eq("1b torn batch2: completed -> utf8", view_text(w), "A\228\184\173B")
+eq("1a torn batch1: hold, whole line withheld", view_text(w), "")
+w:_process_rx_batch("\208B\n")    -- trail D0 completes 中, then 'B' + LF
+eq("1b torn batch2: completed -> utf8", view_text(w), "A\228\184\173B\n")
 
 -- ===========================================================================
 -- 2) Whole batch is a single held lead byte -> nothing may be displayed.
@@ -166,6 +168,78 @@ w4:_final_drain()
 xcom.drain_display = saved_drain
 eq("4b flush emits the held byte", view_text(w4), "\214")
 ok("4c flush re-armed (nothing stays pending)",
+   (charset.flush()) == nil)
+
+-- ===========================================================================
+-- 5) Pause must NOT stop display capture, and Lua must NOT write RX to the
+--    log at all: persistence is owned by the core's raw-byte lane (design §4
+--    item 1).  This is the regression guard for the double-write bug — the
+--    recording core must see ZERO log_append calls on the RX path.
+-- ===========================================================================
+do
+    local w5 = new_fake_window({ charset = "ASCII" })
+    w5._charset_active = false
+    w5.core = { fake = true }
+    w5.connected = true
+    w5._log_active = true
+    w5._pause_display = true
+    local queue = { { xcom.ok, "hello\n" }, { xcom.ok, "world\n" } }
+    local di = 0
+    local saved_drain, saved_append = xcom.drain_display, xcom.log_append
+    local logged = {}
+    xcom.drain_display = function()
+        di = di + 1
+        local d = queue[di]
+        if d then return d[1], d[2] end
+        return xcom.ok, nil
+    end
+    xcom.log_append = function(_, text) logged[#logged + 1] = text; return xcom.ok end
+    w5:poll_display()
+    xcom.drain_display, xcom.log_append = saved_drain, saved_append
+    eq("5a RX is never log_append'd by Lua", #logged, 0)
+    eq("5b paused: viewport untouched", view_text(w5), "")
+    eq("5c paused: skipped bytes counted", w5._paused_display_bytes, 12)
+    w5._pause_display = false
+    w5:_process_rx_batch("resumed\n")
+    eq("5d resume shows newly arriving data", view_text(w5), "resumed\n")
+end
+
+-- ===========================================================================
+-- 6) Legacy (imgui == nil) tail must stay bounded under a chatty link: the
+--    chunk table is only reset by a frame flush, which never runs without the
+--    dashboard, so it must compact its retired prefix itself.
+-- ===========================================================================
+do
+    local w6 = new_fake_window({ charset = "ASCII" })
+    w6._charset_active = false
+    w6.imgui = nil
+    w6._receive_window = 1024
+    for _ = 1, 5000 do
+        w6:_append_imgui_receive(string.rep("x", 100) .. "\n")
+    end
+    ok("6a legacy chunk table stays bounded (#=" ..
+       tostring(#w6._imgui_receive_chunks) .. ")",
+       #w6._imgui_receive_chunks < 300)
+end
+
+-- ===========================================================================
+-- 7) Disconnect edge: a character torn at the session boundary must be FLUSHED
+--    (visible) at the disconnect, not carried into the next session -- where
+--    dbcs_to_utf8 would prepend the orphan lead to the new session's first
+--    bytes and garble its opening characters.  _render_ui_state's
+--    was-connected -> disconnected edge is where the other per-session display
+--    state is cleared; the charset half must flush there too.
+-- ===========================================================================
+charset.reset()
+local w7 = new_fake_window()
+w7.conn = {}                       -- the real _render_ui_state indexes conn
+w7.connected = true                -- simulate a live session
+w7:_process_rx_batch("\214")       -- lone DBCS lead held inside charset
+eq("7a pending held: view empty", view_text(w7), "")
+w7:_render_ui_state()              -- disconnect edge
+eq("7b disconnect flushes the held byte (visible, not silent)",
+   view_text(w7), "\214")
+ok("7c flush re-armed: nothing carried into the next session",
    (charset.flush()) == nil)
 
 print(string.format("rx_charset_batch: %d passed, %d failed", pass_n, fail_n))

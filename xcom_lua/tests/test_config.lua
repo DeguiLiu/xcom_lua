@@ -103,5 +103,16 @@ eq("multi get enabled", config.get_multi_entry(cfg, 0, 3, "enabled", false), tru
 local cfg2 = config.load("/nonexistent/definitely/missing.ini")
 eq("missing load returns default blob", type(cfg2[""]), "table")
 
+-- 8) open-time modem-line tri-state keys ([serial] dtr_open/rts_open) persist
+--    as plain ints in 0/1/2; 2 (XCOM_LINE_LEAVE_ALONE) must survive a
+--    save/load round-trip, not be coerced to a bool.
+local tri = { [""] = {}, serial = { dtr_open = 0, rts_open = 2 } }
+local tmp_tri = os.tmpname()
+config.save(tmp_tri, tri)
+local tri_rt = config.load(tmp_tri)
+eq("rt dtr_open 0", tri_rt["serial"].dtr_open, 0)
+eq("rt rts_open 2", tri_rt["serial"].rts_open, 2)
+os.remove(tmp_tri)
+
 print(string.format("\nconfig tests: %d passed, %d failed", passed, failed))
 os.exit(failed == 0 and 0 or 1)

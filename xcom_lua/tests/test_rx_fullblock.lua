@@ -4,13 +4,15 @@
 -- through xcom_test_inject_rx in varying chunk sizes (simulating arbitrary
 -- serial driver read() splits), then asserts on the drained display text:
 --
---   1. Every "[HH:MM:SS.mmm] " timestamp sits at a line boundary (offset 0
---      or right after '\n'). Mid-line timestamps are THE bug.
+--   1. The C++ drain carries NO timestamp (design §4 item 2 moved stamping to
+--      Lua), so any "[HH:MM:SS.mmm] " in the drained bytes is a regression;
+--      if one appeared it must never be mid-line.
 --   2. Long command-description lines arrive intact: "mkfs", "mkdir",
 --      "Concatenate", "current working directory" are not chopped by a
 --      spurious newline+timestamp injected at a block boundary.
---   3. The byte count is conserved: drained total >= raw minus dropped
---      control bytes, and the tail (last command + prompt) is present.
+--   3. The normalised byte count is plausible: CRLF folds to one LF, so the
+--      output is strictly smaller than the raw input and the tail (last
+--      command + prompt) is present.
 --
 -- Usage: runtime\luvjit.exe tests\test_rx_fullblock.lua <raw_capture.bin>
 --        (default sample data if no file is given)
@@ -99,6 +101,9 @@ local function run_scenario(chunk_size, raw, label)
         return
     end
 
+    -- timestamp = true is accepted-but-ignored by the core (design §4 item 2);
+    -- it is set only to prove the drain stays timestamp-free even when a client
+    -- still forwards the legacy flag.
     xcom.set_options(handle, { hex_view = false, timestamp = true,
         pause_display = false, auto_clear_bytes = 0 })
 
@@ -137,12 +142,15 @@ local function run_scenario(chunk_size, raw, label)
     xcom.close(handle, 2000)
     xcom.destroy(handle)
 
-    -- Assert 1: timestamps only at line boundaries.
+    -- Assert 1: the C++ drain injects no timestamp at all; if any appeared it
+    -- must sit at a line boundary (mid-line is THE historical bug).
     local bad = 0
+    local stamps = 0
     local i = 1
     while i <= #captured do
         if captured:sub(i, i) == "[" and captured:sub(i + 1, i + 2):match("^%d%d")
            and captured:sub(i + 8, i + 8) == ":" then
+            stamps = stamps + 1
             if i > 1 then
                 local prev = captured:byte(i - 1)
                 if prev ~= 10 and prev ~= 13 then
@@ -157,6 +165,8 @@ local function run_scenario(chunk_size, raw, label)
         i = i + 1
     end
     ok("no mid-line timestamps", bad == 0, bad .. " occurrences")
+    ok("no C++ timestamps in drain (Lua owns stamping)",
+       stamps == 0, stamps .. " occurrences")
 
     -- Assert 2: intact lines (each description must appear whole: the command
     -- name, its padding, and the dash on the SAME line — a block-boundary
@@ -172,11 +182,15 @@ local function run_scenario(chunk_size, raw, label)
     end
     ok("command lines intact (" .. intact .. "/4)", intact == 4)
 
-    -- Assert 3: byte conservation is plausible (strip only removes control
-    -- bytes; CRLF collapses to LF).  With timestamps on, the output must be
-    -- larger than the raw input.
-    ok("output not truncated", #captured >= #raw,
-       ("#captured=%d #raw=%d"):format(#captured, #raw))
+    -- Assert 3: the drained text is normalised, NOT padded by timestamps, so it
+    -- is strictly smaller than the raw input (each CRLF collapses to one LF)
+    -- but must not lose meaningful bytes.  Allow the CR count plus a small
+    -- margin for other stripped C0 bytes.
+    local cr_count = select(2, raw:gsub("\r", ""))
+    ok("output normalised, not truncated",
+       #captured > 0 and #captured < #raw and
+       (#raw - #captured) <= (cr_count + 8),
+       ("#captured=%d #raw=%d cr=%d"):format(#captured, #raw, cr_count))
     ok("tail prompt present", captured:find("msh />", 1, true) ~= nil)
     return captured
 end

@@ -32,16 +32,16 @@ end
 -- 1) The module loads on Linux (cdef + layout self-check run at require time).
 --    require() already succeeded above; assert the size pins are present.
 ok("SIZEOF table present", type(x.SIZEOF) == "table")
-eq("sizeof snapshot pinned", x.SIZEOF.snapshot, 80)
+eq("sizeof snapshot pinned", x.SIZEOF.snapshot, 84)
 eq("sizeof portconfig pinned", x.SIZEOF.port_config, 32)
 eq("sizeof error pinned", x.SIZEOF.error, 268)
-eq("sizeof portinfo pinned", x.SIZEOF.port_info, 324)
+eq("sizeof portinfo pinned", x.SIZEOF.port_info, 420)
 
--- 2) version packing (v1.5.0 -> 0x010500).  This must track xcom.h's
+-- 2) version packing (v1.6.0 -> 0x010600).  This must track xcom.h's
 -- XCOM_VERSION_MAJOR/MINOR/PATCH: the cdef and the size pins above already
--- describe the v1.5 layout, so a stale constant here would make a capability
+-- describe the v1.6 layout, so a stale constant here would make a capability
 -- gate compare against the wrong DLL version.
-eq("packed version 010500", string.format("%06x", x.packed_version()), "010500")
+eq("packed version 010600", string.format("%06x", x.packed_version()), "010600")
 eq("constant ok", x.ok, 0)
 eq("constant full", x.err_full, -5)
 eq("port open", x.port_open, 2)
@@ -96,6 +96,29 @@ eq("hex empty+crlf payload stays empty", ok6, "")
 eq("hex empty+crlf err nil", err6, nil)
 local ok7 = x.build_send_payload("   ", true, true)
 eq("hex whitespace-only+crlf stays empty", ok7, "")
+
+-- 8) open-time modem-line tri-state (mirror xcom.h XCOM_LINE_*).  Regression
+--    guard: the old `dtr and 1 or 0` collapsed the third state (2 -> 1), so
+--    XCOM_LINE_LEAVE_ALONE could never reach the C backend.  Bool callers must
+--    still degrade to the historical 0/1.
+eq("line deassert const", x.line_deassert, 0)
+eq("line assert const", x.line_assert, 1)
+eq("line leave-alone const", x.line_leave_alone, 2)
+eq("tristate 0 passthrough", x.line_tristate(0), 0)
+eq("tristate 1 passthrough", x.line_tristate(1), 1)
+eq("tristate 2 not swallowed", x.line_tristate(2), 2)
+eq("tristate true -> 1", x.line_tristate(true), 1)
+eq("tristate false -> 0", x.line_tristate(false), 0)
+eq("tristate nil -> 0", x.line_tristate(nil), 0)
+-- End-to-end through the real FFI field (cdef only; no DLL needed): the value
+-- the backend receives must still hold 2.
+local line_cfg = x.typeof.port_config()
+line_cfg.dtr_enable = x.line_tristate(x.line_leave_alone)
+line_cfg.rts_enable = x.line_tristate(false)
+eq("ffi dtr_enable keeps LEAVE_ALONE", line_cfg.dtr_enable, 2)
+eq("ffi rts_enable bool false -> 0", line_cfg.rts_enable, 0)
+line_cfg.dtr_enable = x.line_tristate(true)
+eq("ffi dtr_enable bool true -> 1", line_cfg.dtr_enable, 1)
 
 print(string.format("\nxcom_ffi tests: %d passed, %d failed", passed, failed))
 os.exit(failed == 0 and 0 or 1)

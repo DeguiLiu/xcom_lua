@@ -1,11 +1,16 @@
--- Reproduce the exact bug: timestamp inserted mid-line when a device prompt
--- arrives without a trailing newline, then a command is echoed with one.
+-- Regression for the mid-line-stamp bug, updated to the redesign contract.
+--
+-- Historically the C++ formatter injected [HH:MM:SS.mmm] at each line start;
+-- a device prompt arriving without a trailing newline ("msh/g") followed by an
+-- echoed "echo 1\r\n" therefore got a stamp glued mid-line.  After design §4
+-- item 2 the C++ drain carries NO timestamp (Lua stage ⑥ renders arrival wall
+-- time itself), so this test now pins the SOURCE contract: the drained bytes
+-- are timestamp-free, the command echo is not split by a spurious injected
+-- newline, and (defensively) no timestamp appears mid-line.
 --
 -- Scenario (from the user's screenshot):
 --   device sends "msh/g"        (no trailing newline - prompt)
 --   user types   "echo 1\r\n"  (echoed back WITH newline)
--- Expected (timestamp on):  each timestamped line starts with [HH:MM:SS.mmm]
---   and a mid-line command echo should NOT get a timestamp glued to it.
 --
 -- Usage: runtime\luajit.exe tests\test_ts_midline.lua [COMport]
 --        no port arg -> VIRTUAL (hardware-free in-process session,
@@ -47,7 +52,9 @@ for _ = 1, 40 do
 end
 if not opened then print("could not open " .. port); finish(1) end
 
--- enable timestamp, text view
+-- enable text view.  `timestamp = true` is accepted-but-ignored by the core
+-- (design §4 item 2); it is set only to prove the drain stays timestamp-free
+-- even when a client still forwards the legacy flag.
 xcom.set_options(handle, { hex_view = false, timestamp = true,
     pause_display = false, auto_clear_bytes = 0, max_display_bytes = 2*1024*1024 })
 
@@ -87,14 +94,17 @@ end
 print("")
 
 -- Assertions:
--- (a) every timestamp prefix "[HH:MM:SS.mmm] " must be at offset 0 or right
---     after a \n or \r.  A mid-line timestamp is THE bug.
+-- (a) NO timestamp prefix may be produced by the C++ drain at all (the Lua
+--     stage owns stamping), so any "[HH:MM:SS.mmm] " found is a regression;
+--     and if one is found it must never be mid-line (the original bug).
 local bad = 0
+local stamps = 0
 local i = 1
 while i <= #captured do
     if captured:sub(i, i) == "[" and captured:sub(i+1, i+2):match("^%d%d")
        and captured:sub(i+8, i+8) == ":" then
         -- found a timestamp start; check it is at a line boundary
+        stamps = stamps + 1
         if i > 1 then
             local prev = captured:byte(i - 1)
             if prev ~= 10 and prev ~= 13 then  -- not \n or \r
@@ -114,8 +124,9 @@ local echo_count = select(2, captured:gsub("echo 1", ""))
 -- (c) a separator newline may be inserted BEFORE a mid-line timestamp, but it
 --     must not corrupt the visible command text.
 print(string.format("mid-line timestamps: %d (must be 0)", bad))
+print(string.format("C++ timestamps in drain: %d (must be 0 after redesign)", stamps))
 print(string.format("'echo 1' occurrences: %d (must be 1)", echo_count))
 
-local verdict = (bad == 0 and echo_count == 1) and "PASS" or "FAIL"
+local verdict = (bad == 0 and stamps == 0 and echo_count == 1) and "PASS" or "FAIL"
 print("VERDICT: " .. verdict)
 finish(verdict == "PASS" and 0 or 1)
