@@ -148,9 +148,11 @@ struct Lang final {
     const char* flow_items[3];
     // Open-time modem-line tri-state (XCOM_LINE_*).  Items are ordered by the
     // ABI enum so combo index == value: 0 deassert, 1 assert, 2 leave alone.
-    // A distinct group from the live DTR/RTS toggles.
+    // The same control renders the two-state variant while a session is open,
+    // when "leave alone" is no longer a state the pin can be in.
     const char* open_line_label;    // "开端口线路" / "OPEN LINES"
     const char* open_line_items[3];
+    const char* open_line_open_items[2];   // 拉低/拉高 — while a session is open
     // Serial-profile combo labels in the grid's fixed row order
     // (baud / data bits / stop bits / parity / flow — same order as
     // serial_fields in draw_console, which indexes this array positionally).
@@ -210,6 +212,8 @@ struct Lang final {
         for (const char* item : flow_items) { fn(item); }
         for (const char* item : open_line_items) { fn(item); }
         fn(open_line_label);
+        fn(open_line_items[0]); fn(open_line_items[1]); fn(open_line_items[2]);
+        fn(open_line_open_items[0]); fn(open_line_open_items[1]);
         for (const char* item : serial_field_labels) { fn(item); }
         fn(subtitle);
         fn(menu_select_all); fn(menu_copy); fn(menu_paste);
@@ -234,6 +238,7 @@ static_assert(std::is_standard_layout_v<Lang> && std::is_trivially_copyable_v<La
 static_assert(std::size(Lang{}.parity_items) == 5U);   // matches ui/imgui_bridge.lua PARITY_ITEMS
 static_assert(std::size(Lang{}.flow_items) == 3U);      // matches ui/imgui_bridge.lua FLOW_ITEMS
 static_assert(std::size(Lang{}.open_line_items) == 3U); // == XCOM_LINE_* count (0/1/2)
+static_assert(std::size(Lang{}.open_line_open_items) == 2U); // deassert/assert while open
 static_assert(std::size(Lang{}.serial_field_labels) == 5U);  // == serial_fields row count
 
 // Chinese labels mirror pic/1.png + llcom/SSCOM naming conventions.
@@ -261,6 +266,7 @@ constexpr Lang kLangZh{
     /*flow*/ {"无", "RTS / CTS", "XON / XOFF"},
     /*open_line_label*/ "开端口线路",
     /*open_line_items*/ {"拉低", "拉高", "不接触"},
+    /*open_line_open_items*/ {"拉低", "拉高"},
     /*serial_field_labels*/ {"波特率", "数据位", "停止位", "校验位", "流控"},
     /*subtitle*/ "串口助手",
     /*menu_select_all*/ "全选", /*menu_copy*/ "复制", /*menu_paste*/ "粘贴",
@@ -305,6 +311,7 @@ constexpr Lang kLangEn{
     /*flow*/ {"None", "RTS / CTS", "XON / XOFF"},
     /*open_line_label*/ "OPEN LINES",
     /*open_line_items*/ {"Deassert", "Assert", "Leave alone"},
+    /*open_line_open_items*/ {"Deassert", "Assert"},
     /*serial_field_labels*/ {"BAUD", "DATA", "STOP", "PARITY", "FLOW"},
     /*subtitle*/ "SERIAL CONSOLE",
     /*menu_select_all*/ "Select all", /*menu_copy*/ "Copy", /*menu_paste*/ "Paste",
@@ -2046,11 +2053,71 @@ bool QueueReceiveCopy(ImGuiRuntime& runtime, std::size_t begin_abs,
     // was opened with.
     const bool rts_driver_owned = *flow == 1;
     ImGui::SetCursorPosX(kSidebarInset);
-    const std::array<ToggleSpec, 2> modem_options{{
-        {"DTR", dtr, Action::ActionSyncSettings},
-        {"RTS", rts, Action::ActionSyncSettings, !rts_driver_owned},
-    }};
-    RenderToggles(actions, modem_options);
+    // ONE control per line, whose FORM follows the session state, instead of a
+    // live toggle pair here plus a separate open-time tri-state group below.
+    //
+    // The two groups existed because they answer different questions — what
+    // level to drive the pin at when the port opens, versus what level to drive
+    // it now — but a user reads them as the same question asked twice, and no
+    // surveyed tool shows both (LLCOM, the reference for this layout, has a
+    // single DTR/RTS pair). Keep one control and let the state pick its form:
+    //
+    //   CLOSED/FAULT : tri-state combo (拉低/拉高/不接触). The value is the
+    //                  open-time setting; "leave alone" is the only choice that
+    //                  makes open() issue no EscapeCommFunction, which is what
+    //                  keeps a DTR->NRST board from being reset by opening.
+    //   OPEN         : two-state combo (拉低/拉高). The pin can no longer be
+    //                  left alone — the port is already driving it — so offering
+    //                  three choices would imply a state the hardware is not in.
+    //                  An open-time "leave alone" is shown as the level the pin
+    //                  actually settled to, so the control never lies.
+    const bool session_open = connected;
+    const auto* line_items = session_open ? lang.open_line_open_items
+                                          : lang.open_line_items;
+    const int line_item_count = session_open ? 2 : 3;
+    {
+        const auto& runtime = ImGuiRuntime::instance();
+        if (ImGui::BeginTable("##modem_line_grid", 2,
+                              ImGuiTableFlags_SizingStretchProp)) {
+            ImGui::TableSetupColumn("label", ImGuiTableColumnFlags_WidthFixed,
+                                    lang.serial_label_col);
+            ImGui::TableSetupColumn("value", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+            if (runtime.dtr_open_ != nullptr) {
+                ImGui::TableNextRow();
+                if (GridComboField({"##dtr_line", "DTR", runtime.dtr_open_,
+                                    line_items, line_item_count})) {
+                    // The runtime toggle mirrors the open-time value while open,
+                    // so the live level and the stored preference never diverge.
+                    *dtr = *runtime.dtr_open_ != 0;
+                    actions |= Action::ActionSyncSettings;
+                }
+            }
+            if (runtime.rts_open_ != nullptr || rts != nullptr) {
+                ImGui::TableNextRow();
+                // Under RTS/CTS the driver owns RTS, so the request cannot be
+                // honoured; disable rather than show a level the port will not
+                // program (RealTerm's documented handshake-pin rule).
+                ImGui::BeginDisabled(rts_driver_owned);
+                if (runtime.rts_open_ != nullptr) {
+                    if (GridComboField({"##rts_line", "RTS", runtime.rts_open_,
+                                        line_items, line_item_count})) {
+                        *rts = *runtime.rts_open_ != 0;
+                        actions |= Action::ActionSyncSettings;
+                    }
+                } else if (rts != nullptr) {
+                    // No open-line buffers registered (older Lua peer): keep the
+                    // plain live toggle so the pin is still reachable.
+                    bool asserted = *rts != 0;
+                    if (ImGui::Checkbox("##rts_live", &asserted)) {
+                        *rts = asserted ? 1 : 0;
+                        actions |= Action::ActionSyncSettings;
+                    }
+                }
+                ImGui::EndDisabled();
+            }
+            ImGui::EndTable();
+        }
+    }
     ImGui::Dummy(ImVec2(0.0f, 5.0f));
     ImGui::Separator();
     ImGui::Spacing();
@@ -2088,48 +2155,10 @@ bool QueueReceiveCopy(ImGuiRuntime& runtime, std::size_t begin_abs,
         }
         ImGui::EndTable();
     }
-    // Open-time modem-line tri-state (XCOM_LINE_*).  A SEPARATE group from the
-    // live DTR/RTS toggles above: these are programmed once, at open.  "Leave
-    // alone" is the only setting under which the open path issues no
-    // EscapeCommFunction for that line, so a target with DTR->NRST / RTS->BOOT
-    // is not reset just by opening the port.  Hidden on a DLL whose Lua peer
-    // did not register the two int buffers (xcom_imgui_set_open_lines).
-    {
-        const auto& runtime = ImGuiRuntime::instance();
-        if (runtime.dtr_open_ != nullptr || runtime.rts_open_ != nullptr) {
-            ImGui::Spacing();
-            ImGui::SetCursorPosX(kSidebarInset);
-            Section(lang.open_line_label);
-            if (ImGui::BeginTable("##open_line_grid", 2,
-                                  ImGuiTableFlags_SizingStretchProp)) {
-                ImGui::TableSetupColumn("label", ImGuiTableColumnFlags_WidthFixed,
-                                        lang.serial_label_col);
-                ImGui::TableSetupColumn("value", ImGuiTableColumnFlags_WidthStretch, 1.0f);
-                const int item_count =
-                    static_cast<int>(std::size(lang.open_line_items));
-                if (runtime.dtr_open_ != nullptr) {
-                    ImGui::TableNextRow();
-                    if (GridComboField({"##dtr_open", "DTR", runtime.dtr_open_,
-                                        lang.open_line_items, item_count})) {
-                        actions |= Action::ActionSyncSettings;
-                    }
-                }
-                if (runtime.rts_open_ != nullptr) {
-                    ImGui::TableNextRow();
-                    // Under RTS/CTS the driver owns RTS, so an open-time RTS
-                    // choice cannot be honoured; disable rather than show a
-                    // level the port will not program.
-                    ImGui::BeginDisabled(*flow == 1);
-                    if (GridComboField({"##rts_open", "RTS", runtime.rts_open_,
-                                        lang.open_line_items, item_count})) {
-                        actions |= Action::ActionSyncSettings;
-                    }
-                    ImGui::EndDisabled();
-                }
-                ImGui::EndTable();
-            }
-        }
-    }
+    // Open-time modem-line tri-state (XCOM_LINE_*) is folded into the single
+    // DTR/RTS control above: it renders the tri-state form while closed and the
+    // two-state form while open, so this separate group was removed.  Adding a
+    // second visible control for the same two pins read as a duplicate.
     ImGui::EndDisabled();
     // "更多" advanced band — kept per user request (may be re-enabled later),
     // but currently gated OFF by kMoreSectionEnabled so the sidebar shows only

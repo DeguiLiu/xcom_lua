@@ -179,11 +179,12 @@ function M.new(hwnd, cfg)
         flow = int1(cfg.flow_control),
         dtr = bool1(cfg.dtr_enable),
         rts = bool1(cfg.rts_enable),
-        -- Open-time modem-line tri-state (0 = deassert, 1 = assert, 2 = leave
-        -- the line alone), a SEPARATE group from the runtime dtr/rts toggles
-        -- just above (those stay plain 0/1).  These are the values handed to
-        -- XcomPortConfig.dtr_enable/rts_enable at open; the native serial grid
-        -- edits them in place once xcom_imgui_set_open_lines is registered.
+        -- Modem-line level, one control for both meanings (see the native
+        -- grid): tri-state while closed (0 deassert / 1 assert / 2 leave alone)
+        -- and two-state while open.  dtr/rts above stay plain booleans because
+        -- the live ABI (xcom_set_lines) only accepts 0/1; dtr_open/rts_open hold
+        -- the tri-state the open path consumes.  The native grid writes both in
+        -- step while open, so they cannot disagree.
         -- line_from_ui_index normalises a missing/stale config to LEAVE_ALONE,
         -- so a config-less bridge can never default to driving the pin.
         dtr_open = int1(xcom_ffi.line_from_ui_index(cfg.dtr_open)),
