@@ -25,7 +25,7 @@ concurrency:
 # message which coact change is being taken. Keep it a full 40-character SHA so
 # the pin is unambiguous.
 env:
-  COACT_REF: a0ddd9590678f30a6a1ca727058dbf72ced3594f
+  COACT_REF: 6bbb094d6b997df5d06e9cb702bbffb88cb664a5
 
 jobs:
   # ---------------------------------------------------------------------------
