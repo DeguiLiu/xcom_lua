@@ -5,6 +5,8 @@
 XCOM is a Windows serial debugging tool: a native C++17 core (`xcom_core`) plus a
 LuaJIT + Dear ImGui client (`xcom_lua`) with async text/HEX I/O, timestamps,
 auto-send, a Lua script system, a scope plot, and a D3D11/WARP renderer.
+<img width="1380" height="975" alt="image" src="https://github.com/user-attachments/assets/b43da6dd-b5fc-497d-8dc5-a763531db028" />
+
 
 ## Topology
 
