@@ -2589,8 +2589,19 @@ end
 
 function Window:_imgui_send_slot(index)
     if not self.imgui then return end
-    local text, enabled = self.imgui:multi_entry(index)
-    if not enabled or text == "" then return end
+    -- The per-row "N" button (and Alt+digit, which shares this path) sends THAT
+    -- row unconditionally.  The enable toggle is the BULK selector -- the "发送"
+    -- button walks the ticked rows -- not a gate on the per-row button.
+    -- Requiring the tick made the button look dead on any unticked row, which
+    -- is the opposite of what a per-row button is for; the row's own text is
+    -- the only thing that decides, and an empty row says so instead of
+    -- swallowing the click.
+    local text = self.imgui:multi_entry(index)
+    if text == "" then
+        self:set_status_deferred("multi slot " .. (index + 1) ..
+            ": empty, nothing sent")
+        return
+    end
     local payload = xcom.build_send_payload(text,
         self.imgui.multi_hex[0] ~= 0, self.imgui.multi_crlf[0] ~= 0)
     if payload == nil then

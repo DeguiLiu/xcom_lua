@@ -1285,8 +1285,43 @@ bool QueueReceiveCopy(ImGuiRuntime& runtime, std::size_t begin_abs,
     // area, which is always wide enough).  Right-aligned row of icon buttons
     // above the log; rendered BEFORE the empty-state early-return so the
     // buttons stay available even with no data yet.
+    // The pinned row's screen-space top and bottom.  Everything the panel draws
+    // below the bottom is clipped so the log cannot paint over the icons.
+    float icon_strip_top = 0.0f;
+    float icon_strip_bottom = 0.0f;
     {
-        ImGui::SetCursorPosX(ImGui::GetWindowWidth() - 3.0f * 28.0f - 2.0f * 4.0f - kSidebarInset);
+        // Anchor to the panel's VISIBLE top-right corner, in screen space.
+        //
+        // GetWindowWidth() is the scrollable CONTENT width: one log line longer
+        // than the panel widens it past the viewport, and a cursor X measured
+        // from it lands outside what the user can see — the three buttons
+        // disappeared entirely on any run with a wide line (reported twice;
+        // reproduces only once a line overflows, e.g. when the window is
+        // narrowed). GetContentRegionAvail() cannot fix that either when fed
+        // back through GetCursorPosX, because it is already relative to the
+        // cursor: the sum is identically GetWindowWidth().
+        //
+        // Screen space is immune to the scroll offset, so take the cursor's
+        // screen position (which is the panel's inner left edge plus whatever
+        // the cursor already advanced, i.e. its left edge here) and add the
+        // visible width. The row then stays pinned to the corner regardless of
+        // how far the content scrolls horizontally.
+        // X stays in screen space: GetWindowWidth() is the scrollable CONTENT
+        // width, so one log line wider than the panel puts the row past the
+        // viewport.  Y must be the VIEWPORT top, not the content cursor's
+        // screen Y -- that tracks the CONTENT origin, so the moment the log
+        // outgrows the panel and follow-tail scrolls it, the row is drawn
+        // above the visible area and disappears, which is exactly why the
+        // buttons still vanished after the X fix.  The scrollbar is reserved
+        // too: ImGui draws it LAST, so a row flush to the right edge loses its
+        // rightmost icon under the track.
+        const ImVec2 panel_pos = ImGui::GetWindowPos();
+        const float visible_right = panel_pos.x + ImGui::GetWindowSize().x -
+                                    ImGui::GetStyle().ScrollbarSize;
+        icon_strip_top = panel_pos.y + 2.0f;
+        ImGui::SetCursorScreenPos(ImVec2(
+            visible_right - 3.0f * 28.0f - 2.0f * 4.0f - kSidebarInset,
+            icon_strip_top));
         actions |= Command<Action::ActionClear>::Execute(
             [] { return IconButton("##clear_log", UtilityIcon::Clear,
                                    ImGuiRuntime::instance().lang().clear_tip); });
@@ -1298,7 +1333,17 @@ bool QueueReceiveCopy(ImGuiRuntime& runtime, std::size_t begin_abs,
         actions |= Command<Action::ActionChooseLogPath>::Execute(
             [] { return IconButton("##choose_log_path", UtilityIcon::Path,
                                    ImGuiRuntime::instance().lang().path_tip); });
+        icon_strip_bottom = ImGui::GetItemRectMax().y;
     }
+    // Clip the panel's remaining output below the pinned row.  The log is
+    // submitted after the icons, so without this it would draw over them and,
+    // because ImGui resolves hover against the clip rect, also take their
+    // clicks.  Both returns below pop this.
+    ImGui::PushClipRect(
+        ImVec2(ImGui::GetWindowPos().x, icon_strip_bottom),
+        ImVec2(ImGui::GetWindowPos().x + ImGui::GetWindowSize().x,
+               ImGui::GetWindowPos().y + ImGui::GetWindowSize().y),
+        true);
     if (runtime.receive_text_.empty()) {
         EmptyState(ImGuiRuntime::instance().lang().waiting, {});
         runtime.receive_follow_tail_ = true;
@@ -1309,6 +1354,7 @@ bool QueueReceiveCopy(ImGuiRuntime& runtime, std::size_t begin_abs,
         runtime.receive_sel_end_ = 0;
         runtime.receive_sel_drag_hit_ = false;
         runtime.receive_base_ = 0;
+        ImGui::PopClipRect();
         return actions;
     }
     // Official ImGui log-window pattern (imgui_demo.cpp ShowExampleAppLog):
@@ -1803,6 +1849,7 @@ bool QueueReceiveCopy(ImGuiRuntime& runtime, std::size_t begin_abs,
         }
         ImGui::EndPopup();
     }
+    ImGui::PopClipRect();
     return actions;
 }
 

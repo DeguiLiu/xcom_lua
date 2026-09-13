@@ -310,6 +310,22 @@ local function f(t)
     end
 end
 
+-- Optional-export probe.  Resolving a symbol that the loaded DLL does not
+-- export RAISES in LuaJIT ("cannot resolve symbol 'x'"), it does not yield nil,
+-- so `l.xcom_foo == nil` is not a capability test: it aborts the caller.  That
+-- is the opposite of the graceful degradation the optional exports below
+-- document, so every one of them must be probed through this helper.
+local function optional_symbol(l, name)
+    if l == nil then
+        return nil
+    end
+    local ok, sym = pcall(function() return l[name] end)
+    if ok then
+        return sym
+    end
+    return nil
+end
+
 M.version = f("xcom_version")
 M.list_ports_c = f("xcom_list_ports")
 M.create_c = f("xcom_create")
@@ -398,7 +414,7 @@ function M.list_ports(opts)
     local native = ffi.new("int32_t[1]")
     -- Prefer the error-aware entry point when the loaded DLL exports it; fall
     -- back to the legacy symbol so an older xcom_core.dll keeps working.
-    local list_ex = l.xcom_list_ports_ex
+    local list_ex = optional_symbol(l, "xcom_list_ports_ex")
     local function call(c, buf)
         if list_ex then
             return list_ex(buf, c, count, flags, native)
@@ -600,7 +616,7 @@ nothing) on a pre-1.4 DLL that lacks the export, so callers degrade quietly.
 function M.set_lines(h, dtr, rts)
     local l = M.load()
     if not l then return nil end
-    local fn = l.xcom_set_lines
+    local fn = optional_symbol(l, "xcom_set_lines")
     if fn == nil then return nil end
     return fn(h, (dtr and 1 or 0), (rts and 1 or 0))
 end
@@ -677,13 +693,7 @@ the previous anchor is left untouched, exactly like xcom_drain_display_ts.
 ------------------------------------------------------------------------]]--
 function M.drain_display_ts(h, capacity)
     local l = M.load()
-    local fn
-    if l then
-        -- Symbol lookup on a declared-but-absent export RAISES in LuaJIT, so
-        -- probe with pcall instead of a plain nil comparison.
-        local ok, sym = pcall(function() return l.xcom_drain_display_ts end)
-        if ok then fn = sym end
-    end
+    local fn = optional_symbol(l, "xcom_drain_display_ts")
     if fn == nil then
         local rc, text = M.drain_display(h, capacity)
         return rc, text, nil, false

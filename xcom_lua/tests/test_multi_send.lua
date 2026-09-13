@@ -261,6 +261,30 @@ do
 end
 
 -- ===========================================================================
+-- G2) the per-row button does NOT require the enable tick
+--     The enable toggle is the BULK selector ("发送" walks the ticked rows);
+--     gating the per-row button on it made the button look dead on any
+--     unticked row.  The bulk gate itself stays pinned by test D above -- this
+--     block only covers the per-row path (and Alt+digit, which shares it).
+-- ===========================================================================
+do
+    local win = new_fake_window()
+    win.imgui:set_slot(2, "unticked-row")
+    win.imgui.multi_enabled[2] = 0            -- deliberately NOT ticked
+    win:_imgui_send_slot(2)
+    eq("G2.1 unticked row still sends via the per-row button",
+       win.sent[1], "unticked-row")
+    eq("G2.2 exactly one payload", #win.sent, 1)
+end
+
+do
+    local win = new_fake_window()
+    win.imgui.multi_enabled[4] = 0            -- unticked AND empty
+    win:_imgui_send_slot(4)
+    eq("G2.3 unticked empty row sends nothing", #win.sent, 0)
+end
+
+-- ===========================================================================
 -- H) Alt+digit fires the same slot as the row button
 -- ===========================================================================
 do
