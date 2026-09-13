@@ -3250,7 +3250,13 @@ function Window:_poll_errors()
         local cause = xcom.describe_open_error and xcom.describe_open_error(err.code)
         local text
         if cause then
-            text = string.format("E%d: %s (%s)", err.code, cause, err.message)
+            -- The raw ring message is the backend's own English text
+            -- ("Win32 serial open failed"). Appending it doubled the length of
+            -- an already-long line and pushed the actionable Chinese half off
+            -- the clipped footer, so the user saw "E5: 端口被其他程序占用或权..."
+            -- and lost the cause. When we have a translation the raw text adds
+            -- nothing; keep it only as the fallback for codes we cannot name.
+            text = string.format("E%d: %s", err.code, cause)
         else
             text = string.format("E%d: %s", err.code, err.message)
         end

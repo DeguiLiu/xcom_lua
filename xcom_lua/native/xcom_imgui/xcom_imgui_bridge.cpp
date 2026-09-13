@@ -2308,8 +2308,13 @@ void Footer(const bool connected, const int rx_bytes, const int tx_bytes) {
     const float counters_width = cached_counters_width;
     const float counter_x = (std::max)(content_boundary - counters_width - 18.0f,
                                        (state_max.x - origin.x) + 24.0f);
-    draw_list->AddText(ImVec2(origin.x + counter_x, baseline),
-                       ImGui::GetColorU32(rgb(palette::kTextMuted)), counters);
+    // While a status message is up it owns the strip from the badge rightwards
+    // (see below), so the counters step aside rather than being overpainted.
+    // They return the moment the message clears.
+    if (runtime.status_text_.empty()) {
+        draw_list->AddText(ImVec2(origin.x + counter_x, baseline),
+                           ImGui::GetColorU32(rgb(palette::kTextMuted)), counters);
+    }
     // The two hint literals are fixed; cache each width, font-keyed.
     const std::string_view hint = connected ? std::string_view{runtime.lang().ready}
                                             : std::string_view{runtime.lang().open_a_port};
@@ -2335,24 +2340,71 @@ void Footer(const bool connected, const int rx_bytes, const int tx_bytes) {
     // hint, clipping to whatever room is left so a long message can never
     // collide with either neighbour.
     if (!runtime.status_text_.empty()) {
-        const float text_left = origin.x + counter_x + counters_width + 12.0f;
-        const float text_right = origin.x + (std::max)(
-            footer_width - hint_width - 14.0f, content_boundary + 8.0f) - 8.0f;
+        // Anchored right after the online/offline badge, not right-aligned
+        // ahead of the counters. The strip left of the counters was empty at
+        // every window width while the message itself was squeezed into the
+        // few hundred pixels between the counters and the hint — so a failure
+        // that the user just caused got elided to "E5: 端口被其..." while acres of
+        // blank surface sat beside it. Reading order also improves: badge
+        // (state) -> message (what happened) -> counters (numbers) -> hint.
+        const float text_left = state_max.x + 12.0f;
+        // The right-hand hint ("请打开串口" / "no RX for 5s") yields to a status
+        // message: the message names a failure the user just caused, the hint
+        // repeats standing advice they can read at any time.
+        const float text_right = origin.x + footer_width - 8.0f;
         if (text_right > text_left) {
-            const ImVec4 clip(text_left, origin.y, text_right,
-                              origin.y + kFooterHeight);
-            draw_list->PushClipRect(ImVec2(clip.x, clip.y),
-                                    ImVec2(clip.z, clip.w), true);
-            draw_list->AddText(ImVec2(text_left, baseline),
-                               ImGui::GetColorU32(rgb(0xB4551F)),  // amber: advisory
-                               runtime.status_text_.c_str());
-            draw_list->PopClipRect();
+            // Measure first and elide with an ellipsis when the message does not
+            // fit. Clipping alone cut mid-character and gave the reader no sign
+            // that anything was missing: "E5: 端口被其他程序占用或权" read as a
+            // complete (if odd) sentence rather than a truncated one. The
+            // ellipsis is the cheapest honest signal, and it keeps the head of
+            // the message — where the cause is — on screen.
+            const char* const text = runtime.status_text_.c_str();
+            const float avail = text_right - text_left;
+            const float full = ImGui::CalcTextSize(text).x;
+            if (full <= avail) {
+                draw_list->AddText(ImVec2(text_left, baseline),
+                                   ImGui::GetColorU32(rgb(0xB4551F)), text);
+            } else {
+                constexpr const char* kEllipsis = "...";
+                const float ell_width = ImGui::CalcTextSize(kEllipsis).x;
+                const float budget = avail - ell_width;
+                // Walk code-point boundaries (UTF-8 lead bytes) so the cut never
+                // lands inside a hanzi and emits a tail of replacement glyphs.
+                int cut = 0;
+                float width = 0.0f;
+                for (int i = 0; text[i] != '\0';) {
+                    const int len = (static_cast<unsigned char>(text[i]) & 0x80U) == 0 ? 1
+                                  : (static_cast<unsigned char>(text[i]) & 0xE0U) == 0xC0 ? 2
+                                  : (static_cast<unsigned char>(text[i]) & 0xF0U) == 0xE0 ? 3 : 4;
+                    if (width + ImGui::CalcTextSize(text + i, text + i + len).x > budget) {
+                        break;
+                    }
+                    width += ImGui::CalcTextSize(text + i, text + i + len).x;
+                    i += len;
+                    cut = i;
+                }
+                const ImVec4 clip(text_left, origin.y, text_right,
+                                  origin.y + kFooterHeight);
+                draw_list->PushClipRect(ImVec2(clip.x, clip.y),
+                                        ImVec2(clip.z, clip.w), true);
+                draw_list->AddText(ImVec2(text_left, baseline),
+                                   ImGui::GetColorU32(rgb(0xB4551F)), text, text + cut);
+                draw_list->AddText(ImVec2(text_left + width, baseline),
+                                   ImGui::GetColorU32(rgb(0xB4551F)), kEllipsis);
+                draw_list->PopClipRect();
+            }
         }
     }
-    draw_list->AddText(ImVec2(origin.x + (std::max)(footer_width - hint_width - 14.0f,
-                                                     content_boundary + 8.0f), baseline),
-                       ImGui::GetColorU32(rgb(palette::kTextMuted)), hint.data(),
-                       hint.data() + hint.size());
+    // Suppressed while a status message is up: the message now owns the whole
+    // strip to the right of the counters (see above), so drawing the hint too
+    // would overlap it.
+    if (runtime.status_text_.empty()) {
+        draw_list->AddText(ImVec2(origin.x + (std::max)(footer_width - hint_width - 14.0f,
+                                                         content_boundary + 8.0f), baseline),
+                           ImGui::GetColorU32(rgb(palette::kTextMuted)), hint.data(),
+                           hint.data() + hint.size());
+    }
     draw_list->AddLine(ImVec2(origin.x + content_boundary, origin.y + 4.0f),
                        ImVec2(origin.x + content_boundary, origin.y + kFooterHeight - 4.0f),
                        divider, 1.0f);
