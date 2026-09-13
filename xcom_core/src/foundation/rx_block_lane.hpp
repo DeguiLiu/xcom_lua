@@ -24,23 +24,30 @@
 //     block, so the raw bytes are preserved byte-for-byte with no extra copy.
 //
 // File-lane reservation (the display must never be able to starve the file):
-//   - The pool is partitioned by a floor of kRxRawReserveBlocks. A block is
-//     claimed with two different coact entries:
-//       * both lanes:  pool.alloc_with_margin(sig, kRxRawReserveBlocks) - the
+//   - The reserve exists ONLY to stop the display lane from consuming blocks
+//     the FILE lane needs, so it is applied only when a file lane is actually
+//     present for this segment (file_lane == true):
+//       * file lane:   pool.alloc_with_margin(sig, kRxRawReserveBlocks) - the
 //         reservation check and the free-list pop share ONE critical section,
 //         so the floor can never be consumed by the display even under
-//         concurrent allocators;
-//       * file only:   pool.alloc(sig) - taken only after the margin claim
-//         failed, i.e. the file lane dipping into its own reserve.
-//     The display lane therefore never holds a reference on a block below the
-//     floor, so a stalled display cannot starve the file lane.
+//         concurrent allocators; if that claim fails, pool.alloc(sig) lets the
+//         file lane dip into its own reserve.
+//       * display only: pool.alloc_with_margin(sig, 0) - with no file lane
+//         there is no critical claim to protect, so a display-only session
+//         gets the WHOLE pool. Reserving for a lane that does not exist only
+//         shrinks the no-log buffering window and makes the counted-drop path
+//         (save_rejected_bytes) fire earlier than necessary.
+//     While a file lane is active the display lane therefore never holds a
+//     reference on a block below the floor, so a stalled display cannot starve
+//     the file lane.
 //   - When the file lane genuinely cannot claim (the floor is exhausted, i.e.
 //     the disk has stalled for seconds), the reader BLOCKS on a condition
 //     variable rather than dropping: the file stream is lossless. The blocked
 //     episode is timed by the caller and surfaced as a storage stall.
 //   - When the display cannot claim it simply falls behind; the caller counts
-//     those bytes as DISPLAY BACKLOG (rx_pool_exhausted_bytes), not as loss,
-//     because the file log keeps the complete authoritative stream.
+//     those bytes as DISPLAY BACKLOG (rx_pool_exhausted_bytes) while a log is
+//     open (the log keeps the authoritative stream), or as loss
+//     (save_rejected_bytes) when there is no log.
 //
 // Concurrency: the read thread is the sole allocator (both the live callback
 // and the injected test seam funnel through one ingress entry), and it is the
@@ -109,6 +116,15 @@ public:
                                   coact::HostSmpProfile,
                                   kBlockAlign>;
 
+    // A DISPLAY-ring descriptor's `len` high bit marks a segment that had NO
+    // file lane at ingress: its bytes live only in the display lane, so if a
+    // display reset discards them before the ABI drains them they are real
+    // loss and must be charged to the loss ledger. The RAW ring never sets the
+    // bit (publish only tags the display copy), so LogWriter reads a clean
+    // length. `len` is at most kRxBlockBytes (4096), so bit 15 is always free.
+    static constexpr std::uint16_t kFileBackedLenMask = 0x7FFFU;
+    static constexpr std::uint16_t kDisplayUnloggedBit = 0x8000U;
+
     RxBlockLane() noexcept = default;
     RxBlockLane(const RxBlockLane&) = delete;
     RxBlockLane& operator=(const RxBlockLane&) = delete;
@@ -134,15 +150,21 @@ public:
     {
         const uint16_t sig = to_signal(Signal::RxBlock);
         display_ok = false;
-        coact::Event* const both =
-            pool_.alloc_with_margin(sig, kRxRawReserveBlocks);
+        // The reserve protects the FILE lane from the display lane. With no
+        // file lane for this segment there is nothing to protect, so the
+        // margin is 0 and a display-only session may use the whole pool; with
+        // a file lane present the floor is preserved exactly as before.
+        const uint16_t margin =
+            file_lane ? static_cast<uint16_t>(kRxRawReserveBlocks) : 0U;
+        coact::Event* const both = pool_.alloc_with_margin(sig, margin);
         if (both != nullptr) {
-            // Free after the claim is still >= the reserve: both lanes share it.
+            // Free after the claim is still >= the reserve (or the pool is not
+            // held back at all): both lanes share it.
             display_ok = true;
             return both;
         }
         if (!file_lane) {
-            return nullptr;   // display cannot touch the reserve
+            return nullptr;   // pool truly full: display backlog, not a drop
         }
         // File lane dipping into its own reserved floor: file-only, so the
         // display falls behind rather than the file losing bytes.
@@ -191,8 +213,14 @@ public:
             COACT_ASSERT(pushed);
         }
         if (display_ok) {
+            // Tag the DISPLAY copy: a segment with no file lane is unlogged,
+            // so its bytes are loss if the display reset discards the batch
+            // before the ABI drains it. The raw copy keeps an untagged len.
+            const std::uint16_t display_len = static_cast<std::uint16_t>(
+                static_cast<std::uint16_t>(ref.len & kFileBackedLenMask) |
+                (file_lane ? 0U : kDisplayUnloggedBit));
             const bool pushed = display_ready_.try_push(
-                RxBlockRef{event, ref.len, ref.gen, ref.ingress_ms});
+                RxBlockRef{event, display_len, ref.gen, ref.ingress_ms});
             COACT_ASSERT(pushed);
             return true;
         }
@@ -249,7 +277,7 @@ public:
         std::uint32_t bytes = 0U;
         RxBlockRef ref{};
         while (display_ready_.try_pop(ref)) {
-            bytes += ref.len;
+            bytes += static_cast<std::uint32_t>(ref.len & kFileBackedLenMask);
             coact::event_gc(ref.event);
         }
         return bytes;

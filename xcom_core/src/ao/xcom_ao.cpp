@@ -197,7 +197,7 @@ uint32_t format_payload(uint8_t* out, uint32_t budget,
 // ---------------------------------------------------------------------------
 
 bool rx_format_block(RxCtx* self, const uint8_t* bytes, uint32_t len,
-                     uint32_t ingress_ms)
+                     uint32_t ingress_ms, bool unlogged)
 {
     CoreCtx* core = self->core;
 
@@ -256,9 +256,12 @@ bool rx_format_block(RxCtx* self, const uint8_t* bytes, uint32_t len,
 
     // ingress_ms (monotonic, sampled at arrival) rides the display descriptor
     // so the Lua drain can order batches by real arrival time even when the
-    // UI formats them seconds later under backlog.
+    // UI formats them seconds later under backlog. The source RX length and the
+    // no-file-lane flag ride it too, so a session-boundary reset can charge
+    // exactly the unlogged bytes it discards.
     if (!core->display.push_ready(
-            bid, written, ingress_ms, core->generation.load(std::memory_order_acquire))) {
+            bid, written, ingress_ms,
+            core->generation.load(std::memory_order_acquire), len, unlogged)) {
         core->display.release_buf(bid);
         return false;
     }
@@ -296,15 +299,24 @@ void rx_kick_action(RxCtx& ctx, const coact::Event&) noexcept
         else if (!core->rx.pop_display(d)) {
             break;
         }
-        if (d.len > kRxBlockBytes) {
-            d.len = kRxBlockBytes;
+        // The display-ring descriptor tags its len high bit when the source
+        // segment had no file lane (see RxBlockLane::publish); strip it before
+        // use and pass the flag on so the batch records whether it is the only
+        // copy of those bytes.
+        const bool unlogged =
+            (d.len & foundation::RxBlockLane::kDisplayUnloggedBit) != 0U;
+        uint32_t payload_len =
+            static_cast<uint32_t>(d.len &
+                                  foundation::RxBlockLane::kFileBackedLenMask);
+        if (payload_len > kRxBlockBytes) {
+            payload_len = kRxBlockBytes;
         }
         // The popped descriptor owns exactly one reference to the RX block.
         // On success ReceiveAo consumed it (formatting copied the bytes); on
         // failure the deferred slot keeps owning it until a later kick or
         // teardown. An over-release here would abort inside event_gc.
-        if (rx_format_block(&ctx, core->rx.payload(d.event), d.len,
-                            d.ingress_ms)) {
+        if (rx_format_block(&ctx, core->rx.payload(d.event), payload_len,
+                            d.ingress_ms, unlogged)) {
             core->rx.release(d.event);
             core->resume_rx();
         }
@@ -571,17 +583,17 @@ void serial_publish(SerialCtx& ctx, SerialState state) noexcept
 }
 
 // Session boundary for the display lane: release every undrained batch back to
-// the pool and retire the matching display_pending count. Called on the
-// Dispatcher from both commit paths so a close cannot strand the ring's 32 ids
-// and a reopen cannot drain the previous session's bytes. See
-// DisplayLane::reset for why this cannot run concurrently with drain_into.
+// the pool, retire the matching display_pending count, and charge bytes that
+// reached the display lane with NO file lane to the shared loss ledger (a batch
+// arriving after the log closed but before the close commits is never displayed
+// and would otherwise vanish uncounted). Called on the Dispatcher from both
+// commit paths so a close cannot strand the ring's 32 ids and a reopen cannot
+// drain the previous session's bytes. See DisplayLane::reset for why this
+// cannot run concurrently with drain_into; the accounting lives on CoreCtx so
+// the host test can exercise the real path.
 void reset_display_at_commit(CoreCtx* core) noexcept
 {
-    const uint32_t drained = core->display.reset();
-    if (drained != 0U) {
-        core->metrics.display_pending.fetch_sub(drained,
-                                                std::memory_order_relaxed);
-    }
+    static_cast<void>(core->reset_display_committed());
 }
 
 SerialState serial_run_action(SerialCtx& ctx, SerialAction action,

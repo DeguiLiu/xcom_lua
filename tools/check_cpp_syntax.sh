@@ -110,6 +110,7 @@ TUS=(
     xcom_core/tests/open_failure_status_test.cpp
     xcom_core/tests/fault_latch_reconcile_test.cpp
     xcom_core/tests/rx_reject_count_test.cpp
+    xcom_core/tests/open_pin_warning_test.cpp
 )
 
 fail=0

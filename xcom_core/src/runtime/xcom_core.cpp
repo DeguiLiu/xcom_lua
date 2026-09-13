@@ -870,6 +870,20 @@ struct CoreState {
                 static_cast<LineDrive>(core->cfg_dtr_enable),
                 static_cast<LineDrive>(core->cfg_rts_enable)};
             int32_t error = kSerialSuccess;
+            // Advisory warning sink, wired BEFORE open() because configure() -
+            // and therefore the DTR/RTS replay - runs inside it. A failed
+            // pin replay leaves the DCB-programmed level in place, so it must
+            // not fail the open; the user still has to learn that a target may
+            // not have received its NRST/BOOT pulse. This lambda is non-fatal by
+            // construction: it pushes the text into the error ring (source 1 =
+            // serial backend) and does NOTHING else - no Signal::Fault, no
+            // coact event, no fault_pending, and no last_open_result/port_state
+            // write - so nothing downstream can read it as a fatal condition and
+            // the OPENING -> OPEN edge below still happens.
+            state->serial_backend.set_warning(
+                [core](std::string_view message) noexcept {
+                    core->errors.push(XCOM_ERR_IO, 1U, message);
+                });
             if (!state->serial_backend.open(
                     options,
                     [core](const uint8_t* data, uint32_t size) noexcept {

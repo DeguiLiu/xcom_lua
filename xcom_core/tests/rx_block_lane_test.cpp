@@ -189,17 +189,19 @@ int main()
     CHECK(lane.free_blocks() == lane.capacity(),
           "pool free count back to capacity after teardown");
 
-    // --- display-only floor: try_alloc(false) must never touch the reserve --
-    // With NO log open the display lane is the only consumer; it may claim
-    // exactly the non-reserved share and no more. Kills the mutation that
-    // deletes the `if (!file_lane) return nullptr;` guard in try_alloc.
+    // --- display-only lane: no file lane, so no reserve is withheld --------
+    // With NO log open the display lane is the only consumer of the pool. The
+    // kRxRawReserveBlocks floor protects the FILE lane from the display, so
+    // with no file lane there is nothing to protect and the display must be
+    // able to use the WHOLE pool. Kills the mutation that passes
+    // kRxRawReserveBlocks to alloc_with_margin regardless of file_lane (the
+    // old bug left only capacity - reserve = 32 blocks usable and counted the
+    // rest as display backlog / drop far too early).
     {
         RxBlockLane display_only;
         CHECK(display_only.init(coact::make_spin_critical_section(spin)),
               "display-only lane init");
-        constexpr std::uint32_t kDisplayShare =
-            xcom::kRxBlockCount - xcom::kRxRawReserveBlocks;
-        std::array<coact::Event*, kDisplayShare> held{};
+        std::array<coact::Event*, xcom::kRxBlockCount> held{};
         std::uint32_t claimed = 0U;
         bool all_display_ok = true;
         for (std::uint32_t i = 0U; i < xcom::kRxBlockCount; ++i) {
@@ -212,27 +214,21 @@ int main()
             held[claimed] = ev;
             ++claimed;
         }
-        CHECK(claimed == kDisplayShare,
-              "display-only lane stops exactly at the reserve floor");
-        CHECK(all_display_ok, "display-only claims preserve the reserve");
-        CHECK(display_only.free_blocks() == xcom::kRxRawReserveBlocks,
-              "reserve floor remains after display-only exhaustion");
+        // Assert the measured usable-block count, not merely a flag change.
+        CHECK(claimed == xcom::kRxBlockCount,
+              "display-only lane claims the FULL pool (128 usable blocks)");
+        CHECK(all_display_ok,
+              "display-only claims never withhold a non-existent file reserve");
+        CHECK(display_only.free_blocks() == 0U,
+              "no block stays reserved when no file lane exists");
         bool beyond_ok = true;
         CHECK(display_only.try_alloc(false, beyond_ok) == nullptr,
-              "a display-only claim beyond the floor is refused");
+              "a display-only claim is refused only when the pool is truly full");
         CHECK(beyond_ok == false, "refused claim did not mark display_ok");
-        // The file lane may still dip into its own reserve.
-        bool file_ok = true;
-        coact::Event* const from_reserve = display_only.try_alloc(true, file_ok);
-        CHECK(from_reserve != nullptr && file_ok == false,
-              "file lane reaches the reserve after display is refused");
-        if (from_reserve != nullptr) {
-            display_only.release(from_reserve);
-        }
         for (std::uint32_t i = 0U; i < claimed; ++i) {
             display_only.release(held[i]);
         }
-        CHECK(display_only.used() == 0U, "display-only floor lane back to 0");
+        CHECK(display_only.used() == 0U, "display-only lane back to 0");
     }
 
     // --- a blocked reader is woken by a release, not by the timeout --------
@@ -289,32 +285,49 @@ int main()
         CHECK(blocked.used() == 0U, "wake lane back to 0");
     }
 
-    // --- the reserve constant is load-bearing, not parametric --------------
-    // Kills the mutation that shrinks kRxRawReserveBlocks to 1: holding exactly
-    // kRxRawReserveBlocks blocks must refuse the display lane. A display claim
-    // that still succeeds would prove the floor is reserving nothing.
+    // --- the file-lane reserve is load-bearing, not parametric --------------
+    // While a file lane is active the display must stop at exactly the
+    // non-reserved share, so a stalled display can never pin the file lane's
+    // floor. Kills the mutation that drops kRxRawReserveBlocks from the
+    // file-lane margin (display_ok would then stay true into the reserve) and
+    // the mutation that shrinks the reserve (the share would grow).
     {
-        RxBlockLane reserve;
-        CHECK(reserve.init(coact::make_spin_critical_section(spin)),
-              "reserve lane init");
-        std::array<coact::Event*, xcom::kRxRawReserveBlocks> reserved{};
-        bool all_reserved = true;
-        for (std::uint32_t i = 0U; i < xcom::kRxRawReserveBlocks; ++i) {
+        RxBlockLane with_file;
+        CHECK(with_file.init(coact::make_spin_critical_section(spin)),
+              "file-reserve lane init");
+        const std::uint32_t display_share =
+            xcom::kRxBlockCount - xcom::kRxRawReserveBlocks;
+        std::vector<coact::Event*> held;
+        std::uint32_t display_ok_count = 0U;
+        bool share_is_contiguous = true;
+        for (;;) {
             bool display_ok = false;
-            reserved[i] = reserve.try_alloc(true, display_ok);
-            all_reserved = all_reserved && (reserved[i] != nullptr);
-        }
-        CHECK(all_reserved, "held the full reserve floor");
-        bool display_ok = true;
-        CHECK(reserve.try_alloc(false, display_ok) == nullptr,
-              "display refused while the reserve floor is held");
-        CHECK(display_ok == false, "refused display claim clears display_ok");
-        for (coact::Event* ev : reserved) {
-            if (ev != nullptr) {
-                reserve.release(ev);
+            coact::Event* const ev = with_file.try_alloc(true, display_ok);
+            if (ev == nullptr) {
+                break;
+            }
+            held.push_back(ev);
+            if (display_ok) {
+                ++display_ok_count;
+                share_is_contiguous =
+                    share_is_contiguous && (display_ok_count <= display_share);
+            }
+            else {
+                // Once the floor is reached the display must never come back.
+                share_is_contiguous =
+                    share_is_contiguous && (display_ok_count >= display_share);
             }
         }
-        CHECK(reserve.used() == 0U, "reserve lane back to 0");
+        CHECK(display_ok_count == display_share,
+              "display_ok stops at exactly capacity - kRxRawReserveBlocks");
+        CHECK(share_is_contiguous,
+              "the reserve is one contiguous floor, never re-entered");
+        CHECK(held.size() == xcom::kRxBlockCount,
+              "the file lane still reaches the full pool via its reserve");
+        for (coact::Event* ev : held) {
+            with_file.release(ev);
+        }
+        CHECK(with_file.used() == 0U, "file-reserve lane back to 0");
     }
 
     // --- Item 1: tagged-CAS FixedPool is safe with TWO release producers ----

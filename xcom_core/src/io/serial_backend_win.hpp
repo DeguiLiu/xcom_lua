@@ -327,12 +327,37 @@ public:
         on_beat_ = std::move(on_beat);
     }
 
+    // Advisory, NON-FATAL warning sink. on_fault_ is the wrong channel for a
+    // redundant-IOCTL failure at open: the runtime escalates every fault to a
+    // critical Signal::Fault that publishes FAULT and closes the port, so
+    // routing a "the pin replay did not take" note through it would fail an
+    // otherwise valid open. This callback carries a bounded, user-visible
+    // message and the producer's contract is that it changes NO state and
+    // submits NO event - the operation that reported it still succeeds.
+    //
+    // Installed by the owner BEFORE open() (see set_warning) so it is already
+    // live when configure() replays DTR/RTS; close() deliberately does NOT
+    // clear it, exactly like on_beat_, because open() runs its own close()
+    // first, which would otherwise wipe a callback installed before open().
+    // Same discipline as the other sinks: no exceptions, no allocation; the
+    // string_view borrows a backend stack buffer valid only for the call.
+    using WarningCallback = foundation::FixedFunction<void(std::string_view)>;
+    void set_warning(WarningCallback on_warning) noexcept
+    {
+        on_warning_ = std::move(on_warning);
+    }
 
 private:
     [[nodiscard]] bool configure(const SerialPortOptions& options,
                                  std::int32_t& error) noexcept;
     void read_loop() noexcept;
     void report_fault(std::int32_t error) noexcept;
+    // Reports a failed open-time pin replay through on_warning_ (a no-op when
+    // no sink is installed). `line_name` is "DTR" or "RTS"; `native_error` is
+    // the Win32 code from the failed EscapeCommFunction. Non-fatal by design:
+    // the caller keeps the open alive.
+    void report_pin_warning(const char* line_name,
+                            std::int32_t native_error) noexcept;
     // Samples COMSTAT.fCtsHold/fDsrHold/fXoffHold into the kLineStatus* bits.
     // Only called from the write path on a timeout; the read_loop's own line
     // error monitoring is a separate ClearCommError caller.
@@ -358,6 +383,10 @@ private:
     // Core-installed liveness stamp called once per read-loop iteration; empty
     // until the owner installs it (see set_read_beat).
     BeatCallback on_beat_;
+    // Core-installed advisory warning sink; empty until the owner installs it
+    // (see set_warning). Deliberately not reset by close() so a callback
+    // installed before open() survives open()'s internal close().
+    WarningCallback on_warning_;
     // True while a WriteFile is pending on write_overlapped_. Lets the bounded
     // teardown drain distinguish "a frame is in flight, give it grace" from
     // "nothing to drain, cancel immediately". Set on ERROR_IO_PENDING and

@@ -3,6 +3,7 @@
 #include "serial_backend_win.hpp"
 
 #include <array>
+#include <cstdio>
 #include <cstring>
 #include <string>
 #include <utility>
@@ -495,17 +496,26 @@ bool WinSerialBackend::configure(const SerialPortOptions& options,
     // IRP is outside user-mode control. Whether a target stops resetting must be
     // verified on hardware; it is not claimed here.
     //
-    // The result is deliberately ignored here: the DCB above already programmed
-    // the level, so a redundant-IOCTL failure must not fail an otherwise valid
-    // open. That leaves the open-time DTR/BOOT pulse as a KNOWN silent-failure
-    // and known target-reset risk (needs real hardware to resolve; tracked
-    // separately). set_dtr()/set_rts() are used only so the return is captured
-    // rather than discarded at the source - it changes no behaviour.
+    // A failed replay stays NON-FATAL: the DCB above already programmed the
+    // level, so a redundant-IOCTL failure must not fail an otherwise valid open.
+    // It is no longer silent, though - the failure is reported through
+    // on_warning_ (naming the line and the Win32 code) so a target that did not
+    // receive its NRST/BOOT pulse is distinguishable from one that did. The
+    // warning sink changes no state and submits no event, so open() still
+    // returns success. GetLastError() is captured immediately after the failed
+    // call: set_dtr()/set_rts() make no Win32 call between the failing
+    // EscapeCommFunction and their return, so the code is still the IOCTL's.
     if (options.dtr_drive != LineDrive::LeaveAlone) {
-        static_cast<void>(set_dtr(options.dtr_drive == LineDrive::Assert));
+        if (set_dtr(options.dtr_drive == LineDrive::Assert) ==
+            LineApplyResult::Failed) {
+            report_pin_warning("DTR", static_cast<std::int32_t>(GetLastError()));
+        }
     }
     if (!handshake && options.rts_drive != LineDrive::LeaveAlone) {
-        static_cast<void>(set_rts(options.rts_drive == LineDrive::Assert));
+        if (set_rts(options.rts_drive == LineDrive::Assert) ==
+            LineApplyResult::Failed) {
+            report_pin_warning("RTS", static_cast<std::int32_t>(GetLastError()));
+        }
     }
     COMMTIMEOUTS timeouts{};
     // Bounded tick, not the old "return immediately" mode. ReadIntervalTimeout =
@@ -692,6 +702,24 @@ void WinSerialBackend::report_fault(std::int32_t error) noexcept
     if (on_fault_) {
         on_fault_(error);
     }
+}
+
+void WinSerialBackend::report_pin_warning(const char* line_name,
+                                          std::int32_t native_error) noexcept
+{
+    if (!on_warning_) {
+        return;
+    }
+    // A failed pin replay happens at most once per configured line during a
+    // cold open, so building the message on the stack is cheap and keeps the
+    // callback path allocation-free. The view is valid only for this call; the
+    // owner copies it into the (fixed-capacity) error ring before returning.
+    std::array<char, 160U> message{};
+    std::snprintf(message.data(), message.size(),
+                  "open warning (non-fatal): %s pin write failed, "
+                  "Win32 error %d; %s not driven",
+                  line_name, static_cast<int>(native_error), line_name);
+    on_warning_(std::string_view(message.data()));
 }
 
 void WinSerialBackend::poll_line_status() noexcept

@@ -263,6 +263,12 @@ private:
 // ---------------------------------------------------------------------------
 class DisplayLane {
 public:
+    // DisplayDesc.rx_meta packing: low 15 bits are the batch's source RX byte
+    // count (<= kRxBlockBytes), bit 15 marks a source segment that had no file
+    // lane. A batch carrying the flag is real loss if a reset discards it.
+    static constexpr uint16_t kRxLenMask = 0x7FFFU;
+    static constexpr uint16_t kRxUnloggedFlag = 0x8000U;
+
     [[nodiscard]] bool init() noexcept { return true; }
 
     [[nodiscard]] bool try_acquire(uint16_t& out_id, uint8_t*& out_buf) noexcept
@@ -282,13 +288,22 @@ public:
     }
 
     bool push_ready(uint16_t id, uint32_t len, uint32_t ingress_ms,
-                    uint32_t generation) noexcept
+                    uint32_t generation, uint32_t source_len,
+                    bool unlogged) noexcept
     {
         DisplayDesc d{};
         d.buf = id;
         d.len = len;
         d.ingress_ms = ingress_ms;
         d.gen = generation;
+        // Source RX bytes of this batch plus the "no file lane" flag, packed
+        // into the former padding slot (source_len <= kRxBlockBytes fits the
+        // low 15 bits; bit 15 is the flag). A reset can then charge exactly the
+        // unlogged source bytes it discards.
+        const uint16_t packed = static_cast<uint16_t>(
+            (source_len & kRxLenMask) |
+            (unlogged ? kRxUnloggedFlag : 0U));
+        d.rx_meta = packed;
         return ready_ring_.try_push(std::move(d));
     }
     // Return every batch still parked on the ready ring to the pool at a
@@ -297,6 +312,13 @@ public:
     // returns false forever and the handle's display never works again; and the
     // next session's UI drains the previous session's bytes. Returns the count
     // drained so the caller keeps metrics.display_pending consistent.
+    //
+    // `out_unlogged_bytes` (optional) receives the summed SOURCE RX bytes of
+    // the discarded batches that carried no file lane. Those bytes exist only
+    // in the display lane, so a reset that discards them without a consumer is
+    // real loss and the caller must charge it to the loss ledger; batches that
+    // DID have a file lane are skipped, so logged bytes are never double
+    // counted.
     //
     // Threading: called on the Dispatcher from the SerialAo open/close commit.
     // The producer (ReceiveAo push_ready) is that same Dispatcher, so it is
@@ -311,13 +333,20 @@ public:
     // instead. A late old-generation push that lands after this drain stays in
     // the ring and is dropped (and released) by drain_into, or by the next
     // session's reset.
-    uint32_t reset() noexcept
+    uint32_t reset(uint32_t* out_unlogged_bytes = nullptr) noexcept
     {
         uint32_t drained = 0U;
+        uint32_t unlogged = 0U;
         DisplayDesc stale{};
         while (ready_ring_.try_pop(stale)) {
             release_buf(stale.buf);
+            if ((stale.rx_meta & kRxUnloggedFlag) != 0U) {
+                unlogged += static_cast<uint32_t>(stale.rx_meta & kRxLenMask);
+            }
             ++drained;
+        }
+        if (out_unlogged_bytes != nullptr) {
+            *out_unlogged_bytes = unlogged;
         }
         return drained;
     }
@@ -381,7 +410,10 @@ public:
 private:
     struct alignas(16) DisplayDesc {
         uint16_t buf;
-        uint16_t pad0;
+        // Source RX bytes of the batch (low 15 bits, <= kRxBlockBytes) plus the
+        // kRxUnloggedFlag bit when the source segment had no file lane. Reuses
+        // the former padding word, so the descriptor stays one 16-byte slot.
+        uint16_t rx_meta;
         uint32_t len;
         // Arrival time (monotonic ms) of the source RX block, carried so the
         // Lua drain can timestamp by REAL ingress time rather than format/drain
@@ -910,6 +942,27 @@ struct CoreCtx {
         metrics.rx_loss_offset.store(
             metrics.rx_bytes.load(std::memory_order_relaxed),
             std::memory_order_relaxed);
+    }
+
+    // Session-boundary display retire, run on the Dispatcher at the open/close
+    // commit. Returns every undrained batch to the pool, retires the matching
+    // display_pending count, and charges bytes that reached the display lane
+    // with NO file lane to the shared loss ledger. Without that charge a batch
+    // that arrives after the log closed but before the close commits - and is
+    // therefore never displayed - was discarded silently, absent from both the
+    // DATA LOSS ledger and the file. Batches that had a file lane are skipped,
+    // so logged bytes are never counted again. Inline so the accounting is
+    // host-testable without linking xcom_core.cpp.
+    uint32_t reset_display_committed() noexcept
+    {
+        uint32_t unlogged = 0U;
+        const uint32_t drained = display.reset(&unlogged);
+        if (drained != 0U) {
+            metrics.display_pending.fetch_sub(drained,
+                                              std::memory_order_relaxed);
+        }
+        count_rejected_rx(unlogged);
+        return drained;
     }
 
     void diag_emit(uint16_t source, uint16_t event_id, uint32_t a0,

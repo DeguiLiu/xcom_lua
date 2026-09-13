@@ -44,11 +44,13 @@ struct RxCtx {
 
 // Format one received block [bytes..bytes+len) into the display lane per the
 // current view.  `ingress_ms` is the block's arrival time (monotonic ms),
-// carried onto the display descriptor for the Lua timestamp stage.  The block
-// is released by the caller.  No timestamp text is injected.  Defined in
-// xcom_ao.cpp.
+// carried onto the display descriptor for the Lua timestamp stage. `unlogged`
+// is true when the source segment had no file lane, so the resulting display
+// batch is the only copy of those bytes and a session-boundary reset must
+// charge them to the loss ledger.  The block is released by the caller.  No
+// timestamp text is injected.  Defined in xcom_ao.cpp.
 bool rx_format_block(RxCtx* self, const uint8_t* bytes, uint32_t len,
-                     uint32_t ingress_ms);
+                     uint32_t ingress_ms, bool unlogged);
 
 // Handle a SIG_RX_KICK (P0 wake bridge): drain up to 4 blocks on the
 // Dispatcher, then run the disarm -> acquire-recheck -> arm -> resubmit
