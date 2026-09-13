@@ -2,9 +2,9 @@
 core/config.lua - minimal INI-style (key=value, [section]) settings persistence.
 
 Pure Lua, no Win32/LuaJIT.jit dependency, so it runs unit-testable on the Linux
-luajit binary.  Mirrors the persisted field set of xcom_client/services/settings.py
-(PySide6 config.toml) so behaviour stays consistent across the two front-ends,
-but writes a flat `config.ini` beside the scripts instead of TOML.
+luajit binary.  Persists the UI settings to a flat `config.ini` beside the
+scripts; that file is the single source of truth for the current Lua front-end
+(no external client is kept in sync with it).
 
 Supported value types: numbers, booleans, strings.  Comment lines start with
 ';' or '#'.  Section headers are `[name]`.  Unknown keys are preserved on round
@@ -211,5 +211,36 @@ end
 
 M.MAX_MULTI_ENTRIES = 8
 M.MAX_MULTI_PAGES = 50
+
+--[[-------------------------------------------------------------------------
+Device-profile section helpers (see docs/design-device-profiles.md).
+
+`[profile]` holds the stable device `key` and the resolution `mode`
+(`auto` | `custom`).  `[profile.custom]` is a flat override table whose keys
+may be dotted paths into the profile shape (`reset.mode`, `reset.reenumerates`,
+`flow_control`, `silent_warn_ms`, ...).  These are thin wrappers over the same
+nested `data[section][key]` layout as the rest of this module, kept here so
+callers never spell the section names inline.
+------------------------------------------------------------------------]]--
+function M.get_profile(data)
+    return data["profile"] or {}, data["profile.custom"] or {}
+end
+
+function M.set_profile(data, key, mode, custom)
+    if data["profile"] == nil then
+        data["profile"] = {}
+    end
+    data["profile"].key = key
+    data["profile"].mode = mode
+    if custom ~= nil then
+        -- copy so the caller keeps ownership of its table
+        local flat = {}
+        for k, v in pairs(custom) do
+            flat[k] = v
+        end
+        data["profile.custom"] = flat
+    end
+    return data
+end
 
 return M

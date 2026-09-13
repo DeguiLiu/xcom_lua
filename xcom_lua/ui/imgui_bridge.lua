@@ -1,5 +1,10 @@
 local ffi = require("ffi")
 local bit = require("bit")
+local xcom_ffi = require("xcom_ffi")
+-- Pure timestamp-stripping helper for the receive-area copy path (see the
+-- module header).  Requireable without the DLL, so its unit test runs
+-- headless on Linux.
+local receive_copy = require("receive_copy")
 
 ffi.cdef[[
 int xcom_imgui_init(void* hwnd);
@@ -11,6 +16,12 @@ void xcom_imgui_receive_append(const char* delta, size_t length);
 size_t xcom_imgui_get_receive_text(char* out, size_t capacity, size_t* base_out);
 void xcom_imgui_set_receive_window(size_t bytes);
 void xcom_imgui_set_receive_base(size_t absolute_offset);
+/* Receive-area copy path: the native side queues the bytes the user asked to
+ * copy (Ctrl+C / context menu) instead of touching the clipboard, so this Lua
+ * layer owns the optional timestamp strip before the clipboard write. */
+void xcom_imgui_set_copy_strip(int* enabled);
+size_t xcom_imgui_take_receive_copy(char* out, size_t capacity);
+void xcom_imgui_set_clipboard_text(const char* text, size_t length);
 void xcom_imgui_set_status(const char* text);
 int xcom_imgui_wndproc(void* hwnd, unsigned int msg, uintptr_t wparam, intptr_t lparam);
 int xcom_imgui_draw_console(char* port, size_t port_capacity, int connected,
@@ -28,12 +39,18 @@ void xcom_imgui_shutdown(void);
 /* ---- feature extensions (Phase 4; each is symbol-probed at load time so
  * an older DLL without them degrades gracefully — see optional_export) ---- */
 void xcom_imgui_set_baud_extra(int* custom_baud);
+/* Open-time modem-line tri-state (XCOM_LINE_*: 0/1/2).  The two Lua-owned
+ * int buffers are registered once; the native serial grid edits them in
+ * place.  Symbol-probed like the rest, so an older DLL keeps the persisted
+ * values with no UI to change them. */
+void xcom_imgui_set_open_lines(int* dtr_open, int* rts_open);
 void xcom_imgui_set_multi_extra(int* gap_ms);
 void xcom_imgui_set_charset(int* index);
 void xcom_imgui_set_frame_gap(int* enabled, int* ms);
 void xcom_imgui_set_highlight_rules(const char* packed, int count);
 void xcom_imgui_set_scripts(const char* names_packed, int* enabled, int count);
 void xcom_imgui_set_script_labels(const char* labels_packed);
+void xcom_imgui_set_script_descs(const char* descs_packed, int count);
 void xcom_imgui_set_script_log(const char* text, size_t length);
 void xcom_imgui_set_scripts_visible(int visible);
 int xcom_imgui_take_script_events(int* events, int capacity);
@@ -106,6 +123,35 @@ local function index_of(values, value, fallback)
     return fallback or 0
 end
 
+-- Resolve a persisted (baud_rate, baud_custom) pair into
+--   (combo_index, custom_override)
+-- A saved NON-PRESET baud (250000/500000/74880/1500000, ...) must never snap to
+-- the nearest preset: the old `index_of(BAUD, cfg.baud_rate, 7)` fallback
+-- silently rewrote such a value to 115200 on the next open/save, corrupting
+-- the config for MCUs that need it.  Instead the non-preset value is carried as
+-- the custom override (which serial_config returns even when the native "more"
+-- section is hidden) while the combo parks on the 115200 slot as a stable
+-- display fallback.  An explicit non-zero baud_custom always wins, matching the
+-- native contract ("a non-zero Custom value overrides the preset combo").
+-- Exported (pure) so it is unit-testable on Linux without the DLL.
+function M.resolve_baud(baud_rate, baud_custom)
+    local custom = math.floor(tonumber(baud_custom) or 0)
+    if custom < 300 or custom > 3000000 then
+        custom = 0
+    end
+    local index = index_of(BAUD, baud_rate, -1)
+    if index < 0 then
+        index = index_of(BAUD, 115200, 7)
+        if custom == 0 then
+            local saved = math.floor(tonumber(baud_rate) or 0)
+            if saved >= 300 and saved <= 3000000 then
+                custom = saved
+            end
+        end
+    end
+    return index, custom
+end
+
 -- Clamp a configured receive-window size to the shared Lua/native range.
 -- Exported so window.lua can normalize the config value once and push the
 -- SAME number into its chunk trimming and this bridge.
@@ -121,17 +167,27 @@ function M.new(hwnd, cfg)
     if M.available.xcom_imgui_init(hwnd) == 0 then return nil end
     local receive_capacity = M.clamp_receive_window(
         cfg and cfg.receive_window_bytes or DEFAULT_RECEIVE_CAPACITY)
+    local baud_index, baud_custom_value = M.resolve_baud(cfg.baud_rate, cfg.baud_custom)
     local self = {
         lib = M.available,
         port = ffi.new("char[?]", PORT_CAPACITY),
         send = ffi.new("char[?]", SEND_CAPACITY),
-        baud = int1(index_of(BAUD, cfg.baud_rate, 7)),
+        baud = int1(baud_index),
         data_bits = int1(math.max(0, math.min(3, (cfg.data_bits or 8) - 5))),
         stop_bits = int1(cfg.stop_bits),
         parity = int1(cfg.parity),
         flow = int1(cfg.flow_control),
         dtr = bool1(cfg.dtr_enable),
         rts = bool1(cfg.rts_enable),
+        -- Open-time modem-line tri-state (0 = deassert, 1 = assert, 2 = leave
+        -- the line alone), a SEPARATE group from the runtime dtr/rts toggles
+        -- just above (those stay plain 0/1).  These are the values handed to
+        -- XcomPortConfig.dtr_enable/rts_enable at open; the native serial grid
+        -- edits them in place once xcom_imgui_set_open_lines is registered.
+        -- line_from_ui_index normalises a missing/stale config to LEAVE_ALONE,
+        -- so a config-less bridge can never default to driving the pin.
+        dtr_open = int1(xcom_ffi.line_from_ui_index(cfg.dtr_open)),
+        rts_open = int1(xcom_ffi.line_from_ui_index(cfg.rts_open)),
         receive_hex = bool1(cfg.receive_hex),
         timestamp = bool1(cfg.timestamp),
         pause_display = bool1(cfg.pause_display),
@@ -159,8 +215,13 @@ function M.new(hwnd, cfg)
     local set_multi_extra = optional_export("xcom_imgui_set_multi_extra")
     local set_charset = optional_export("xcom_imgui_set_charset")
     local set_frame_gap = optional_export("xcom_imgui_set_frame_gap")
+    local set_open_lines = optional_export("xcom_imgui_set_open_lines")
+    -- The resolved custom override (see resolve_baud) is ALSO kept Lua-side:
+    -- when the DLL has no set_baud_extra export there is no cdata to read back
+    -- from, and serial_config must still return the preserved non-preset value.
+    self._baud_override = baud_custom_value > 0 and baud_custom_value or nil
     if set_baud_extra then
-        self.baud_custom = int1(cfg.baud_custom or 0)
+        self.baud_custom = int1(baud_custom_value)
         set_baud_extra(self.baud_custom)
     end
     if set_multi_extra then
@@ -176,6 +237,20 @@ function M.new(hwnd, cfg)
         self.frame_gap_enabled = bool1(gap > 0)
         self.frame_gap_ms = int1(gap)
         set_frame_gap(self.frame_gap_enabled, self.frame_gap_ms)
+    end
+    -- Open-time tri-state buffers (created unconditionally above) are handed
+    -- to the native serial grid when that export exists; otherwise the values
+    -- still flow to open via serial_config, only the in-panel editors hide.
+    if set_open_lines then
+        set_open_lines(self.dtr_open, self.rts_open)
+    end
+    -- "Copy without timestamps" toggle (Lua-owned int, edited by the native
+    -- receive context menu).  Registered only when the DLL has the export; an
+    -- old DLL hides the menu item and the copy path stays timestamp-inclusive.
+    local set_copy_strip = optional_export("xcom_imgui_set_copy_strip")
+    if set_copy_strip then
+        self.copy_strip_timestamp = bool1(cfg.copy_strip_timestamp)
+        set_copy_strip(self.copy_strip_timestamp)
     end
     -- Push the configured window into the native receive buffer so both
     -- sides trim to the same tail size.
@@ -203,6 +278,11 @@ end
 -- (caller falls back to the full replace).
 local append_export = optional_export("xcom_imgui_receive_append")
 local get_export = optional_export("xcom_imgui_get_receive_text")
+-- Receive copy path exports, probed once (per-frame probing would pcall on the
+-- render hot path).  A pre-feature DLL resolves these to nil and the feature
+-- hides cleanly.
+local take_copy_export = optional_export("xcom_imgui_take_receive_copy")
+local set_clipboard_export = optional_export("xcom_imgui_set_clipboard_text")
 
 function M:append_receive(delta)
     if not append_export then return false end
@@ -230,6 +310,56 @@ function M:get_receive_text()
     local n = get_export(buf, cap, base_out)
     if n == 0 then return "", tonumber(base_out[0]) or 0 end
     return ffi.string(buf, tonumber(n) or 0), tonumber(base_out[0]) or 0
+end
+
+-- ---------------------------------------------------------------------------
+-- Receive copy path (Ctrl+C / context menu)
+--
+-- The native side does NOT write the clipboard for the receive log any more:
+-- Ctrl+C and the context menu queue the requested bytes (xcom_imgui_take_
+-- receive_copy) and this layer writes them after applying the optional
+-- timestamp strip.  Keeping the strip here (not in C++) means the shipping
+-- policy is the pure, headless-tested core/receive_copy.lua function.
+-- ---------------------------------------------------------------------------
+
+-- Current "copy without timestamps" state.  False when the DLL lacks the
+-- export (feature hidden) or the user left it off.
+function M:copy_strip_enabled()
+    return self.copy_strip_timestamp ~= nil and self.copy_strip_timestamp[0] ~= 0
+end
+
+-- Drain a pending copy request.  Returns the raw text the user asked to copy
+-- (selection or retained tail), or nil when none is pending.  The buffer is
+-- the receive-window size, so the request always fits one call.
+function M:take_receive_copy()
+    if not take_copy_export then return nil end
+    local cap = self.receive_capacity or DEFAULT_RECEIVE_CAPACITY
+    local buf = self._copy_buf
+    if not buf or self._copy_buf_cap ~= cap then
+        buf = ffi.new("char[?]", cap)
+        self._copy_buf = buf
+        self._copy_buf_cap = cap
+    end
+    local n = tonumber(take_copy_export(buf, cap)) or 0
+    if n <= 0 then return nil end
+    return ffi.string(buf, n)
+end
+
+function M:set_clipboard_text(text)
+    if not set_clipboard_export then return end
+    set_clipboard_export(text or "", #(text or ""))
+end
+
+-- Service one pending copy after the native draw: strip when the user opted
+-- in, then write the clipboard.  No-op (zero FFI) while no request is queued.
+function M:service_receive_copy()
+    if not take_copy_export then return end
+    local text = self:take_receive_copy()
+    if text == nil then return end
+    if self:copy_strip_enabled() then
+        text = receive_copy.strip_timestamps(text)
+    end
+    self:set_clipboard_text(text)
 end
 
 -- Push highlight rules ({pattern, color, style} tables, color = 0xRRGGBB)
@@ -263,14 +393,19 @@ end
 -- @name/@desc label when a script declared one, else the filename.  The DLL
 -- keeps `names` as the index key (events carry only the index) and renders
 -- `labels`; a pre-labels DLL simply ignores the second export.
+-- descs (optional): array of HOVER strings, index-aligned with names — the
+-- @desc/@name tooltip, "" meaning "no tooltip".  Rides its own export (same
+-- ABI reason as labels) with an explicit count, because an empty entry in the
+-- middle is meaningful here and the label parser would stop at it.
 -- The bridge keeps `self._script_enabled_buf` alive (Lua-owned int array).
-function M:set_scripts(names, labels)
+function M:set_scripts(names, labels, descs)
     local push = optional_export("xcom_imgui_set_scripts")
     if not push then return end
     if not names or #names == 0 then
         self._script_enabled_buf = nil
         self._script_names = nil
         self._script_labels = nil
+        self._script_descs = nil
         push(nil, nil, 0)
         return
     end
@@ -286,6 +421,14 @@ function M:set_scripts(names, labels)
         local set_labels = optional_export("xcom_imgui_set_script_labels")
         if set_labels then
             set_labels(table.concat(labels, "\0"))
+        end
+    end
+    -- Tooltips mirror labels, but send the count: descs may contain "".
+    if descs and #descs == #names then
+        self._script_descs = descs
+        local set_descs = optional_export("xcom_imgui_set_script_descs")
+        if set_descs then
+            set_descs(table.concat(descs, "\0"), #descs)
         end
     end
     return enabled
@@ -460,6 +603,9 @@ function M:draw(connected, rx_bytes, tx_bytes)
         self.multi_text, MULTI_SLOT_CAPACITY, self.multi_enabled, self.multi_hex, self.multi_crlf,
         self.multi_page, self.multi_page_count, self.multi_auto, self.multi_period, self.auto_save,
         nil, 0)
+    -- Service a copy the user requested this frame (Ctrl+C / context menu):
+    -- drain the native queue, apply the strip policy, write the clipboard.
+    self:service_receive_copy()
     return actions
 end
 
@@ -491,17 +637,29 @@ end
 function M:serial_config()
     -- A non-zero Custom value overrides the preset combo (clamped to the
     -- Win32 DCB-reasonable range; the core passes baud_rate straight through).
+    -- Prefer the live DLL buffer (the user may have edited the field) and fall
+    -- back to the load-time resolved override so a persisted non-preset baud
+    -- survives even on a DLL without the set_baud_extra export.
+    local custom = 0
     if self.baud_custom then
-        local custom = tonumber(self.baud_custom[0]) or 0
-        if custom >= 300 then
-            custom = math.min(custom, 3000000)
-            return custom, self.data_bits[0] + 5,
-                self.stop_bits[0], self.parity[0], self.flow[0],
-                self.dtr[0] ~= 0, self.rts[0] ~= 0
-        end
+        custom = tonumber(self.baud_custom[0]) or 0
+    end
+    if custom < 300 and self._baud_override then
+        custom = self._baud_override
+    end
+    -- Return the open-time tri-state as the last two values (0/1/2, see
+    -- xcom_ffi.line_tristate).  Existing 7-value callers are unaffected:
+    -- Lua simply discards extra results they do not name.
+    if custom >= 300 then
+        custom = math.min(custom, 3000000)
+        return custom, self.data_bits[0] + 5,
+            self.stop_bits[0], self.parity[0], self.flow[0],
+            self.dtr[0] ~= 0, self.rts[0] ~= 0,
+            self.dtr_open[0], self.rts_open[0]
     end
     return BAUD[self.baud[0] + 1] or 115200, self.data_bits[0] + 5,
-        self.stop_bits[0], self.parity[0], self.flow[0], self.dtr[0] ~= 0, self.rts[0] ~= 0
+        self.stop_bits[0], self.parity[0], self.flow[0], self.dtr[0] ~= 0, self.rts[0] ~= 0,
+        self.dtr_open[0], self.rts_open[0]
 end
 
 function M:display_options()

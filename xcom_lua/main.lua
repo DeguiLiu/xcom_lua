@@ -94,6 +94,22 @@ saved_w = math.max(920, math.min(saved_w, screen_w))
 saved_h = math.max(650, math.min(saved_h, screen_h))
 saved_x = math.max(0, math.min(saved_x, screen_w - saved_w))
 saved_y = math.max(0, math.min(saved_y, screen_h - saved_h))
+
+-- Open-time DTR/RTS default.  A fresh install must NOT drive either modem line
+-- just by opening a port: on many boards DTR is wired to NRST and RTS to BOOT,
+-- so even a "deassert" (CLRDTR/CLRRTS) can hold the target in reset.  The safe
+-- default is therefore XCOM_LINE_LEAVE_ALONE (the open path issues no
+-- EscapeCommFunction for that line).  A config written before this setting
+-- existed has only the legacy boolean [serial] dtr_enable/rts_enable; map it
+-- (true -> assert, false -> deassert) so an explicit prior choice is preserved
+-- instead of being silently flipped.  NOTE: for an existing user whose legacy
+-- value was false, this keeps the old deassert behaviour, NOT leave-alone.
+-- The mapping lives in xcom_ffi.open_line_default so it is unit-testable.
+local function open_line_default(cfg_data, key, legacy_key)
+    return xcom.open_line_default(config.get(cfg_data, "serial", key, nil),
+                                  config.get(cfg_data, "serial", legacy_key, nil))
+end
+
 local cfg = {
     window = {
         x = saved_x,
@@ -109,6 +125,9 @@ local cfg = {
     flow_control = config.get(cfg_data, "serial", "flow_control", 0),
     dtr_enable = config.get(cfg_data, "serial", "dtr_enable", false),
     rts_enable = config.get(cfg_data, "serial", "rts_enable", false),
+    -- Open-time modem-line tri-state (XCOM_LINE_*; see open_line_default).
+    dtr_open = open_line_default(cfg_data, "dtr_open", "dtr_enable"),
+    rts_open = open_line_default(cfg_data, "rts_open", "rts_enable"),
     receive_hex = config.get(cfg_data, "send", "receive_hex", false),
     timestamp = config.get(cfg_data, "display", "timestamp", false),
     pause_display = config.get(cfg_data, "display", "pause_display", false),
@@ -139,6 +158,9 @@ local cfg = {
     charset = config.get(cfg_data, "display", "charset", "ASCII"),
     frame_gap_ms = config.get(cfg_data, "display", "frame_gap_ms", 0),
     tx_echo = config.get(cfg_data, "display", "tx_echo", true),
+    -- Receive-area copy policy: when true, Ctrl+C / context-menu copy omits the
+    -- injected "[HH:MM:SS.mmm] " display timestamps (core/receive_copy.lua).
+    strip_timestamp_on_copy = config.get(cfg_data, "display", "strip_timestamp_on_copy", false),
 }
 local page_count = math.max(1, math.min(config.get(cfg_data, "multipage", "page_count", 1), 50))
 cfg.quick_pages = {}

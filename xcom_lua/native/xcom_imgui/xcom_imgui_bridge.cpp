@@ -146,6 +146,11 @@ struct Lang final {
     const char* send_slot_tip_prefix;   // "发送槽位 %d" / "Send slot %d"
     const char* parity_items[5];
     const char* flow_items[3];
+    // Open-time modem-line tri-state (XCOM_LINE_*).  Items are ordered by the
+    // ABI enum so combo index == value: 0 deassert, 1 assert, 2 leave alone.
+    // A distinct group from the live DTR/RTS toggles.
+    const char* open_line_label;    // "开端口线路" / "OPEN LINES"
+    const char* open_line_items[3];
     // Serial-profile combo labels in the grid's fixed row order
     // (baud / data bits / stop bits / parity / flow — same order as
     // serial_fields in draw_console, which indexes this array positionally).
@@ -157,8 +162,11 @@ struct Lang final {
     const char* menu_copy;
     const char* menu_paste;
     const char* menu_copy_sel;          // receive ctx: copy the selection
-    const char* menu_copy_all;          // receive ctx: copy the whole log
+    const char* menu_copy_all;          // receive ctx: copy the retained tail
+    const char* menu_copy_strip_ts;     // receive ctx: strip injected timestamps on copy
     const char* menu_clear_log;         // receive ctx: clear the log
+    const char* menu_save_log;          // receive ctx: save retained tail to file
+    const char* menu_resume;            // receive ctx: resume display (pause off)
     const char* script_new;
     const char* script_open_folder;
     const char* script_reload;
@@ -200,10 +208,14 @@ struct Lang final {
         fn(send_slot_tip_prefix);
         for (const char* item : parity_items) { fn(item); }
         for (const char* item : flow_items) { fn(item); }
+        for (const char* item : open_line_items) { fn(item); }
+        fn(open_line_label);
         for (const char* item : serial_field_labels) { fn(item); }
         fn(subtitle);
         fn(menu_select_all); fn(menu_copy); fn(menu_paste);
-        fn(menu_copy_sel); fn(menu_copy_all); fn(menu_clear_log);
+        fn(menu_copy_sel); fn(menu_copy_all); fn(menu_copy_strip_ts);
+        fn(menu_clear_log);
+        fn(menu_save_log); fn(menu_resume);
         fn(script_new); fn(script_open_folder); fn(script_reload); fn(script_clear_log);
         fn(script_empty_title); fn(script_empty_detail);
         fn(repl_label);
@@ -221,6 +233,7 @@ struct Lang final {
 static_assert(std::is_standard_layout_v<Lang> && std::is_trivially_copyable_v<Lang>);
 static_assert(std::size(Lang{}.parity_items) == 5U);   // matches ui/imgui_bridge.lua PARITY_ITEMS
 static_assert(std::size(Lang{}.flow_items) == 3U);      // matches ui/imgui_bridge.lua FLOW_ITEMS
+static_assert(std::size(Lang{}.open_line_items) == 3U); // == XCOM_LINE_* count (0/1/2)
 static_assert(std::size(Lang{}.serial_field_labels) == 5U);  // == serial_fields row count
 
 // Chinese labels mirror pic/1.png + llcom/SSCOM naming conventions.
@@ -246,10 +259,14 @@ constexpr Lang kLangZh{
     /*send_slot_tip_prefix*/ "发送槽位 %d",
     /*parity*/ {"无校验", "奇校验", "偶校验", "标志位", "空校验"},
     /*flow*/ {"无", "RTS / CTS", "XON / XOFF"},
+    /*open_line_label*/ "开端口线路",
+    /*open_line_items*/ {"拉低", "拉高", "不接触"},
     /*serial_field_labels*/ {"波特率", "数据位", "停止位", "校验位", "流控"},
     /*subtitle*/ "串口助手",
     /*menu_select_all*/ "全选", /*menu_copy*/ "复制", /*menu_paste*/ "粘贴",
-    /*menu_copy_sel*/ "复制选中", /*menu_copy_all*/ "复制全部", /*menu_clear_log*/ "清空日志",
+    /*menu_copy_sel*/ "复制选中", /*menu_copy_all*/ "复制保留尾部",
+    /*menu_copy_strip_ts*/ "复制时去除时间戳", /*menu_clear_log*/ "清空日志",
+    /*menu_save_log*/ "保存日志到文件...", /*menu_resume*/ "继续显示",
     /*script_new*/ "新建", /*script_open_folder*/ "打开文件夹",
     /*script_reload*/ "重新加载", /*script_clear_log*/ "清空日志",
     /*script_empty_title*/ "请选择脚本", /*script_empty_detail*/ "从左侧列表挑选",
@@ -286,10 +303,14 @@ constexpr Lang kLangEn{
     /*send_slot_tip_prefix*/ "Send slot %d",
     /*parity*/ {"None", "Odd", "Even", "Mark", "Space"},
     /*flow*/ {"None", "RTS / CTS", "XON / XOFF"},
+    /*open_line_label*/ "OPEN LINES",
+    /*open_line_items*/ {"Deassert", "Assert", "Leave alone"},
     /*serial_field_labels*/ {"BAUD", "DATA", "STOP", "PARITY", "FLOW"},
     /*subtitle*/ "SERIAL CONSOLE",
     /*menu_select_all*/ "Select all", /*menu_copy*/ "Copy", /*menu_paste*/ "Paste",
-    /*menu_copy_sel*/ "Copy selection", /*menu_copy_all*/ "Copy all", /*menu_clear_log*/ "Clear log",
+    /*menu_copy_sel*/ "Copy selection", /*menu_copy_all*/ "Copy retained tail",
+    /*menu_copy_strip_ts*/ "Copy without timestamps", /*menu_clear_log*/ "Clear log",
+    /*menu_save_log*/ "Save log to file...", /*menu_resume*/ "Resume display",
     /*script_new*/ "New", /*script_open_folder*/ "Open folder",
     /*script_reload*/ "Reload", /*script_clear_log*/ "Clear log",
     /*script_empty_title*/ "SELECT A SCRIPT", /*script_empty_detail*/ "pick one from the list",
@@ -396,6 +417,12 @@ public:
     // via xcom_imgui_set_receive_window ([display] receive_window_bytes in
     // config.ini); the historical fixed size is the default.
     std::size_t receive_limit_ = 64U * 1024U - 1U;
+    // Pending receive-copy request.  Ctrl+C and the receive context menu queue
+    // the bytes the user asked to copy here instead of writing the clipboard
+    // directly, so the Lua bridge can apply the optional timestamp strip
+    // (core/receive_copy.lua) before it sets the clipboard.  Empty == none
+    // (we never queue an empty range).
+    std::string receive_copy_pending_{};
     // ---- Phase 4 feature-extension state --------------------------------
     // All pointers below are LUA-OWNED: the Lua bridge allocates int[1]
     // buffers and registers them through the setter exports before the first
@@ -407,6 +434,9 @@ public:
     int* charset_ = nullptr;          // index into kCharsetItems
     int* frame_gap_en_ = nullptr;     // auto frame-break toggle
     int* frame_gap_ms_ = nullptr;     // auto frame-break threshold ms
+    int* copy_strip_ts_ = nullptr;    // receive copy: strip injected timestamps
+    int* dtr_open_ = nullptr;         // open-time DTR: XCOM_LINE_* (0/1/2)
+    int* rts_open_ = nullptr;         // open-time RTS: XCOM_LINE_* (0/1/2)
     // Keyword-highlight rules pushed from the Lua script engine.  Rendering
     // walks only clipper-visible lines x rules (see ReceiveContent), so the
     // per-frame cost is bounded regardless of log size.
@@ -427,6 +457,12 @@ public:
     // Empty on a pre-labels DLL/Lua pair, in which case the console falls back
     // to script_names_ for rendering.
     std::vector<std::string> script_labels_{};
+    // Hover tooltips for the script list, index-aligned with script_names_
+    // exactly like script_labels_.  An EMPTY entry means "no tooltip" (a script
+    // with neither @desc nor @name), so the renderer skips it rather than
+    // opening an empty box.  Pushed by Lua through xcom_imgui_set_script_descs;
+    // this vector owns its own strings, same lifetime as the labels above.
+    std::vector<std::string> script_descs_{};
     int* script_enabled_ = nullptr;   // Lua-owned int[count]
     std::string script_log_{};        // full log text (Lua pushes the tail)
     std::vector<std::size_t> script_log_lines_{1, 0};  // line offsets
@@ -1128,6 +1164,11 @@ struct ToggleSpec final {
     const char* label;
     int* value;
     Action action;
+    // When false the switch renders disabled: the label is still visible but the
+    // knob cannot be flipped.  Used for RTS under RTS/CTS flow control, where the
+    // driver owns the pin -- the panel must not offer a level it cannot command.
+    // Defaults to true, so the existing three-field aggregates are unchanged.
+    bool enabled = true;
 };
 
 template <size_t Count>
@@ -1135,7 +1176,11 @@ void RenderToggles(int& actions, const std::array<ToggleSpec, Count>& specs) {
     for (size_t index = 0; index < specs.size(); ++index) {
         if (index != 0) ImGui::SameLine();
         const ToggleSpec& spec = specs[index];
+        // Always paired (BeginDisabled(false) is a no-op), so the disabled stack
+        // stays balanced on every path.
+        ImGui::BeginDisabled(!spec.enabled);
         if (Toggle(spec.label, spec.value)) actions |= spec.action;
+        ImGui::EndDisabled();
     }
 }
 
@@ -1172,6 +1217,24 @@ void TextContextMenu(const char* popup_id, char* buffer, const size_t capacity) 
         }
     }
     ImGui::EndPopup();
+}
+
+// Queue the ABSOLUTE lifetime byte range [begin_abs, end_abs) of the receive
+// log as a copy request for the Lua bridge.  The range is clamped to the
+// retained window (receive_base_ .. base+size): bytes that already scrolled
+// out are unrecoverable -- the byte-faithful source is the auto-save log, not
+// this normalized view.  An empty / fully-out-of-window range queues nothing.
+// Returns true when bytes were queued.
+bool QueueReceiveCopy(ImGuiRuntime& runtime, std::size_t begin_abs,
+                      std::size_t end_abs) {
+    const std::size_t window_end =
+        runtime.receive_base_ + runtime.receive_text_.size();
+    const std::size_t from = (std::max)(begin_abs, runtime.receive_base_);
+    const std::size_t to = (std::min)(end_abs, window_end);
+    if (to <= from) return false;
+    runtime.receive_copy_pending_.assign(
+        runtime.receive_text_, from - runtime.receive_base_, to - from);
+    return true;
 }
 
 [[nodiscard]] int ReceiveContent(int rx_bytes, int tx_bytes, int* receive_hex, int* timestamp,
@@ -1259,6 +1322,22 @@ void TextContextMenu(const char* popup_id, char* buffer, const size_t capacity) 
         runtime.receive_sel_anchor_ == kSelDragging &&
         ImGui::IsMouseDown(ImGuiMouseButton_Left);
     const bool has_selection = runtime.receive_sel_end_ > runtime.receive_sel_begin_;
+    // Keyboard shortcuts mirroring the context menu.  Ctrl+A selects the whole
+    // retained tail; Ctrl+C queues the selection for the Lua-side copy (which
+    // applies the optional timestamp strip).  Shortcut()'s default routing is
+    // focus-scope based: the receive child serves these only while it is on the
+    // focus path, and an active InputText (send box / script editor) owns
+    // Ctrl+A / Ctrl+C itself -- so this never steals a text edit's keys.  Same
+    // mechanism as the script console's Ctrl+S.
+    if (ImGui::Shortcut(ImGuiMod_Ctrl | ImGuiKey_A)) {
+        runtime.receive_sel_begin_ = runtime.receive_base_;
+        runtime.receive_sel_end_ =
+            runtime.receive_base_ + runtime.receive_text_.size();
+    }
+    if (ImGui::Shortcut(ImGuiMod_Ctrl | ImGuiKey_C)) {
+        QueueReceiveCopy(runtime, runtime.receive_sel_begin_,
+                         runtime.receive_sel_end_);
+    }
     // Render the log glyphs with the fixed-width data face when available so
     // hex bytes and RX counters line up column-wise (typical serial-monitor
     // look).  A consistent per-line row height also keeps the clipper metric
@@ -1570,6 +1649,25 @@ void TextContextMenu(const char* popup_id, char* buffer, const size_t capacity) 
         if (!runtime.receive_sel_drag_hit_) {
             runtime.receive_sel_begin_ = runtime.receive_sel_end_ = 0;
         }
+        // xcom_imgui_receive_append defers its prefix trim while a drag is in
+        // progress so the selected bytes cannot slide out from under the
+        // cursor.  Catch up here, on the first frame the button is observed
+        // released: this is what re-establishes text.size() <= receive_limit_.
+        // (The renderer clamps sel_begin/end to base, so a selection the trim
+        // retires is shown clipped to byte 0, never underflowed.)
+        if (runtime.receive_text_.size() > runtime.receive_limit_) {
+            const std::size_t erase_n =
+                runtime.receive_text_.size() - runtime.receive_limit_;
+            runtime.receive_text_.erase(0, erase_n);
+            runtime.receive_base_ += erase_n;
+            std::vector<std::size_t>& offsets = runtime.receive_line_offsets_;
+            offsets.erase(offsets.begin(),
+                          std::lower_bound(offsets.begin(), offsets.end(), erase_n));
+            for (std::size_t& off : offsets) off -= erase_n;
+            if (offsets.empty() || offsets.front() != 0U) {
+                offsets.insert(offsets.begin(), 0U);
+            }
+        }
     }
     ImGui::PopStyleVar();
     // pop_mono is a ScopedAction: its destructor pops the font at scope exit.
@@ -1592,25 +1690,74 @@ void TextContextMenu(const char* popup_id, char* buffer, const size_t capacity) 
     }
     if (ImGui::BeginPopup("##receive_context")) {
         const bool has_sel = runtime.receive_sel_end_ > runtime.receive_sel_begin_;
+        const bool has_text = !runtime.receive_text_.empty();
         const Lang& lang = runtime.lang();
-        if (ImGui::MenuItem(lang.menu_copy_sel, nullptr, false, has_sel)) {
-            // Absolute -> window, clamped to the retained tail: bytes that
-            // already scrolled out of the 64 KiB window are unrecoverable.
-            const std::size_t window_end =
-                runtime.receive_base_ + runtime.receive_text_.size();
-            const std::size_t from =
-                (std::max)(runtime.receive_sel_begin_, runtime.receive_base_);
-            const std::size_t to = (std::min)(runtime.receive_sel_end_, window_end);
-            const std::string sel(to > from
-                ? runtime.receive_text_.substr(from - runtime.receive_base_, to - from)
-                : std::string{});
-            ImGui::SetClipboardText(sel.c_str());
+        // Copy submenu.  The items do NOT touch the clipboard here: they queue
+        // the requested bytes (QueueReceiveCopy) and the Lua bridge writes the
+        // clipboard after applying the optional timestamp strip.  That keeps
+        // the strip policy in ONE place (core/receive_copy.lua, unit-tested
+        // headless) instead of duplicating the pattern in C++.  Ctrl+C mirrors
+        // "Copy selection".
+        if (ImGui::BeginMenu(lang.menu_copy, has_sel || has_text)) {
+            if (ImGui::MenuItem(lang.menu_copy_sel, nullptr, false, has_sel)) {
+                QueueReceiveCopy(runtime, runtime.receive_sel_begin_,
+                                 runtime.receive_sel_end_);
+            }
+            // "All" reaches only the RETAINED tail (receive_limit_, default
+            // 64 KiB - 1): earlier bytes have been retired from the view.
+            if (ImGui::MenuItem(lang.menu_copy_all, nullptr, false, has_text)) {
+                QueueReceiveCopy(runtime, runtime.receive_base_,
+                                 runtime.receive_base_ +
+                                     runtime.receive_text_.size());
+            }
+            ImGui::Separator();
+            // Copy policy: when on, the injected "[HH:MM:SS.mmm] " prefixes
+            // are stripped before the clipboard write.  The toggle is a
+            // Lua-owned int (registered via xcom_imgui_set_copy_strip) so the
+            // Lua side both persists and applies it; the item hides when the
+            // bridge did not register the pointer (older Lua/DLL pairing).
+            if (runtime.copy_strip_ts_ != nullptr) {
+                bool strip = *runtime.copy_strip_ts_ != 0;
+                if (ImGui::MenuItem(lang.menu_copy_strip_ts, nullptr, strip)) {
+                    *runtime.copy_strip_ts_ = strip ? 0 : 1;
+                }
+            }
+            ImGui::EndMenu();
         }
-        if (ImGui::MenuItem(lang.menu_copy_all, nullptr, false, !runtime.receive_text_.empty())) {
-            ImGui::SetClipboardText(runtime.receive_text_.c_str());
+        // Select every retained byte: base..base+size is exactly the window, so
+        // the copy-selection clamp above maps it 1:1 (no off-by-base error).
+        if (ImGui::MenuItem(lang.menu_select_all, nullptr, false, has_text)) {
+            runtime.receive_sel_begin_ = runtime.receive_base_;
+            runtime.receive_sel_end_ =
+                runtime.receive_base_ + runtime.receive_text_.size();
         }
         ImGui::Separator();
-        if (ImGui::MenuItem(lang.menu_clear_log, nullptr, false, !runtime.receive_text_.empty())) {
+        // View toggles mirror the sidebar checkboxes exactly: same Lua-owned
+        // int, same ActionSyncDisplay.  ReceiveContent draws BEFORE the sidebar
+        // in xcom_imgui_draw_console, so a flip here is already visible to the
+        // checkbox within this same frame (and a popup blocks the sidebar's
+        // click, so the two can never both toggle in one frame).
+        const bool hex_on = receive_hex != nullptr && *receive_hex != 0;
+        if (ImGui::MenuItem(lang.hex_display, nullptr, hex_on, receive_hex != nullptr)) {
+            *receive_hex = hex_on ? 0 : 1;
+            actions |= Action::ActionSyncDisplay;
+        }
+        const bool ts_on = timestamp != nullptr && *timestamp != 0;
+        if (ImGui::MenuItem(lang.timestamp, nullptr, ts_on, timestamp != nullptr)) {
+            *timestamp = ts_on ? 0 : 1;
+            actions |= Action::ActionSyncDisplay;
+        }
+        const bool paused = pause_display != nullptr && *pause_display != 0;
+        if (ImGui::MenuItem(paused ? lang.menu_resume : lang.pause, nullptr, paused,
+                            pause_display != nullptr)) {
+            *pause_display = paused ? 0 : 1;
+            actions |= Action::ActionSyncDisplay;
+        }
+        ImGui::Separator();
+        if (ImGui::MenuItem(lang.menu_save_log)) {
+            actions |= Action::ActionSaveLog;
+        }
+        if (ImGui::MenuItem(lang.menu_clear_log, nullptr, false, has_text)) {
             actions |= Action::ActionClear;
         }
         ImGui::EndPopup();
@@ -1622,7 +1769,13 @@ void TextContextMenu(const char* popup_id, char* buffer, const size_t capacity) 
                     char* send_text, size_t send_capacity, char* multi_text,
                     size_t multi_slot_capacity, int* multi_enabled, int* multi_hex,
                     int* multi_crlf, int* multi_page, int* multi_page_count,
-                    int* multi_auto, int* multi_period) {
+                    int* multi_auto, int* multi_period, const bool send_ok) {
+    // send_ok follows the Lua send_enabled bit (OPEN and not RECONNECTING,
+    // passed as the console's `connected` argument).  Rather than let the
+    // buttons stay clickable in CLOSED/OPENING/CLOSING/FAULT/RECONNECTING and
+    // reject at runtime -- which reads as a dead button -- disable exactly the
+    // controls that would send: Send, Send-enabled, the per-row slot buttons
+    // and Run.  Editors and toggles stay live so the user can still compose.
     int actions = 0;
     const Lang& lang = ImGuiRuntime::instance().lang();
     if (ImGui::BeginTabBar("##transmit_tabs")) {
@@ -1662,8 +1815,10 @@ void TextContextMenu(const char* popup_id, char* buffer, const size_t capacity) 
             ImGui::SameLine();
             // Large primary Send vertically centred against the editor.
             ImGui::SetCursorPosY(ImGui::GetCursorPosY() + (editor_height - 48.0f) * 0.5f);
+            ImGui::BeginDisabled(!send_ok);
             actions |= Command<Action::ActionSend>::Execute(
                 [&lang] { return SendAction(lang.send, ImVec2(96, 48)); });
+            ImGui::EndDisabled();
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem(lang.tab_multi)) {
@@ -1707,9 +1862,11 @@ void TextContextMenu(const char* popup_id, char* buffer, const size_t capacity) 
                         // preserves the slot identity.  Plain "N" avoids the
                         // "Send >" misread caused by ">" being clipped.
                         sprintf_s(send_label, "%d", index + 1);
+                        ImGui::BeginDisabled(!send_ok);
                         if (ImGui::Button(send_label, ImVec2(32.0f, kControlHeight))) {
                             actions |= send_slot_action(static_cast<std::uint32_t>(index));
                         }
+                        ImGui::EndDisabled();
                         if (ImGui::IsItemHovered()) {
                             ImGui::SetTooltip(lang.send_slot_tip_prefix, index + 1);
                         }
@@ -1765,13 +1922,17 @@ void TextContextMenu(const char* popup_id, char* buffer, const size_t capacity) 
             ImGui::SetCursorPosX(ImGui::GetWindowWidth() - 76.0f);
             if (runtime.multi_gap_ != nullptr) {
                 ImGui::SetCursorPosX(ImGui::GetWindowWidth() - 138.0f);
+                ImGui::BeginDisabled(!send_ok);
                 actions |= Command<Action::ActionRunSequence>::Execute(
                     [&lang] { return PrimaryAction(lang.run, ImVec2(56.0f, kControlHeight)); });
+                ImGui::EndDisabled();
                 ImGui::SameLine(0.0f, 4.0f);
             }
             ImGui::SetCursorPosX(ImGui::GetWindowWidth() - 76.0f);
+            ImGui::BeginDisabled(!send_ok);
             actions |= Command<Action::ActionSendEnabled>::Execute(
                 [&lang] { return SendAction(lang.send, ImVec2(72.0f, kControlHeight)); });
+            ImGui::EndDisabled();
             ImGui::PopStyleVar();
             ImGui::EndTabItem();
         }
@@ -1804,6 +1965,16 @@ void TextContextMenu(const char* popup_id, char* buffer, const size_t capacity) 
     // port and picks one from the enumerated list; Refresh sits beside it.
     ImGui::SetCursorPosX(kSidebarInset);
     ImGui::SetNextItemWidth(-34.0f);
+    // Disabled while a session is live, for the same invariant as the line
+    // format combos below: the panel must never name a port other than the one
+    // the open handle belongs to.  This is not cosmetic -- the pick writes
+    // _imgui_port (window.lua:2196), which feeds _serial_config().port
+    // (window.lua:1319), which _drive_reconnect reads as its recovery target
+    // (window.lua:3422).  A pick made while connected would therefore silently
+    // redirect reconnection to a DIFFERENT device -- the exact "silently
+    // switched to another port" failure recorded as a defect in other tools.
+    // Closing first remains the way to reach another port.
+    ImGui::BeginDisabled(connected);
     if (ImGui::BeginCombo("##port_combo", port[0] ? port : lang.select_port)) {
         const auto& port_list = ImGuiRuntime::instance().ports_;
         const Slice<std::string> ports(port_list.data(), port_list.size());
@@ -1817,6 +1988,7 @@ void TextContextMenu(const char* popup_id, char* buffer, const size_t capacity) 
         }
         ImGui::EndCombo();
     }
+    ImGui::EndDisabled();
     ImGui::SameLine(0.0f, 6.0f);
     actions |= Command<Action::ActionRefreshPorts>::Execute(
         [&lang] { return IconButton("##refresh_ports", UtilityIcon::Refresh, lang.refresh_tip); });
@@ -1829,8 +2001,21 @@ void TextContextMenu(const char* popup_id, char* buffer, const size_t capacity) 
     // DTR/RTS moved up next to the open/close pair (user: the "更多" band is
     // hidden for now — see kMoreSectionEnabled — and these two modem lines are
     // primary enough to live right under the port action).
+    // RTS is driver-owned under RTS/CTS hardware flow control (flow index 1;
+    // xcom.h XcomPortConfig.flow_control, order mirrored by Lang::flow_items):
+    // the driver decides the pin, so the switch is disabled rather than showing a
+    // level the panel cannot command (same invariant as the connected-gated
+    // combos above, and as RealTerm's documented handshake-pin rule).  DTR is NOT
+    // governed by RTS/CTS (nor by XON/XOFF) and xcom_set_lines still applies the
+    // DTR half under hw flow, so it stays enabled.  The flow combo itself is
+    // disabled while connected, so this reads the same effective setting the DCB
+    // was opened with.
+    const bool rts_driver_owned = *flow == 1;
     ImGui::SetCursorPosX(kSidebarInset);
-    const std::array<ToggleSpec, 2> modem_options{{{"DTR", dtr, Action::ActionSyncSettings}, {"RTS", rts, Action::ActionSyncSettings}}};
+    const std::array<ToggleSpec, 2> modem_options{{
+        {"DTR", dtr, Action::ActionSyncSettings},
+        {"RTS", rts, Action::ActionSyncSettings, !rts_driver_owned},
+    }};
     RenderToggles(actions, modem_options);
     ImGui::Dummy(ImVec2(0.0f, 5.0f));
     ImGui::Separator();
@@ -1838,6 +2023,14 @@ void TextContextMenu(const char* popup_id, char* buffer, const size_t capacity) 
     ImGui::SetCursorPosX(kSidebarInset);
     Section(lang.section_serial);
     ImGui::SetCursorPosX(kSidebarInset);
+    // The line format is programmed into the DCB exactly once, in
+    // open()->configure() (serial_backend_win.cpp, the only SetCommState), and
+    // there is no runtime reconfiguration path.  Editing these five combos
+    // while connected would therefore change only the DISPLAYED value while
+    // the port keeps the old one -- the panel would contradict the live DCB.
+    // Gate them on `connected`, the same way the Open/Close buttons are gated.
+    // DTR/RTS below stay enabled: set_dtr/set_rts really drive the pins live.
+    ImGui::BeginDisabled(connected);
     if (ImGui::BeginTable("##serial_grid", 2, ImGuiTableFlags_SizingStretchProp)) {
         // Label column tracks the active language: 48 px fits the 4-char
         // English labels (BAUD/FLOW), 56 px fits the 3-hanzi Chinese labels
@@ -1848,8 +2041,62 @@ void TextContextMenu(const char* popup_id, char* buffer, const size_t capacity) 
             ImGui::TableNextRow();
             if (GridComboField(field)) actions |= Action::ActionSyncSettings;
         }
+        // 1.5 stop bits exists only for a 5-data-bit word: the core's
+        // valid_line_format() (serial_backend_win.cpp) rejects every other
+        // pairing, so an "8 data bits + 1.5 stop" pick would make Open fail on
+        // a format the panel let the user choose.  Carry a data-bit change into
+        // the Stop combo (index 1 == 1.5 -> 0 == 1) so the shipped UI cannot
+        // hold the invalid pair.  data_bits is the 0-based combo index (0 ==
+        // 5 bits), so 1.5 is legal only while *data_bits == 0.
+        if (*stop_bits == 1 && *data_bits != 0) {
+            *stop_bits = 0;
+            actions |= Action::ActionSyncSettings;
+        }
         ImGui::EndTable();
     }
+    // Open-time modem-line tri-state (XCOM_LINE_*).  A SEPARATE group from the
+    // live DTR/RTS toggles above: these are programmed once, at open.  "Leave
+    // alone" is the only setting under which the open path issues no
+    // EscapeCommFunction for that line, so a target with DTR->NRST / RTS->BOOT
+    // is not reset just by opening the port.  Hidden on a DLL whose Lua peer
+    // did not register the two int buffers (xcom_imgui_set_open_lines).
+    {
+        const auto& runtime = ImGuiRuntime::instance();
+        if (runtime.dtr_open_ != nullptr || runtime.rts_open_ != nullptr) {
+            ImGui::Spacing();
+            ImGui::SetCursorPosX(kSidebarInset);
+            Section(lang.open_line_label);
+            if (ImGui::BeginTable("##open_line_grid", 2,
+                                  ImGuiTableFlags_SizingStretchProp)) {
+                ImGui::TableSetupColumn("label", ImGuiTableColumnFlags_WidthFixed,
+                                        lang.serial_label_col);
+                ImGui::TableSetupColumn("value", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+                const int item_count =
+                    static_cast<int>(std::size(lang.open_line_items));
+                if (runtime.dtr_open_ != nullptr) {
+                    ImGui::TableNextRow();
+                    if (GridComboField({"##dtr_open", "DTR", runtime.dtr_open_,
+                                        lang.open_line_items, item_count})) {
+                        actions |= Action::ActionSyncSettings;
+                    }
+                }
+                if (runtime.rts_open_ != nullptr) {
+                    ImGui::TableNextRow();
+                    // Under RTS/CTS the driver owns RTS, so an open-time RTS
+                    // choice cannot be honoured; disable rather than show a
+                    // level the port will not program.
+                    ImGui::BeginDisabled(*flow == 1);
+                    if (GridComboField({"##rts_open", "RTS", runtime.rts_open_,
+                                        lang.open_line_items, item_count})) {
+                        actions |= Action::ActionSyncSettings;
+                    }
+                    ImGui::EndDisabled();
+                }
+                ImGui::EndTable();
+            }
+        }
+    }
+    ImGui::EndDisabled();
     // "更多" advanced band — kept per user request (may be re-enabled later),
     // but currently gated OFF by kMoreSectionEnabled so the sidebar shows only
     // primary controls.  DTR/RTS moved above the open/close row; the custom
@@ -1873,7 +2120,10 @@ void TextContextMenu(const char* popup_id, char* buffer, const size_t capacity) 
                 ImGui::PopStyleVar();
             }
             ImGui::SetCursorPosX(kSidebarInset);
-            const std::array<ToggleSpec, 2> more_modem{{{"DTR", dtr, Action::ActionSyncSettings}, {"RTS", rts, Action::ActionSyncSettings}}};
+            const std::array<ToggleSpec, 2> more_modem{{
+                {"DTR", dtr, Action::ActionSyncSettings},
+                {"RTS", rts, Action::ActionSyncSettings, !rts_driver_owned},
+            }};
             RenderToggles(actions, more_modem);
         }
     }
@@ -2180,6 +2430,16 @@ int ScriptEditorResize(ImGuiInputTextCallbackData* data) {
                     if (ImGui::Selectable(shown, selected)) {
                         runtime.script_events_.push_back(
                             (static_cast<int>(ScriptEvent::Edit) << 8) | index);
+                    }
+                    // @desc/@name hover text from Lua (may be CJK; its glyphs
+                    // are baked from script_descs_ in rebuild_fonts).  An empty
+                    // entry means "no tooltip" -- never open an empty box.
+                    // SetTooltip("%s", ...) keeps the text from being read as a
+                    // printf format string.
+                    if (ImGui::IsItemHovered() &&
+                        index < static_cast<int>(runtime.script_descs_.size()) &&
+                        !runtime.script_descs_[index].empty()) {
+                        ImGui::SetTooltip("%s", runtime.script_descs_[index].c_str());
                     }
                     ImGui::PopID();
                 }
@@ -3040,6 +3300,11 @@ static void rebuild_fonts(ImGuiRuntime& runtime) {
         for (const std::string& label : runtime.script_labels_) {
             text_builder.AddText(label.c_str());
         }
+        // Script-list hover tooltips (@desc) are user-authored too and render
+        // in the body face via SetTooltip, so they need the same glyph merge.
+        for (const std::string& desc : runtime.script_descs_) {
+            text_builder.AddText(desc.c_str());
+        }
         // The footer status line is set by Lua and may contain Chinese
         // ("端口被其他程序占用", "串口连接异常，等待恢复...").  It is re-baked
         // on change (see xcom_imgui_set_status), so only the current string
@@ -3220,6 +3485,8 @@ extern "C" __declspec(dllexport) int xcom_imgui_init(HWND hwnd) {
     if (!hwnd || runtime.initialized_ || !IsWindow(hwnd)) return 0;
     runtime.receive_text_.clear();
     runtime.receive_text_.reserve(64U * 1024U - 1U);
+    // Drop any stale copy request from a previous bridge instance.
+    runtime.receive_copy_pending_.clear();
     // Full state reset for the absolute-coordinate contract: receive_base_
     // and the selection describe the CURRENT buffer contents, so a re-init
     // (bridge rebuilt without process restart) must drop them along with
@@ -3424,7 +3691,7 @@ extern "C" __declspec(dllexport) int xcom_imgui_draw_console(
                                            send_text, send_capacity, multi_text,
                                            multi_slot_capacity, multi_enabled, multi_hex,
                                            multi_crlf, multi_page, multi_page_count,
-                                           multi_auto, multi_period);
+                                           multi_auto, multi_period, connected != 0);
         }
         // Inner gap column (transparent child) carrying the single 1px
         // hairline that separates the two panels (1.png: border-free panels
@@ -3621,7 +3888,15 @@ extern "C" __declspec(dllexport) void xcom_imgui_receive_append(
     // follow_tail_ is deliberately untouched: scrolling to the bottom stays a
     // render-time decision (was_at_bottom), so incoming data never yanks a
     // user who is reading history.
-    if (text.size() > runtime.receive_limit_) {
+    // INVARIANT: while a drag selection is in progress (anchor == kSelDragging)
+    // the trim is DEFERRED, so every absolute selection byte keeps the same
+    // window offset for the whole drag -- otherwise a heavy stream would erase
+    // the prefix, advance receive_base_ and slide the selected text out from
+    // under the held cursor.  The deferred trim is performed by the render loop
+    // on the frame the left button is observed released (ReceiveContent), which
+    // restores text.size() <= receive_limit_ after every drag.
+    if (text.size() > runtime.receive_limit_ &&
+        runtime.receive_sel_anchor_ != kSelDragging) {
         const std::size_t erase_n = text.size() - runtime.receive_limit_;
         text.erase(0, erase_n);
         runtime.receive_base_ += erase_n;
@@ -3815,6 +4090,20 @@ extern "C" __declspec(dllexport) void xcom_imgui_set_baud_extra(int* custom_baud
     runtime.baud_custom_ = custom_baud;
 }
 
+// Open-time modem-line tri-state (XCOM_LINE_*: 0 deassert / 1 assert /
+// 2 leave alone).  The two Lua-owned int buffers are edited in place by the
+// serial-grid combos; Lua reads them back through imgui_bridge.serial_config
+// and forwards them to XcomPortConfig.dtr_enable/rts_enable at open.  Range is
+// not policed here: the C ABI (xcom_abi.cpp queue_open) rejects anything above
+// XCOM_LINE_LEAVE_ALONE, and the Lua side normalises the combo index first.
+extern "C" __declspec(dllexport) void xcom_imgui_set_open_lines(
+    int* dtr_open, int* rts_open) {
+    auto& runtime = ImGuiRuntime::instance();
+    if (!extension_ready(runtime)) return;
+    runtime.dtr_open_ = dtr_open;
+    runtime.rts_open_ = rts_open;
+}
+
 extern "C" __declspec(dllexport) void xcom_imgui_set_multi_extra(int* gap_ms) {
     auto& runtime = ImGuiRuntime::instance();
     if (!extension_ready(runtime)) return;
@@ -3832,6 +4121,49 @@ extern "C" __declspec(dllexport) void xcom_imgui_set_frame_gap(int* enabled, int
     if (!extension_ready(runtime)) return;
     runtime.frame_gap_en_ = enabled;
     runtime.frame_gap_ms_ = ms;
+}
+
+// ---- receive copy path -----------------------------------------------------
+// Register the Lua-owned "copy without timestamps" toggle.  The receive
+// context menu reads/flips it in place; the Lua side persists it ([display]
+// strip_timestamp_on_copy) and applies it when it services a copy.
+extern "C" __declspec(dllexport) void xcom_imgui_set_copy_strip(int* enabled) {
+    auto& runtime = ImGuiRuntime::instance();
+    if (!extension_ready(runtime)) return;
+    runtime.copy_strip_ts_ = enabled;
+}
+
+// Hand the pending receive-copy request to Lua and clear it.  Ctrl+C / the
+// context menu queue the bytes in QueueReceiveCopy instead of writing the
+// clipboard, so the Lua bridge can strip timestamps first.  Returns the number
+// of bytes copied into `out` (NUL-terminated), or 0 when nothing is pending.
+// The caller sizes `out` to the receive window, so a request always fits; a
+// smaller buffer truncates.
+extern "C" __declspec(dllexport) size_t xcom_imgui_take_receive_copy(
+    char* out, size_t capacity) {
+    auto& runtime = ImGuiRuntime::instance();
+    if (!extension_ready(runtime) || !out || capacity == 0) return 0;
+    const std::string& pending = runtime.receive_copy_pending_;
+    if (pending.empty()) return 0;
+    const std::size_t copy = (std::min)(pending.size(), capacity - 1U);
+    std::memcpy(out, pending.data(), copy);
+    out[copy] = '\0';
+    // Release the request even when the caller's buffer was too small: a
+    // truncated copy is still the copy the user asked for, and holding it
+    // would re-copy stale bytes on the next frame.
+    runtime.receive_copy_pending_.clear();
+    return copy;
+}
+
+// Write text the Lua bridge has already transformed (timestamp-stripped or
+// raw) to the OS clipboard.  ImGui's platform backend owns the actual
+// clipboard call, so no raw Win32 clipboard code is needed here.
+extern "C" __declspec(dllexport) void xcom_imgui_set_clipboard_text(
+    const char* text, size_t length) {
+    auto& runtime = ImGuiRuntime::instance();
+    if (!extension_ready(runtime)) return;
+    const std::string value(text ? text : "", text ? length : 0);
+    ImGui::SetClipboardText(value.c_str());
 }
 
 // packed = "pattern\0RRGGBB\0style\0" repeated `count` times (style: "text"
@@ -3889,6 +4221,7 @@ extern "C" __declspec(dllexport) void xcom_imgui_set_scripts(
     if (!extension_ready(runtime)) return;
     runtime.script_names_.clear();
     runtime.script_labels_.clear();   // labels are index-aligned with names
+    runtime.script_descs_.clear();    // tooltips too: never keep a stale map
     if (!names_packed || count <= 0) {
         runtime.script_enabled_ = nullptr;
         return;
@@ -3934,6 +4267,36 @@ extern "C" __declspec(dllexport) void xcom_imgui_set_script_labels(
     // next frame — same safe point the mono-CJK toggle uses.  At init the
     // initial bake has not happened yet, so no rebuild is needed (and asking
     // for one here would run before the DX11 device exists).
+    if (runtime.initialized_) {
+        runtime.font_rebuild_pending_ = true;
+    }
+}
+
+// Hover tooltips for the script list ("desc1\0desc2\0..."), the tooltip
+// companion to script_labels() and index-aligned with the same names.  Like
+// labels, a separate export keeps the set_scripts ABI untouched.  Unlike
+// labels, `count` is passed explicitly: a script with neither @desc nor @name
+// has an EMPTY tooltip, and the label parser (which stops at the first empty
+// token) would truncate the list at that point and misalign every later row.
+// The count is what guarantees index alignment; a count that disagrees with the
+// current name list is discarded wholesale rather than applied partially.
+extern "C" __declspec(dllexport) void xcom_imgui_set_script_descs(
+    const char* descs_packed, int count) {
+    auto& runtime = ImGuiRuntime::instance();
+    if (!extension_ready(runtime)) return;
+    std::vector<std::string> next;
+    if (descs_packed && count > 0 &&
+        count == static_cast<int>(runtime.script_names_.size())) {
+        const char* cursor = descs_packed;
+        for (int index = 0; index < count; ++index) {
+            next.emplace_back(cursor);
+            cursor += next.back().size() + 1;
+        }
+    }
+    if (next == runtime.script_descs_) return;   // no change: no font churn
+    runtime.script_descs_ = std::move(next);
+    // Same deferred-rebuild contract as labels: a @desc can appear/change after
+    // the last bake, so register the glyphs at the top of the next frame.
     if (runtime.initialized_) {
         runtime.font_rebuild_pending_ = true;
     }

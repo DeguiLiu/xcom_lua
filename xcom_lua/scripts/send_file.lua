@@ -23,11 +23,24 @@ local state = {
     interval = 50,    -- 块间隔毫秒
     running = false,  -- 发送中
     timer = nil,      -- 在途一次性定时器句柄（自续前显式回收）
+    stall_retries = 0,-- 连续被瞬时拒绝的次数（成功推进即清零）
 }
 
 -- combo 索引 -> 字节数（与 spec 的 items 顺序一致）
 local CHUNK_ITEMS = { 128, 512, 1024, 4096, 16384 }
 local CHUNK_DEFAULT_IDX = 2   -- 1024
+
+-- uart.send's errcode is the xcom ABI status; the sandbox exposes no FFI, so
+-- mirror core/xcom_ffi.lua's names here.  Both are TRANSIENT refusals and must
+-- share one retry path: -4 err_busy (the scheduler declined the event —
+-- breaker downgrade / open-in-progress), -5 err_full (TX pool / dispatcher
+-- queue at capacity).  Only a non-transient code (e.g. -2 not open, -6 io)
+-- aborts outright.
+local ERR_BUSY, ERR_FULL = -4, -5
+-- Upper bound on consecutive transient rejections before the stream gives up.
+-- Unbounded retry would leave a permanently wedged pipeline (e.g. a breaker
+-- stuck at L2) spinning forever with sys.busy(true), locking the host out.
+local MAX_STALL_RETRIES = 100
 
 local function basename(path)
     return path:match("([^/\\]+)$") or path
@@ -102,6 +115,10 @@ end
 
 local function stop_running(reason)
     state.running = false
+    -- Clear the host interlock flag together with state.running: any_script_busy
+    -- must go false the instant the stream is no longer active, or the host
+    -- would keep refusing to start a sequence / auto-cycle forever.
+    sys.busy(false)
     if state.timer then
         sys.timer_stop(state.timer)
         state.timer = nil
@@ -145,16 +162,26 @@ issue_read = function()
             stop_running("read failed")
             return
         end
-        -- Backpressure: a full TX queue (err_full, -5) is a transient hardware
-        -- limit, not a failure.  Retry the SAME chunk after `interval` so the
-        -- 115200-baud line has time to drain; only a real "not open" / "io"
+        -- Backpressure / transient refusal: a full TX queue (err_full, -5) and
+        -- a scheduler downgrade (err_busy, -4) are both "wait a moment"
+        -- conditions, not failures.  Retry the SAME chunk after `interval` so
+        -- the line has time to drain/recover; only a real "not open" / "io"
         -- error aborts.  errcode comes from uart.send's second return value.
         local sent, errcode = uart.send(data)
-        if not sent and errcode == -5 then
+        if not sent and (errcode == ERR_FULL or errcode == ERR_BUSY) then
+            if state.stall_retries >= MAX_STALL_RETRIES then
+                close_file()
+                stop_running("retry limit reached: " ..
+                    tostring(state.stall_retries) .. " retries rejected (" ..
+                    tostring(errcode) .. ")")
+                return
+            end
             -- Do not advance offset; re-issue this chunk after the gap.
+            state.stall_retries = state.stall_retries + 1
             schedule(state.interval, issue_read)
             return
         end
+        state.stall_retries = 0   -- progress: a fresh budget for the next stall
         if not sent then
             close_file()
             stop_running("port error (" .. tostring(errcode) .. ")")
@@ -212,6 +239,12 @@ ui.event = function(page, kind, widget, value)
         end
         state.offset = 0
         state.running = true
+        state.stall_retries = 0
+        -- Publish the stream to the host for the WHOLE run, not just while a
+        -- timer is armed: between two chunks the one-shot timer is stopped but
+        -- an async read (and the next send) is still in flight, and that window
+        -- is exactly where a naive "is a timer running?" probe would misjudge.
+        sys.busy(true)
         schedule(0, step)
     elseif kind == "click" and widget == "resume" then
         -- Continue from wherever the previous run stopped. The fd was left
@@ -226,6 +259,10 @@ ui.event = function(page, kind, widget, value)
             return
         end
         state.running = true
+        state.stall_retries = 0
+        -- Same stream-lifetime publication as Send: the host interlock must
+        -- block a batch sender while a resumed transfer is mid-flight.
+        sys.busy(true)
         schedule(0, step)
     elseif kind == "click" and widget == "stop" then
         -- Keep offset AND fd: a resume needs to read from the same handle, and

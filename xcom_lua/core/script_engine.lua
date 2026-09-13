@@ -37,6 +37,10 @@ Script environment (one shared table per script, fresh per (re)load):
   sys.timer_start(ms, fn)          one-shot timer (fn pcall-wrapped)
   sys.timer_loop_start(ms, fn)     repeating timer
   sys.timer_stop(fn)
+  sys.busy(active)         publish this script as a long-running STREAM
+                           (send_file).  The host interlocks its batch
+                           senders on any_script_busy() so a streaming file
+                           send is never starved by a sequence/auto-cycle.
   wave.*                   waveform module passthrough (core/waveform.lua)
   string.toHex/fromHex/split/utf8Len  LLCOM-style string extensions
   _SCRIPT                  script base name ("demo")
@@ -269,12 +273,28 @@ function meta.parse(text)
 end
 
 -- The list label for one script: the @name when present, else the filename.
--- @desc is deliberately NOT the label (it is long-form; a tooltip may use it).
+-- @desc is deliberately NOT the label (it is long-form; the tooltip below uses
+-- it).
 function meta.display_name(name, parsed)
     if parsed and type(parsed.name) == "string" and parsed.name ~= "" then
         return parsed.name
     end
     return name
+end
+
+-- Hover-tooltip text for one script: the long-form @desc when present, else the
+-- @name, else nil (no tooltip at all -- never an empty box).  Distinct from
+-- display_name (the short list LABEL); kept pure so it is unit-testable without
+-- an ImGui host.
+function meta.tooltip(parsed)
+    if type(parsed) ~= "table" then return nil end
+    if type(parsed.desc) == "string" and parsed.desc ~= "" then
+        return parsed.desc
+    end
+    if type(parsed.name) == "string" and parsed.name ~= "" then
+        return parsed.name
+    end
+    return nil
 end
 
 M.meta = meta
@@ -346,6 +366,12 @@ end
 --   is_open         function() -> bool (port connected?)
 --   on_rules_changed function(rules_array)  -- highlight rules updated; each
 --                   rule = {pattern, color, style}
+--   on_reload       optional function() -- a script is about to be (re)loaded.
+--                   The host uses this to flush state that spans raw batches
+--                   (window.lua's whole-line bridge) through the OLD hooks
+--                   before they are cleared, so a reload never mixes a held
+--                   half line across the boundary.  Called for every load,
+--                   including enable-time with nothing pending.
 --   on_log          optional function(line) — mirrors every log line
 --                   (window.lua pushes the ring to the C++ console)
 --   wave            optional module table exposed as `wave` (core/waveform)
@@ -360,6 +386,7 @@ function M.new(opts)
         send_fn = opts.send,
         is_open_fn = opts.is_open,
         on_rules_changed = opts.on_rules_changed,
+        on_reload = opts.on_reload,
         on_log = opts.on_log,
         wave_module = opts.wave,
         charset_module = opts.charset,
@@ -584,6 +611,20 @@ local function build_env(engine, record)
 
     env.sys = {
         now = function() return uv.now() end,
+        -- Long-running-stream declaration (send_file's chunked send).  A
+        -- streaming file send retries a FULL TX queue with backoff instead of
+        -- dropping, while the sequential Run / auto-cycle ignore the return
+        -- value and blast on; run together, the sequence starves the file send
+        -- and silently drops its chunks.  The script publishes "I am streaming"
+        -- for the WHOLE state.running lifetime -- including the window between
+        -- two async reads where its one-shot timer is momentarily stopped --
+        -- and the host refuses to start a batch sender while any script is
+        -- busy (any_script_busy).  XCOM states the same rule: single / auto /
+        -- file transfer are mutually exclusive (docs/design-serial-tool-
+        -- comparison.md).
+        busy = function(active)
+            engine:set_script_busy(record.name, active)
+        end,
         timer_start = function(ms, fn)
             return engine:timer_create(tonumber(ms) or 0, fn, false)
         end,
@@ -882,6 +923,15 @@ end
 function M:load_script(name)
     local record = self.scripts[name]
     if not record then return false, "unknown script " .. name end
+    -- Notify the host BEFORE any state is cleared, so a buffer that spans raw
+    -- batches is flushed through the OLD hooks.  pcall so a host callback bug
+    -- can never break a script load.
+    if self.on_reload then
+        local called, cb_err = pcall(self.on_reload)
+        if not called then
+            self:log(4, "engine", "on_reload error: " .. tostring(cb_err))
+        end
+    end
     local chunk, err = loadfile(record.path)
     if not chunk then
         record.enabled = false
@@ -900,6 +950,10 @@ function M:load_script(name)
     record.ui_pages = {}     -- ui.page declarations (repopulated on load)
     record.strikes_recv = 0
     record.strikes_send = 0
+    -- A reload starts a fresh stream lifetime: drop any busy flag the previous
+    -- copy published (sys.busy) so a script reloaded mid-send cannot block the
+    -- host's batch senders forever with a stale "streaming" latch.
+    record.busy = false
     record.mtime = script_mtime(record.path)
     -- Refresh the header label on every (re)load: a hot edit may have changed
     -- @name/@desc, and the console list should follow without a full rescan.
@@ -983,6 +1037,27 @@ function M:script_meta(name)
     return record.meta or meta.parse(nil)
 end
 
+-- Hover text for one script: @desc -> @name -> nil.  This is the accessor a
+-- script-list tooltip calls; the LABEL stays script_labels() so a long @desc
+-- never widens the list row.
+function M:script_tooltip(name)
+    local record = self.scripts[name]
+    if not record then return nil end
+    return meta.tooltip(record.meta)
+end
+
+-- Tooltip texts index-aligned with script_names(): the companion to
+-- script_labels() for the native list renderer.  "" marks "no tooltip" (a
+-- script with neither @desc nor @name), so a packed push stays nil-safe.
+function M:script_tooltips()
+    local out = {}
+    for i, name in ipairs(self.order) do
+        local record = self.scripts[name]
+        out[i] = (record and meta.tooltip(record.meta)) or ""
+    end
+    return out
+end
+
 function M:enable(name, enabled)
     local record = self.scripts[name]
     if not record then return end
@@ -1018,6 +1093,25 @@ end
 function M:is_enabled(name)
     local record = self.scripts[name]
     return record and record.enabled or false
+end
+
+-- Record a script-declared long-running stream (sys.busy).  The flag lives on
+-- the record and is read by any_script_busy(); kept as an engine method (not a
+-- raw field poke from the sandbox) so its lifecycle is obvious and testable.
+function M:set_script_busy(name, active)
+    local record = self.scripts[name]
+    if not record then return end
+    record.busy = active and true or false
+end
+
+-- True while any ENABLED script is streaming (sys.busy(true) with no matching
+-- sys.busy(false) yet).  A disabled/reloaded record's flag is stale by
+-- definition, so it is ignored rather than latching the interlock shut.
+function M:any_script_busy()
+    for _, record in pairs(self.scripts) do
+        if record.enabled and record.busy then return true end
+    end
+    return false
 end
 
 function M:reload(name)

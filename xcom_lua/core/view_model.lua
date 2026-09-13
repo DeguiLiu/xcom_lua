@@ -6,10 +6,13 @@ native core is authoritative for port state; this module mirrors it on the
 single UI thread and derives one immutable-ish state table consumed by the
 connection panel, send panel and status bar to drive interlock:
 
-  * params_enabled - only true while OFFLINE (CLOSED/FAULT): baud/data/parity/
-    stop/flow/DTR/RTS edits are only safe before a port is opened;
+  * params_enabled - only true while OFFLINE (the CLOSED/FAULT/RECONNECTING
+    super-state, not just CLOSED/FAULT): baud/data/parity/stop/flow/DTR/RTS
+    edits are only safe before a port is opened;
   * open_enabled   - only true from CLOSED/FAULT (mirrors can_open);
-  * close_enabled  - only true from OPEN/OPENING/FAULT (mirrors can_close);
+  * close_enabled  - only true from OPEN/OPENING/FAULT/RECONNECTING (mirrors
+    can_close; the transitional OPENING case is what lets a slow open be
+    cancelled);
   * send_enabled / autosend_enabled - only true exactly in OPEN.
 
 Generation guards discard stale core notifications (a port_state signal from
@@ -17,6 +20,28 @@ an older `xcom_open` session that raced with a newer one), exactly like the
 Python `on_port_state`/`on_snapshot`.
 
 No FFI/Win32 dependency: fully unit-testable on Linux with plain luajit.
+------------------------------------------------------------------------]]--
+
+--[[--------------------------------------------------------------------------
+Authority contract (native core <-> this mirror)
+------------------------------------------------
+  * Port facts are CORE-authoritative.  The native HSM owns closed/opening/
+    open/closing/fault; on_port_state/on_snapshot only replay what the core
+    published.  The mirror never invents a port state and never writes one
+    back to the core.
+  * Recovery POLICY is LUA-authoritative.  The reconnect grace window, its
+    duration and retry cadence, and whether to retry at all are UI decisions
+    (M.RECONNECT_GRACE_MS, window.lua's _drive_reconnect); the core has no
+    equivalent timer.  The mirror owns the derived interlock because it is the
+    single place send/params/close is computed from.
+  * Lua influences the core ONLY by submitting open/close REQUESTS (xcom_open/
+    xcom_close via the UI driver).  It never forges a transition locally:
+    intent_open/intent_close only show an optimistic OPENING/CLOSING and roll
+    back if the request is rejected.
+  * RECONNECTING exists ONLY in the mirror.  The core reports FAULT for the
+    whole grace window; UI_TO_CORE maps RECONNECTING back to CORE_FAULT so the
+    wire view stays truthful, and the mirror owns downgrading that FAULT for
+    display.
 ------------------------------------------------------------------------]]--
 
 local M = {}
@@ -148,9 +173,13 @@ function Hsm:reject_open()
     if self.state ~= M.STATE_OPENING then
         return false
     end
-    self.state = self._return_to or M.STATE_CLOSED
-    self.effective = self.state
-    self.faulted = self.state ~= M.STATE_CLOSED
+    -- Consume the rollback target: a returned-to state must never be reused by
+    -- a later, unrelated reject (which would roll back into a stale state).
+    local return_to = self._return_to or M.STATE_CLOSED
+    self._return_to = nil
+    self.state = return_to
+    self.effective = return_to
+    self.faulted = return_to ~= M.STATE_CLOSED
     return true
 end
 
@@ -161,9 +190,12 @@ function Hsm:reject_close()
     if self.state ~= M.STATE_CLOSING then
         return false
     end
-    self.state = self._return_to or M.STATE_FAULT
-    self.effective = self.state
-    self.faulted = self.state ~= M.STATE_OPEN
+    -- Consume the rollback target (see reject_open).
+    local return_to = self._return_to or M.STATE_FAULT
+    self._return_to = nil
+    self.state = return_to
+    self.effective = return_to
+    self.faulted = return_to ~= M.STATE_OPEN
     return true
 end
 
@@ -255,8 +287,19 @@ function Hsm:on_port_state(core_state, generation)
                generation <= self.generation then
                 return false
             end
-            if state == M.STATE_OPENING or state == M.STATE_OPEN or
-               state == M.STATE_CLOSING then
+            if generation > self.generation then
+                -- Resync boundary: the core advanced a whole round the mirror
+                -- never observed, so the previous session's rollback target is
+                -- worthless.  Drop it (and the fault flag), but KEEP the grace
+                -- window: a recovery candidate must go on latching until
+                -- settle_recovering() commits it.  Exiting RECONNECTING here
+                -- would destroy the recovery design (the driver's own reset ->
+                -- reopen sequence advances the generation on every step), so
+                -- the window is deliberately not torn down on generation alone.
+                self._return_to = nil
+                self.faulted = false
+            elseif state == M.STATE_OPENING or state == M.STATE_OPEN or
+                   state == M.STATE_CLOSING then
                 self.faulted = false
             end
             if generation == self.generation and state == self.effective then
@@ -269,12 +312,25 @@ function Hsm:on_port_state(core_state, generation)
         if generation == self.generation then
             return false
         end
+        -- A strictly newer generation still reporting FAULT: keep the window
+        -- alive, but drop the previous session's rollback target.
+        self._return_to = nil
         self.generation = generation
         return true
     end
     if state == self.state and state == self.effective and
        generation == self.generation then
         return false
+    end
+    if generation > self.generation then
+        -- Strictly newer generation: the core completed a whole open/close
+        -- round (both advance the generation) that the mirror never observed.
+        -- Nothing local survives that boundary -- clear the pending rollback
+        -- target and the fault flag, then take the core's state as both the
+        -- mirror's own and the effective one.  A greater-generation FAULT
+        -- therefore still lands on FAULT.
+        self._return_to = nil
+        self.faulted = false
     end
     self.generation = generation
     self.state = state
@@ -314,7 +370,26 @@ function M.new()
     return setmetatable({
         hsm = M.new_hsm(),
         snapshot = { port_state = CORE_CLOSED, generation = 0 },
+        -- Presence of the SELECTED port in the current enumeration.  Orthogonal
+        -- to the port state machine (same reasoning as the health axis, design
+        -- §4.1): it is NOT a state, is not in ALLOWED_OPEN/ALLOWED_CLOSE, and
+        -- can never force a close or override an active OPEN.  Its only effect
+        -- is to withhold the Open button for a port the UI knows is absent.
+        -- Default true so a caller that never enumerates keeps the pure
+        -- port-state interlock.
+        port_present = true,
     }, ViewModel)
+end
+
+-- Orthogonal presence input (USB plug/unplug, MCU power, re-enumeration).
+-- Returns true only when the value changed, so the caller can re-render once.
+function ViewModel:set_port_present(present)
+    present = present and true or false
+    if self.port_present == present then
+        return false
+    end
+    self.port_present = present
+    return true
 end
 
 -- Build the current immutable-ish render-state table.
@@ -326,8 +401,13 @@ function ViewModel:ui_state()
         state = state,
         super_state = parent,
         snapshot = self.snapshot,
+        port_present = self.port_present,
         params_enabled = parent == M.SUPER_OFFLINE,
-        open_enabled = self.hsm:can_open(),
+        -- Open additionally requires presence: never offer Open for a port the
+        -- enumeration no longer lists.  Presence only ever gates THIS flag --
+        -- close_enabled/send_enabled stay purely state-derived, so a vanished
+        -- port can never force a close or cut an OPEN session.
+        open_enabled = self.hsm:can_open() and self.port_present,
         close_enabled = self.hsm:can_close(),
         send_enabled = online,
         autosend_enabled = online,
@@ -367,7 +447,20 @@ function ViewModel:on_snapshot(snap)
     if same_snapshot and not state_changed then
         return false
     end
-    self.snapshot = snap
+    -- Copy into the OWN retained table instead of aliasing `snap`.  xcom_ffi's
+    -- get_snapshot hands out a reused module-level buffer (a fresh table per
+    -- 250 ms tick was pure GC churn), so retaining `snap` by reference would let
+    -- the next poll overwrite the "previous" values in place and silently
+    -- disable this very diff.  The copy runs only on an actual change, so
+    -- unchanged ticks allocate nothing.  Stale keys are dropped first so a
+    -- subset snapshot (tests) does not leave fields from an earlier one.
+    local retained = self.snapshot
+    for k in pairs(retained) do
+        if snap[k] == nil then retained[k] = nil end
+    end
+    for k, v in pairs(snap) do
+        retained[k] = v
+    end
     return true
 end
 

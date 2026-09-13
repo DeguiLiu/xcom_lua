@@ -29,10 +29,14 @@ target_include_directories(xcom_imgui PRIVATE
 )
 target_compile_definitions(xcom_imgui PRIVATE WIN32_LEAN_AND_MEAN)
 if(MSVC)
+    # /W4 added for the same reason as xcom_core: this target compiles code and
+    # owns its own warning level. Deliberately no /WX (no Windows CI runs MSVC
+    # here, so a fatal warning is an unverifiable build break) and no
+    # /GR- /EHs-c- (the ABI this bridge links uses try/catch; /EHsc stays).
     # /utf-8: the bridge sources contain UTF-8 comments (em-dash, middle dot).
     # Without it MSVC decodes them as CP936 and emits C4819, which can
     # misparse a trailing byte as a line-continuation backslash.
-    target_compile_options(xcom_imgui PRIVATE /EHsc /utf-8)
+    target_compile_options(xcom_imgui PRIVATE /W4 /EHsc /utf-8)
 endif()
 target_link_libraries(xcom_imgui PRIVATE d3d11 dxgi gdi32 user32 imm32)
 set_target_properties(xcom_imgui PROPERTIES PREFIX "")

@@ -1,5 +1,5 @@
 --[[--------------------------------------------------------------------------
-core/xcom_ffi.lua - LuaJIT FFI binding for xcom_core.dll (xcom.h v1.5 ABI).
+core/xcom_ffi.lua - LuaJIT FFI binding for xcom_core.dll (xcom.h v1.6 ABI).
 
 This module ONLY declares the C ABI and loads the DLL.  It is not callable on
 Linux (no xcom_core.dll); use `luajit -bl` for syntax checking and review the
@@ -81,6 +81,8 @@ typedef struct XcomSnapshot {
     uint32_t rx_sequence;
     uint32_t rx_loss_offset;
     uint32_t rx_backpressure_events;
+    /* v1.6 flow-control stall counter (appended; must match xcom.h) */
+    uint32_t flow_hold_events;
 } XcomSnapshot;
 
 typedef struct XcomError {
@@ -96,6 +98,9 @@ typedef struct XcomPortInfo {
     char description[256];
     uint8_t busy;
     uint8_t _pad[3];
+    /* v1.6 stable PnP hardware id (SPDRP_HARDWAREID first string), or "" for a
+       port that exposes none. Appended after _pad; must match xcom.h. */
+    char hardware_id[96];
 } XcomPortInfo;
 
 uint32_t xcom_version(void);
@@ -114,6 +119,13 @@ XcomStatus xcom_set_auto_template(void* h, const uint8_t* data, uint32_t size,
                                   uint32_t interval_ms, uint32_t flags);
 XcomStatus xcom_drain_display(void* h, char* output, uint32_t capacity,
                               uint32_t* written);
+/* Same batch semantics as xcom_drain_display, but returns the byte count
+   directly and back-fills the batch's EARLIEST ingress time (monotonic ms)
+   through out_ingress_ms.  Declared so a newer xcom_core.dll is usable; the
+   accessor probes for the symbol at call time (an older DLL lacks it) and
+   falls back to the legacy drain. */
+uint32_t xcom_drain_display_ts(void* h, char* output, uint32_t capacity,
+                               uint32_t* out_ingress_ms);
 XcomStatus xcom_get_snapshot(void* h, XcomSnapshot* output);
 XcomStatus xcom_take_error(void* h, XcomError* output);
 XcomStatus xcom_log_open(void* h, const char* utf8_path, uint8_t append);
@@ -216,11 +228,11 @@ function M.probe_enabled_by_env()
 end
 
 -- ABI version this binding is built against.  Keep in step with xcom.h's
--- XCOM_VERSION_MAJOR/MINOR/PATCH: the cdef below already declares the v1.5
--- fields and the size pins assert the v1.5 layout, so a stale value here would
+-- XCOM_VERSION_MAJOR/MINOR/PATCH: the cdef below already declares the v1.6
+-- fields and the size pins assert the v1.6 layout, so a stale value here would
 -- make any future capability gate under-report the loaded DLL.
 M.version_major = 1
-M.version_minor = 5
+M.version_minor = 6
 M.version_patch = 0
 
 -- VERSION: (major << 16) | (minor << 8) | patch, as returned by xcom_version().
@@ -263,6 +275,7 @@ local lib
 local loaded = false
 local display_scratch
 local display_written
+local display_ingress
 function M.load()
     if loaded then
         return lib
@@ -330,6 +343,7 @@ M.typeof = tc
 -- Buffers sized to the ABI's fixed arrays.
 M.PORT_INFO_CAP = 64           -- XcomPortInfo.name
 M.PORT_DESC_CAP = 256          -- XcomPortInfo.description
+M.PORT_HWID_CAP = 96           -- XcomPortInfo.hardware_id (v1.6)
 M.ERROR_MESSAGE_CAP = 256      -- XcomError.message
 M.MAX_PORT_LIST = 32           -- we enumerate at most this many ports per call
 
@@ -353,9 +367,14 @@ function M.create()
 end
 
 --[[-------------------------------------------------------------------------
-list_ports(opts) -> list of {name=, description=, busy=}, native_error
+list_ports(opts) -> list of {name=, description=, busy=, hardware_id=}, native_error
 Enumeration helper.  Calls the ABI with a bounded buffer; on insufficient
 capacity it retries once with a larger buffer sized by the returned count.
+
+Each entry carries `hardware_id` (v1.6): the bridge's stable PnP identity, or ""
+when the port exposes none (composite/virtual ports) or an older 1.5 DLL wrote
+only the legacy fields. Callers use it as the reconnect key and fall back to
+`description` matching when it is empty.
 
 Returns a second value, `native_error`, when the core could not read the
 registry port list (nil on success or on the legacy path). A DLL/symbol/ABI
@@ -415,14 +434,100 @@ function M.list_ports(opts)
             name = ffi.string(arr[i].name),
             description = ffi.string(arr[i].description),
             busy = arr[i].busy ~= 0,
+            -- v1.6 stable identity; "" when the DLL/PnP path has none, so the
+            -- caller can fall back to description matching.
+            hardware_id = ffi.string(arr[i].hardware_id),
         }
     end
     return ports, enum_error
 end
 
 --[[-------------------------------------------------------------------------
+Open-time modem-line tri-state (mirror xcom.h XCOM_LINE_*).  These describe
+what xcom_open()/xcom_open_async() do to DTR/RTS AT OPEN and are distinct from
+the runtime set_lines() booleans below: LEAVE_ALONE is only meaningful at open,
+where the backend issues no EscapeCommFunction for that line.
+------------------------------------------------------------------------]]--
+M.line_deassert = 0
+M.line_assert = 1
+M.line_leave_alone = 2
+
+--[[-------------------------------------------------------------------------
+line_tristate(value) -> 0 | 1 | 2
+Normalise an open-time line value.  Boolean callers keep the historical
+meaning (true -> assert, false/nil -> deassert); a number passes through
+unchanged, so XCOM_LINE_LEAVE_ALONE (2) is NOT collapsed to 1 the way the old
+`dtr and 1 or 0` did.  Out-of-range numbers pass through too, letting the core
+reject them with XCOM_ERR_PARAM instead of silently clamping.
+------------------------------------------------------------------------]]--
+function M.line_tristate(value)
+    if value == true then
+        return M.line_assert
+    end
+    if value == false or value == nil then
+        return M.line_deassert
+    end
+    return value
+end
+
+--[[-------------------------------------------------------------------------
+Open-time modem-line UI contract, shared by the ImGui combo (native
+xcom_imgui_bridge.cpp), the legacy Win32 combo (ui/window.lua) and the tests.
+The item order is fixed by the ABI enum, so a combo index IS its XCOM_LINE_*
+value: index 0 = deassert, 1 = assert, 2 = leave alone.
+------------------------------------------------------------------------]]--
+M.OPEN_LINE_ITEMS = { "Deassert", "Assert", "Leave alone" }
+
+--[[-------------------------------------------------------------------------
+line_from_ui_index(index) -> 0 | 1 | 2
+
+Normalise a UI combo index (or any persisted value) to a valid XCOM_LINE_*
+constant.  A boolean is still accepted (true -> assert, false -> deassert), and
+anything missing or out of range falls back to XCOM_LINE_LEAVE_ALONE, the safe
+default that does not drive the pin — so a stale config or an unselected combo
+can never pulse a target's reset/BOOT line.
+------------------------------------------------------------------------]]--
+function M.line_from_ui_index(index)
+    if index == true then
+        return M.line_assert
+    end
+    if index == false then
+        return M.line_deassert
+    end
+    local value = tonumber(index)
+    if value ~= M.line_deassert and value ~= M.line_assert and
+       value ~= M.line_leave_alone then
+        return M.line_leave_alone
+    end
+    return value
+end
+
+--[[-------------------------------------------------------------------------
+open_line_default(value, legacy_value) -> 0 | 1 | 2
+
+Resolve a persisted open-time line setting.  An explicit valid value wins (so a
+stored LEAVE_ALONE is never collapsed); otherwise migrate the legacy boolean
+(true -> assert, false -> deassert) an older config carried under the runtime
+dtr_enable/rts_enable key; otherwise fall back to LEAVE_ALONE, the safe default
+that does not drive the pin.  Pure, so main.lua and the tests share it without
+the DLL.
+------------------------------------------------------------------------]]--
+function M.open_line_default(value, legacy_value)
+    if value ~= nil then
+        return M.line_from_ui_index(value)
+    end
+    if legacy_value ~= nil then
+        return M.line_from_ui_index(legacy_value)
+    end
+    return M.line_leave_alone
+end
+
+--[[-------------------------------------------------------------------------
 open(h, port, baud, data_bits, stop_bits, parity, flow, dtr, rts) -> status
 Helper that builds the XcomPortConfig and forwards to xcom_open.
+`dtr` and `rts` are the open-time tri-state: 0 = deassert, 1 = assert,
+2 = leave the line alone.  A boolean is still accepted (true = 1, false = 0)
+for backward compatibility; see line_tristate().
 ------------------------------------------------------------------------]]--
 function M.open(h, port, baud, data_bits, stop_bits, parity, flow, dtr, rts)
     local cfg = tc.port_config()
@@ -433,17 +538,17 @@ function M.open(h, port, baud, data_bits, stop_bits, parity, flow, dtr, rts)
     cfg.stop_bits = stop_bits
     cfg.parity = parity
     cfg.flow_control = flow
-    cfg.dtr_enable = dtr and 1 or 0
-    cfg.rts_enable = rts and 1 or 0
+    cfg.dtr_enable = M.line_tristate(dtr)
+    cfg.rts_enable = M.line_tristate(rts)
     return M.open_c(h, cfg)
 end
 
 --[[-------------------------------------------------------------------------
 open_async(h, ...) -> status
-Same config contract as open(), but queues the open and returns immediately.
-XCOM_OK means the request was queued (NOT that the port is open); a non-OK
-value is an immediate failure a synchronous open would also have returned.
-Poll completion with take_open_result().
+Same config contract as open(), including the tri-state dtr/rts, but queues
+the open and returns immediately.  XCOM_OK means the request was queued (NOT
+that the port is open); a non-OK value is an immediate failure a synchronous
+open would also have returned.  Poll completion with take_open_result().
 ------------------------------------------------------------------------]]--
 function M.open_async(h, port, baud, data_bits, stop_bits, parity, flow, dtr, rts)
     local cfg = tc.port_config()
@@ -454,8 +559,8 @@ function M.open_async(h, port, baud, data_bits, stop_bits, parity, flow, dtr, rt
     cfg.stop_bits = stop_bits
     cfg.parity = parity
     cfg.flow_control = flow
-    cfg.dtr_enable = dtr and 1 or 0
-    cfg.rts_enable = rts and 1 or 0
+    cfg.dtr_enable = M.line_tristate(dtr)
+    cfg.rts_enable = M.line_tristate(rts)
     return M.open_async_c(h, cfg)
 end
 
@@ -560,44 +665,88 @@ function M.drain_display(h, capacity)
 end
 
 --[[-------------------------------------------------------------------------
-get_snapshot(h) -> XcomSnapshot or nil  (assumes caller keeps handle alive)
-Returns a fresh Lua table snapshot for the status bar / UI.
+drain_display_ts(h, capacity) -> (status, text_or_nil, ingress_ms, supported)
 
-The FFI struct behind it is a module-level scratch buffer, not a per-call
-allocation: this runs on every 250 ms status poll, and allocating a cdata for
-each tick just fed the GC. The returned *table* is still freshly allocated —
-ViewModel:on_snapshot retains it and diffs it field-by-field against the
-previous one, so handing out a shared table would silently break every
-change detection downstream.
+Timestamp-aware display drain.  A newer DLL exports xcom_drain_display_ts,
+whose return value is the byte count and whose 4th argument receives the
+batch's earliest ingress time (monotonic ms).  On an older DLL — or no DLL —
+the symbol is absent: fall back to the legacy drain and report supported=false,
+so the caller DISABLES gap stamping rather than stamping the wrong clock
+(design §3).  A zero-byte batch returns supported=true with no ingress value;
+the previous anchor is left untouched, exactly like xcom_drain_display_ts.
+------------------------------------------------------------------------]]--
+function M.drain_display_ts(h, capacity)
+    local l = M.load()
+    local fn
+    if l then
+        -- Symbol lookup on a declared-but-absent export RAISES in LuaJIT, so
+        -- probe with pcall instead of a plain nil comparison.
+        local ok, sym = pcall(function() return l.xcom_drain_display_ts end)
+        if ok then fn = sym end
+    end
+    if fn == nil then
+        local rc, text = M.drain_display(h, capacity)
+        return rc, text, nil, false
+    end
+    local cap = capacity or 65536
+    if not display_scratch or display_scratch.capacity < cap then
+        display_scratch = { capacity = cap, data = ffi.new("char[?]", cap) }
+    end
+    if not display_ingress then
+        display_ingress = ffi.new("uint32_t[1]")
+    end
+    local n = fn(h, display_scratch.data, display_scratch.capacity,
+                 display_ingress)
+    if n == 0 then
+        return M.ok, nil, nil, true
+    end
+    return M.ok, ffi.string(display_scratch.data, n), display_ingress[0], true
+end
+
+--[[-------------------------------------------------------------------------
+get_snapshot(h) -> XcomSnapshot or nil  (assumes caller keeps handle alive)
+Returns a snapshot table for the status bar / UI.
+
+Both the FFI struct AND the returned plain table are module-level scratch
+buffers, not per-call allocations: this runs on every 250 ms status poll, and a
+fresh ~19-field table per tick fed the GC even when nothing changed.
+
+OWNERSHIP CONTRACT: the returned table is reused by the next get_snapshot call,
+so callers must consume it BEFORE the next poll and must NOT retain it.
+ViewModel:on_snapshot copies the fields it keeps into its own persistent table
+(see view_model.lua), which is what makes the reused buffer safe for the
+retain-and-diff consumer.
 ------------------------------------------------------------------------]]--
 local snapshot_scratch = tc.snapshot()
+local snapshot_table = {}
 function M.get_snapshot(h)
     local s = snapshot_scratch
     s.struct_size = ffi.sizeof(tc.snapshot)
     if M.get_snapshot_c(h, s) ~= M.ok then
         return nil
     end
-    return {
-        rx_bytes = s.rx_bytes,
-        tx_bytes = s.tx_bytes,
-        rx_pool_exhausted_bytes = s.rx_pool_exhausted_bytes,
-        tx_rejected = s.tx_rejected,
-        auto_tick_coalesced = s.auto_tick_coalesced,
-        ui_trimmed_bytes = s.ui_trimmed_bytes,
-        save_rejected_bytes = s.save_rejected_bytes,
-        display_paused_bytes = s.display_paused_bytes,
-        callback_count = s.callback_count,
-        generation = s.generation,
-        display_pending = s.display_pending,
-        port_state = s.port_state,
-        framing_errors = s.framing_errors,
-        parity_errors = s.parity_errors,
-        overrun_errors = s.overrun_errors,
-        break_events = s.break_events,
-        rx_sequence = s.rx_sequence,
-        rx_loss_offset = s.rx_loss_offset,
-        rx_backpressure_events = s.rx_backpressure_events,
-    }
+    local t = snapshot_table
+    t.rx_bytes = s.rx_bytes
+    t.tx_bytes = s.tx_bytes
+    t.rx_pool_exhausted_bytes = s.rx_pool_exhausted_bytes
+    t.tx_rejected = s.tx_rejected
+    t.auto_tick_coalesced = s.auto_tick_coalesced
+    t.ui_trimmed_bytes = s.ui_trimmed_bytes
+    t.save_rejected_bytes = s.save_rejected_bytes
+    t.display_paused_bytes = s.display_paused_bytes
+    t.callback_count = s.callback_count
+    t.generation = s.generation
+    t.display_pending = s.display_pending
+    t.port_state = s.port_state
+    t.framing_errors = s.framing_errors
+    t.parity_errors = s.parity_errors
+    t.overrun_errors = s.overrun_errors
+    t.break_events = s.break_events
+    t.rx_sequence = s.rx_sequence
+    t.rx_loss_offset = s.rx_loss_offset
+    t.rx_backpressure_events = s.rx_backpressure_events
+    t.flow_hold_events = s.flow_hold_events
+    return t
 end
 
 --[[-------------------------------------------------------------------------
@@ -642,9 +791,9 @@ local SIZEOF = {
     create_options   = 8,
     port_config      = 32,
     display_options  = 16,
-    snapshot         = 80,
+    snapshot         = 84,
     error            = 268,
-    port_info        = 324,
+    port_info        = 420,
 }
 M.SIZEOF = SIZEOF
 

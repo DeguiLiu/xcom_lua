@@ -135,14 +135,21 @@ function M.combo_text(ctl, index)
     return ffi.string(buf)
 end
 
-function M.combo_set(ctl, items)
+function M.combo_set(ctl, items, sel)
     w.user32.SendMessageA(ctl.hwnd, w.cb.CB_RESETCONTENT, 0, 0)
     for _, it in ipairs(items or {}) do
         w.user32.SendMessageA(ctl.hwnd, w.cb.CB_ADDSTRING, 0,
                               ffi.cast("LPARAM", it))
     end
-    -- default to the first item (matching the Python client's initial state).
-    w.user32.SendMessageA(ctl.hwnd, w.cb.CB_SETCURSEL, 0, 0)
+    -- Reset-content clears the selection, so the caller must supply one.  The
+    -- pre-existing callers pass nothing and keep the historical "default to the
+    -- first item" behaviour.  A caller that preserves a user's live choice MUST
+    -- pass the index explicitly: letting a refresh land on index 0 silently
+    -- retargets the next Open to a different device.  `sel == -1` leaves the
+    -- dropdown list explicitly unselected (there is no valid item), which is
+    -- the honest state when the chosen port is no longer enumerated.
+    w.user32.SendMessageA(ctl.hwnd, w.cb.CB_SETCURSEL,
+                          sel == nil and 0 or sel, 0)
 end
 
 function M.combo_count(ctl)

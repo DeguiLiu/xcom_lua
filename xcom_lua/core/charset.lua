@@ -306,7 +306,14 @@ function M.flush()
     if current_cp == nil then return held end
     if not kernel32 then return held end
     if current_cp == "utf16" then
-        return utf16_to_utf8(held) or held
+        -- utf16_to_utf8() re-arms `pending` for an odd trailing byte or a lone
+        -- high surrogate; at flush there is no next batch to pair with, so it
+        -- must not survive.  Without this reset a reconnect boundary would
+        -- still leak the orphan into the next session's first bytes, defeating
+        -- the whole point of flushing.
+        local out = utf16_to_utf8(held)
+        pending = ""
+        return out or held
     end
     local cp = current_cp
     local needed = kernel32.MultiByteToWideChar(cp, 0, held, #held, nil, 0)

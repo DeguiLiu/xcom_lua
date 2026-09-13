@@ -49,6 +49,9 @@ M.ofn = {
     OFN_PATHMUSTEXIST = 0x00000800,
     OFN_FILEMUSTEXIST = 0x00001000,
     OFN_EXPLORER = 0x00080000,
+    -- Installs lpfnHook, which is what keeps the luv receive drain alive
+    -- inside the dialog's own modal message loop (Window:_ensure_ofn_hook).
+    OFN_ENABLEHOOK = 0x00000020,
 }
 
 M.style = {
@@ -180,6 +183,18 @@ M.wm = {
     WM_NCLBUTTONDBLCLK = 0x00A3,
     WM_NCRBUTTONUP = 0x00A7,
     WM_QUIT = 0x0012,
+    -- Broadcast to every top-level window when the device tree changes; see
+    -- M.dbt for the wParam values (only DEVNODES_CHANGED is needed here).
+    WM_DEVICECHANGE = 0x0219,
+}
+
+-- WM_DEVICECHANGE wParam values (WinUser.h DBT_*).  DBT_DEVNODES_CHANGED is
+-- broadcast to all top-level windows on ANY device-node addition/removal, so a
+-- USB plug/unplug or a USB-CDC MCU powering up/down is seen without calling
+-- RegisterDeviceNotification (that is only needed for the more specific
+-- DBT_DEVTYP_* interface/volume events, which we do not handle).
+M.dbt = {
+    DBT_DEVNODES_CHANGED = 0x0007,
 }
 
 M.ht = {
@@ -537,6 +552,11 @@ int WideCharToMultiByte(UINT codePage, DWORD flags, const unsigned short* src,
                         BOOL* usedDefChar);
 
 // Common Item Dialog (comdlg32) — save dialog.
+// OFN_ENABLEHOOK hook proc, the same shape as LPOFNHOOKPROC in commdlg.h
+// (UINT_PTR return, __stdcall).  window.lua installs one via lpfnHook so the
+// luv receive drain keeps running while the dialog's modal message loop owns
+// the UI thread; see Window:_ensure_ofn_hook for why that is not optional.
+typedef uintptr_t (__stdcall *OFNHookProc)(HWND, UINT, WPARAM, LPARAM);
 typedef struct {
     DWORD lStructSize;
     HWND hwndOwner;
@@ -556,7 +576,7 @@ typedef struct {
     unsigned short nFileExtension;
     LPCWSTR lpstrDefExt;
     LPARAM lCustData;
-    void* lpfnHook;
+    OFNHookProc lpfnHook;
     LPCWSTR lpTemplateName;
 } OPENFILENAMEW;
 BOOL GetSaveFileNameW(OPENFILENAMEW* lpofn);
@@ -610,7 +630,7 @@ HINSTANCE ShellExecuteW(HWND hwnd, LPCWSTR lpOperation, LPCWSTR lpFile,
 -- ---------------------------------------------------------------------------
 -- Module-level lazy loaders (Windows DLL symbol resolution).
 -- ---------------------------------------------------------------------------
-local user32, gdi32, kernel32, shell32, comctl32, comdlg32, riched20
+local user32, gdi32, kernel32, shell32, comctl32, comdlg32, riched20, winmm
 
 local function is_windows()
     return package.config:sub(1, 1) == "\\"
@@ -721,15 +741,25 @@ end
 
 local SW_SHOWNORMAL = 1
 
--- Open a directory (or file) with its registered handler, without blocking the
--- message pump.  Returns true when the shell accepted the request.
+-- Open a DIRECTORY with its registered handler.  Returns true when the shell
+-- accepted the request.
 --
--- ShellExecuteW hands the verb to the shell and returns immediately; it does
--- NOT wait for Explorer to finish.  Building a command string for
--- os.execute('start "" "..."') instead would block the UI thread until the
--- spawned process exited, and it interpolates the path into a command line,
--- so any quote or metacharacter in it became shell syntax.  Passing the path
--- as a wide-string argument keeps it data, not code.
+-- Directories only, and that restriction IS the safety argument: a directory
+-- always has explorer as its handler, so no association lookup happens and none
+-- of the cases where ShellExecuteW BLOCKS this thread can arise.  Those cases
+-- are real, so respect them if this helper is ever pointed at a file: an
+-- unassociated extension raises the "How do you want to open this file?"
+-- picker, a DDE handler waits for its handshake, an elevated target waits on
+-- the secure-desktop prompt, and a disconnected network path or an unresolved
+-- shortcut can stall for tens of seconds.  Any of those would freeze the
+-- message loop and, with it, the receive drain - the same thread here is the
+-- one draining serial data.  If a file ever has to be opened, do NOT reuse this
+-- helper: run the shell call off the UI thread instead.
+--
+-- The alternative it replaced, os.execute('start "" "..."'), was worse on two
+-- counts: it blocked until the spawned process exited, and it interpolated the
+-- path into a command line, so any quote or metacharacter in it became shell
+-- syntax.  Passing the path as a wide-string argument keeps it data, not code.
 function M.open_folder(path)
     if not path or path == "" then
         return false
@@ -744,53 +774,6 @@ function M.open_folder(path)
     local result = ffi.cast("intptr_t",
         M.shell32.ShellExecuteW(nil, "open", wide, nil, nil, SW_SHOWNORMAL))
     return result > 32
-end
-
--- Run a program without blocking the message pump.
---
--- This is the replacement for os.execute/io.popen on every path that can run
--- on the UI thread.  libuv forks and reaps the child off the main thread, so
--- the loop keeps pumping and on_exit lands in the normal P1 timer pass;
--- os.execute instead blocks the calling thread until the child exits, and on
--- this app that thread is the one drawing the window.
---
--- `argv` is an array of arguments, not a command line: each element reaches
--- the child as exactly one argument, so a path containing a quote or a space
--- needs no escaping and cannot turn into shell syntax.  To run a batch file,
--- name cmd.exe explicitly and pass {"/c", script, args...}.
---
--- stdio follows luv's contract: a 3-element array of nil (use the parent's),
--- an integer file descriptor, or a uv_stream_t.  Passing a stream for
--- stdout/stderr and reading it is the async equivalent of io.popen.
---
--- Returns the uv process handle plus its pid on success, or nil, err.  The
--- caller may keep the handle to call :kill(); it is unref'd so a still-running
--- child never by itself keeps the loop alive.
-function M.spawn_async(argv, opts)
-    if type(argv) ~= "table" or argv[1] == nil then
-        return nil, "argv required"
-    end
-    local ok, uv = pcall(require, "luv")
-    if not ok or uv == nil then
-        return nil, "luv unavailable"
-    end
-    opts = opts or {}
-    local args = { unpack(argv, 2) }
-    -- luv expects stdio positionally; a hole means "inherit from the parent".
-    local stdio = opts.stdio or { nil, nil, nil }
-    local handle, pid_or_err = uv.spawn(argv[1], {
-        args = args,
-        cwd = opts.cwd,
-        env = opts.env,
-        stdio = stdio,
-        detached = opts.detached or false,
-        hide = opts.hide ~= false,
-    }, opts.on_exit)
-    if not handle then
-        return nil, pid_or_err
-    end
-    handle:unref()
-    return handle, pid_or_err
 end
 
 return M
