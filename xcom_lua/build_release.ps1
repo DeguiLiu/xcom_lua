@@ -180,11 +180,39 @@ if (Test-Path -LiteralPath $vcRedist) {
 # <runtime>/luvjit.exe and <root>/main.ljbc relative to its own dir).
 
 # ---- sanity gates ----
+# 0. Version agreement: the launcher exe must report the version this package is
+#    named after. The number is compiled into xcom.exe from CMakeLists.txt's
+#    project() VERSION, so a package built from a stale xcom.exe (or assembled
+#    with -Version overriding the CMake value) ships a zip whose name
+#    contradicts the executable inside it. This is not hypothetical: v1.4.5 once
+#    shipped carrying a 1.4.0 launcher. Rebuild (cmake --preset native-release)
+#    after editing the CMake version — copying a DLL does not refresh the exe.
+$exeVersion = (Get-Item -LiteralPath (Join-Path $rt "xcom.exe")).VersionInfo.FileVersion
+if ($exeVersion -ne $Version) {
+    throw ("xcom.exe reports version '$exeVersion' but this package is '$Version'. " +
+           "Update project(XCOM VERSION ...) in CMakeLists.txt and rebuild: " +
+           "cmake --preset native-release; cmake --build --preset build-native-release")
+}
+Write-Host "version gate OK (xcom.exe = $exeVersion)"
+
 # 1. DLL freshness: imgui DLL must be the build output, not a stale copy.
 $built = Get-Item (Join-Path $root "native\xcom_imgui\build\xcom_imgui.dll")
 $shipped = Get-Item (Join-Path $rt "xcom_imgui.dll")
 if ($shipped.LastWriteTime -lt $built.LastWriteTime) {
     throw "xcom_imgui.dll in runtime is OLDER than build output — copy build/xcom_imgui.dll to runtime first"
+}
+# 1b. Same freshness rule for the core DLL. Unlike the imgui one it has no
+#     source-tree build output to compare against at this path, so compare
+#     against the preset's conan-free build dir when it exists.
+$coreBuilt = Join-Path $root "../build/native-release/bin/xcom_core.dll"
+if (Test-Path -LiteralPath $coreBuilt) {
+    $coreShipped = Join-Path $rt "xcom_core.dll"
+    $sizeBuilt = (Get-Item -LiteralPath $coreBuilt).Length
+    $sizeShipped = (Get-Item -LiteralPath $coreShipped).Length
+    if ($sizeBuilt -ne $sizeShipped) {
+        throw ("xcom_core.dll in runtime ($sizeShipped B) differs from the build output " +
+               "($sizeBuilt B) — copy build/native-release/bin/xcom_core.dll to runtime first")
+    }
 }
 # 2. layout.toml must carry the zh language line (DLL reads runtime/assets copy).
 $layout = Get-Content -LiteralPath (Join-Path $rt "assets\layout.toml") -Raw

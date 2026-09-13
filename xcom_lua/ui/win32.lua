@@ -110,6 +110,14 @@ M.image = {
 -- Icon resource id in the launcher (.rc: `IDI_APP ICON "xcom.ico"`).
 M.IDI_APP = 1
 
+-- Load the launcher exe as a data file purely to read its icon resource. The
+-- window belongs to the interpreter process, so GetModuleHandleA(NULL) returns
+-- luvjit.exe — whose resources hold no IDI_APP — and the taskbar fell back to
+-- the generic application icon. Mapping xcom.exe lets LoadIconA find the real
+-- one without executing it.
+M.LOAD_LIBRARY_AS_DATAFILE = 0x00000002
+M.LOAD_LIBRARY_AS_IMAGE_RESOURCE = 0x00000020
+
 -- Standard fallback so a window always gets SOME icon: IDI_APPLICATION is a
 -- predefined resource, so LoadIconA resolves it without any file or module.
 M.IDI_APPLICATION = 32512
@@ -509,6 +517,7 @@ ATOM RegisterClassA(WNDCLASSA* pWndClass);
 void* LoadImageA(HINSTANCE hInst, const char* name, UINT type,
                  int cx, int cy, UINT fuLoad);
 HICON LoadIconA(HINSTANCE hInst, const char* name);
+HINSTANCE LoadLibraryExA(const char* lpLibFileName, HANDLE hFile, DWORD dwFlags);
 BOOL UnregisterClassA(LPCSTR lpClassName, HINSTANCE hInstance);
 void PostQuitMessage(int nExitCode);
 BOOL TranslateMessage(const MSG* lpMsg);

@@ -858,8 +858,30 @@ enum class UtilityIcon : std::uint8_t { Clear, Save, Path, Refresh };
     const ImVec2 center((minimum.x + maximum.x) * 0.5f,
                         (minimum.y + maximum.y) * 0.5f);
     if (icon == UtilityIcon::Clear) {
-        draw_list->AddLine(ImVec2(center.x - 6.0f, center.y - 6.0f), ImVec2(center.x + 6.0f, center.y + 6.0f), stroke, 1.8f);
-        draw_list->AddLine(ImVec2(center.x + 6.0f, center.y - 6.0f), ImVec2(center.x - 6.0f, center.y + 6.0f), stroke, 1.8f);
+        // Trash can, not a bare X.  A 1.8 px grey cross at the far right of the
+        // panel read as decoration — a user looking for "clear the receive
+        // area" reported the button as missing entirely.  The can silhouette
+        // (lid + body + rim) is unambiguous at this size and, unlike an X,
+        // cannot be mistaken for the window-close glyph in the header.
+        const float half = 6.0f;
+        // Lid.
+        draw_list->AddLine(ImVec2(center.x - half - 1.0f, center.y - half),
+                           ImVec2(center.x + half + 1.0f, center.y - half), stroke, 2.2f);
+        // Handle bump above the lid.
+        draw_list->AddLine(ImVec2(center.x - 2.0f, center.y - half - 3.5f),
+                           ImVec2(center.x + 2.0f, center.y - half - 3.5f), stroke, 2.0f);
+        // Body (slightly tapered: wider at the rim, narrower at the base).
+        draw_list->AddLine(ImVec2(center.x - half, center.y - half),
+                           ImVec2(center.x - half + 1.5f, center.y + half), stroke, 2.2f);
+        draw_list->AddLine(ImVec2(center.x + half, center.y - half),
+                           ImVec2(center.x + half - 1.5f, center.y + half), stroke, 2.2f);
+        draw_list->AddLine(ImVec2(center.x - half + 1.5f, center.y + half),
+                           ImVec2(center.x + half - 1.5f, center.y + half), stroke, 2.2f);
+        // Two ribs so the body reads as a container at a glance.
+        draw_list->AddLine(ImVec2(center.x - 2.0f, center.y - half + 2.0f),
+                           ImVec2(center.x - 2.0f, center.y + half - 2.0f), stroke, 1.6f);
+        draw_list->AddLine(ImVec2(center.x + 2.0f, center.y - half + 2.0f),
+                           ImVec2(center.x + 2.0f, center.y + half - 2.0f), stroke, 1.6f);
     } else if (icon == UtilityIcon::Save) {
         draw_list->AddRect(ImVec2(center.x - 6.0f, center.y - 7.0f), ImVec2(center.x + 6.0f, center.y + 7.0f), stroke, 1.8f);
         draw_list->AddLine(ImVec2(center.x - 4.0f, center.y - 4.0f), ImVec2(center.x + 4.0f, center.y - 4.0f), stroke, 1.8f);
@@ -1343,9 +1365,12 @@ bool QueueReceiveCopy(ImGuiRuntime& runtime, std::size_t begin_abs,
     // look).  A consistent per-line row height also keeps the clipper metric
     // stable regardless of glyph width.
     const bool mono_ok = runtime.mono_font_ != nullptr;
+    // Cleared when the mono scope is popped early (see the context-menu note
+    // below), so the scoped popper does not pop a font twice.
+    bool popped_mono = false;
     if (mono_ok) ImGui::PushFont(runtime.mono_font_);
-    const auto pop_mono = ScopedAction([mono_ok] {
-        if (mono_ok) ImGui::PopFont();
+    const auto pop_mono = ScopedAction([mono_ok, &popped_mono] {
+        if (mono_ok && !popped_mono) ImGui::PopFont();
     });
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0.0f, 0.0f));
     ImDrawList* const draw = ImGui::GetWindowDrawList();
@@ -1670,7 +1695,16 @@ bool QueueReceiveCopy(ImGuiRuntime& runtime, std::size_t begin_abs,
         }
     }
     ImGui::PopStyleVar();
-    // pop_mono is a ScopedAction: its destructor pops the font at scope exit.
+    // End the mono font scope HERE, before the context menu below. The mono
+    // data face carries only the default Latin ranges (the CJK merge is the
+    // opt-in "show Chinese in receive" switch), so any hanzi drawn while it is
+    // active renders as '?'. That is correct for log BYTES the user chose not
+    // to localize, but wrong for the menu's own chrome: its labels come from
+    // Lang and are always Chinese under [ui] language = "zh", so the menu
+    // showed "????" for every entry. The listener rebuilds the log glyphs on
+    // the next frame, so popping before the popup costs nothing. popped_mono
+    // keeps the ScopedAction from popping a second time at function exit.
+    if (mono_ok) { ImGui::PopFont(); popped_mono = true; }
     // Follow-tail pin, official pattern: only when the view was at the bottom
     // at the START of the frame, called after all rows are submitted so the
     // scroll range reflects the new content.  An IN-PROGRESS drag freezes the

@@ -673,22 +673,34 @@ Window._create_class = create_class
 --   3. the predefined IDI_APPLICATION, so the window always shows something
 --      rather than falling back to the generic blank frame.
 load_window_icon = function(w)
-    -- A NULL return is nil in LuaJIT (a null cdata compares equal to nil), so a
-    -- plain truthiness test is the correct "did this load?" check.
+    -- The window belongs to the interpreter process (the launcher spawns
+    -- luvjit.exe), so GetModuleHandleA(NULL) hands back luvjit.exe — which
+    -- carries no IDI_APP — and the taskbar showed the generic application
+    -- icon. Resolve the icon from the launcher exe beside this module
+    -- instead, mapped as a data file so it is read and not executed.
     local module = w.kernel32.GetModuleHandleA(nil)
-    local icon = w.user32.LoadIconA(module, ffi.cast("const char*", w.IDI_APP))
-    if icon then
-        return icon
-    end
-    -- Loose-file fallbacks. GetModuleFileNameA gives the running exe's path;
-    -- strip the file name to get its directory.
     local buf = ffi.new("char[?]", 1024)
     local n = w.kernel32.GetModuleFileNameA(module, buf, 1024)
+    local dir
     if n and n > 0 then
         local exe = ffi.string(buf, n)
-        local dir = exe:match("^(.*)[/\\][^/\\]*$") or "."
+        dir = exe:match("^(.*)[/\\][^/\\]*$") or "."
+        -- Module handle NULL means the exe is absent or unreadable; LoadIconA
+        -- then simply fails and we fall through to the loose-file sources.
+        local launcher = w.kernel32.LoadLibraryExA(dir .. "\\xcom.exe", nil,
+            w.LOAD_LIBRARY_AS_DATAFILE + w.LOAD_LIBRARY_AS_IMAGE_RESOURCE)
+        local icon = w.user32.LoadIconA(launcher, ffi.cast("const char*", w.IDI_APP))
+        if icon then
+            return icon
+        end
+    end
+    -- Loose-file fallbacks. GetModuleFileNameA gave the running exe's path;
+    -- strip the file name to get its directory.
+    if dir then
+        -- A NULL return is nil in LuaJIT (a null cdata compares equal to nil),
+        -- so a plain truthiness test is the correct "did this load?" check.
         for _, rel in ipairs({ "xcom.ico", "runtime\\xcom.ico" }) do
-            icon = w.user32.LoadImageA(nil, dir .. "\\" .. rel, w.image.ICON,
+            local icon = w.user32.LoadImageA(nil, dir .. "\\" .. rel, w.image.ICON,
                                        0, 0, w.image.LOAD_FROM_FILE +
                                        w.image.DEFAULT_SIZE)
             if icon then
@@ -1605,6 +1617,9 @@ function Window:core_open()
         return
     end
     if self.imgui then self.imgui:set_status("Opening " .. serial.port .. " ...") end
+    -- Remembered for poll_status's stalled-open notice: the OPENING branch is
+    -- the only place that can explain a request the core never resolved.
+    self._pending_port = serial.port
     -- SIM: remember the requested port so the connected edge (in
     -- _render_ui_state, where port_state is confirmed OPEN) can decide
     -- whether to arm the simulator pump.  Only ever consulted while
@@ -2305,6 +2320,14 @@ end
 -- driver retries) before the UI declares the open dead and faults back so the
 -- user can retry.
 local OPENING_TIMEOUT_MS = 5000
+
+-- How long an open may sit unresolved before the UI says so on the status bar.
+-- The core resolves an open in well under this; past it the request is either
+-- wedged (the owner never ran, so last_open_result stays BUSY forever and the
+-- error ring stays EMPTY) or the port is taking abnormally long to enumerate.
+-- Without this the user sees the button flip back and nothing else, because
+-- every existing reporter keys off a terminal result or a non-empty ring.
+local OPENING_SILENT_MS = 1000
 
 -- Close-side counterpart. The ABI close is synchronous, so the caller gives it
 -- only CLOSE_WAIT_MS: a healthy teardown confirms CLOSED on the first poll,
@@ -3264,12 +3287,30 @@ function Window:poll_status()
         -- with the port interlock frozen.
         if self._opening_deadline == nil then
             self._opening_deadline = uv.now() + OPENING_TIMEOUT_MS
+            self._opening_notice_at = uv.now() + OPENING_SILENT_MS
+        elseif self._opening_notice_at ~= nil and
+               uv.now() >= self._opening_notice_at then
+            -- The open is queued but the owner has not resolved it yet. Say so:
+            -- a wedged request leaves last_open_result at BUSY and the error
+            -- ring EMPTY, so no other reporter in this file has anything to
+            -- print, and the user is left with a button that blinked and a
+            -- status bar that never changed. Announced once (the anchor is
+            -- cleared) so a genuinely slow open does not spam the bar.
+            self._opening_notice_at = nil
+            if self.imgui then
+                self.imgui:set_status("Opening " .. tostring(self._pending_port or "")
+                    .. " ... not responding yet")
+            end
         elseif uv.now() >= self._opening_deadline and
                self.vm.hsm.state == self.vm.STATE_OPENING then
             self.vm:force_fault()
             self._opening_deadline = nil
+            self._opening_notice_at = nil
             if self.imgui then
-                self.imgui:set_status("Open timed out; check the port and parameters")
+                self.imgui:set_status("Open timed out after " ..
+                    tostring(math.floor(OPENING_TIMEOUT_MS / 1000)) ..
+                    "s: no response from the port. Check that it is present, " ..
+                    "not held by another program, and that the parameters fit")
             end
             self:_render_ui_state()
             return self:_poll_errors()
@@ -3300,6 +3341,7 @@ function Window:poll_status()
         -- Any state other than OPENING clears the watchdog anchor so the next
         -- open intent starts a fresh window.
         self._opening_deadline = nil
+        self._opening_notice_at = nil
     end
     if self.vm.hsm.state == self.vm.STATE_CLOSING then
         -- CLOSING watchdog, mirroring the OPENING one. xcom_close waits on the

@@ -9,7 +9,6 @@ LuaJIT + Dear ImGui 客户端（`xcom_lua`），支持异步文本/十六进制�
 ## 进程与线程拓扑
 
 ```mermaid
-%%{init: {'theme':'base','themeVariables':{'fontFamily':'monospace'}}}%%
 flowchart LR
   classDef proc fill:#E8F0FE,stroke:#2E5AAC,color:#111,stroke-width:1.5px
   classDef dll fill:#FDE9D9,stroke:#C55A11,color:#111
@@ -29,7 +28,6 @@ flowchart LR
 ## 模块依赖
 
 ```mermaid
-%%{init: {'theme':'base','themeVariables':{'fontFamily':'monospace'}}}%%
 flowchart LR
   classDef lua fill:#D6E4FF,stroke:#2E5AAC,color:#111
   classDef cpp fill:#FDE9D9,stroke:#C55A11,color:#111
