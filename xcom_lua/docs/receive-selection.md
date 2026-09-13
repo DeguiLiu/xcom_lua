@@ -111,4 +111,9 @@ O(1) 零猜测。
 - **拖选交互本身需人工验证一次**（合成鼠标点击无法到达 ImGui Win32 后端）：
   滚动流中拖选 → 松开 → 高亮应随文本上滚直至不可见；按住拖动期间视图应停住。
 - 遗留：被截断出窗口的选中内容无法复制（需 Lua 保留退役 chunk 副本，当前按 64KiB 窗口契约不做）；
-  边缘自动滚动未实现；双击选词 / Ctrl+C 快捷键未实现（右键"复制选中"可用）。
+  边缘自动滚动、双击选词未实现。
+- 快捷键与复制策略：Ctrl+A 全选、Ctrl+C 复制选中已实现（`ReceiveContent` 内经 `ImGui::Shortcut`，
+  路由按焦点域判定，输入框持有焦点时不抢占）。复制不再由 C++ 直接写剪贴板，而是把请求入队
+  （`QueueReceiveCopy`），由 Lua 侧 `service_receive_copy` 用 `core/receive_copy.lua` 的纯函数
+  `strip_timestamps` 按「复制时去除时间戳」开关处理后写剪贴板；该开关默认关闭、经
+  `[display] strip_timestamp_on_copy` 持久化。

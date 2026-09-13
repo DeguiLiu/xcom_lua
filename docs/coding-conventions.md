@@ -4,7 +4,7 @@
 
 ## 适用范围与阅读约定
 
-- C++：coact 框架头位于 `xcom_core/framework/coact/include/coact/`（`ao.hpp`、`hsm.hpp`、`pool.hpp`、`queue.hpp`、`spsc_ring.hpp`、`expected.hpp`、`coordinator.hpp`、`config.hpp`、`static_ao.hpp`、`policy.hpp`、`pal*.hpp`），应用层 C++ 在 `xcom_core/src/`；规约约束全部 C++17 代码。
+- C++：coact 框架头来自外部 checkout `../coact`（`windows` 分支）的 `include/coact/`（`ao.hpp`、`hsm.hpp`、`pool.hpp`、`queue.hpp`、`spsc_ring.hpp`、`expected.hpp`、`coordinator.hpp`、`config.hpp`、`static_ao.hpp`、`policy.hpp`、`pal*.hpp`），应用层 C++ 在 `xcom_core/src/`；规约约束全部 C++17 代码。
 - Lua：`xcom_lua/` 下运行于单共享 `lua_State` 的 LuaJIT 5.1 代码；`xcom_lua/libs/` 为第三方库，不强制本规约。
 - 条目以 `C++：` / `Lua：` 前缀标注适用侧；无前缀为通用。
 - 代码落点标注到文件与类名/函数名，不标行号（行号随重构漂移）。
@@ -63,7 +63,7 @@ Lua：
 
 ## 错误处理
 
-- C++ 禁用异常（`RT_ASSERT` 同禁，断言只用于框架内部不变量）；错误用值语义返回：简单场景用 bool/错误码枚举（如 `InitError`）；值或错误二选一用 `coact::Expected<V, E>`，落点 `xcom_core/framework/coact/include/coact/expected.hpp`——`class [[nodiscard]] Expected final`、`success(V&&)/error(E)` 工厂、`Expected<void,E>` 特化、支持 move-only `V`、固定内联存储（no exceptions, no heap）。**注意**：实现入口是 `expected.hpp` 本身（头注释说明改编自 newosp `vocabulary.hpp`），本仓库并无 `vocabulary.hpp`。
+- C++ 禁用异常（`RT_ASSERT` 同禁，断言只用于框架内部不变量）；错误用值语义返回：简单场景用 bool/错误码枚举（如 `InitError`）；值或错误二选一用 `coact::Expected<V, E>`，落点 `../coact/include/coact/expected.hpp`——`class [[nodiscard]] Expected final`、`success(V&&)/error(E)` 工厂、`Expected<void,E>` 特化、支持 move-only `V`、固定内联存储（no exceptions, no heap）。**注意**：实现入口是 `expected.hpp` 本身（头注释说明改编自 newosp `vocabulary.hpp`），本仓库并无 `vocabulary.hpp`。
 - C++ `QueueResult`（config.hpp）融合 push 成败与队列水位，免二次进临界区；错误路径不得静默——返回值被消费或被计数（reject 弧计数器），无“丢弃返回值且无注释”的调用点。
 - Lua I/O 结果必处理：所有 `io.open`/`io.write`/`file:close` 与 `os` 调用必须检查 `nil+msg` 并计数或上抛，禁止静默丢弃；错误信息保留 Windows 错误串便于诊断。
 - Lua 外部命令最小化：尽量避免 `os.execute`/`io.popen`；确需调用时用 `cmd.exe` 兼容的引号规则包裹参数，禁止拼接未净化的用户输入（命令注入）。

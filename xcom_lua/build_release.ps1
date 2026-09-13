@@ -14,15 +14,34 @@
 #
 # Usage:  powershell -ExecutionPolicy Bypass -File build_release.ps1 [-Version 1.4.0]
 #                                     [-SkipBytecode] [-OutDir <dir>]
+# -Version is optional: omit it and the version is read from the root
+# CMakeLists.txt project() VERSION, which is the single source of truth (it is
+# also what gets compiled into the launcher's VS_VERSION_INFO).  Pass it only to
+# build a package under a different label than the binary's own version.
 [CmdletBinding()]
 param(
-    [string]$Version = "1.3.0",
+    [string]$Version = "",
     [switch]$SkipBytecode,
     [string]$OutDir
 )
 
 $ErrorActionPreference = "Stop"
 $root = (Resolve-Path -LiteralPath $PSScriptRoot).Path          # xcom_lua/
+
+# Derive the package version from CMakeLists.txt rather than keeping a second
+# copy of the number here.  These had already drifted apart once (1.2.0 in the
+# binary vs 1.3.0 in the package name), which makes a release zip whose name
+# contradicts the version reported by the executable inside it.
+if ([string]::IsNullOrWhiteSpace($Version)) {
+    $cmake = Join-Path (Split-Path $root -Parent) "CMakeLists.txt"
+    $m = Select-String -LiteralPath $cmake -Pattern 'project\(XCOM VERSION ([0-9]+\.[0-9]+\.[0-9]+)' |
+         Select-Object -First 1
+    if (-not $m) {
+        throw "cannot read the XCOM version from $cmake (expected 'project(XCOM VERSION x.y.z')"
+    }
+    $Version = $m.Matches[0].Groups[1].Value
+    Write-Host "version: $Version (from CMakeLists.txt)"
+}
 $stage = if ($OutDir) { $OutDir } else { Join-Path (Split-Path $root -Parent) "dist/xcom-release-v$Version" }
 Write-Host "staging: $stage"
 

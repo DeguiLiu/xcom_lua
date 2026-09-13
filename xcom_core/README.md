@@ -1,9 +1,9 @@
 # xcom_core - XCOM 串口核心（C++17 DLL）
 
-`xcom_core.dll` 实现了 `include/xcom/xcom.h` 中的版本化 C ABI。它基于项目自研的
-`framework/coact` 事件运行时框架,以及原生的 `WinSerialBackend`(Win32
-OVERLAPPED 适配层)。构建中不存在 CSerialPort、libserial、pyserial 或第二条 COM
-数据通路。
+`xcom_core.dll` 实现了 `include/xcom/xcom.h` 中的版本化 C ABI。它基于外部的
+coact 事件运行时框架（`../coact` checkout 的 `windows` 分支），以及原生的
+`WinSerialBackend`(Win32 OVERLAPPED 适配层)。构建中不存在 CSerialPort、
+libserial、pyserial 或第二条 COM 数据通路。
 
 ## 构建
 
@@ -24,9 +24,9 @@ ctest --preset test-native-release
 波特率/数据位/校验位/停止位/流控/DTR/RTS 映射到 `DCB`,并为每个已打开会话拥有一条
 读线程。
 
-- 读完成时,每个块触发一次固定的、零分配的回调。回调把数据复制进自有的
-  `RxDatalane` 块池,向 coact 的 SPSC ring 发布描述符,然后 arm 静态 `RxKick`
-  事件。
+- 读完成时,每个块触发一次固定的、零分配的回调。回调把数据复制进唯一的引用计数
+  `coact::EventPool`(128 × 4 KiB)块,把**同一个** `coact::Event*` 以两份引用分别
+  投入显示与原始/文件两条 SPSC ring,然后 arm 静态 `RxKick` 事件。
 - `close()` 撤销回调 admission,发送信号并取消挂起的读,join 读线程,再确认没有
   回调仍在 in-flight,然后才释放。
 - `SessionWriter` 是唯一的写调用者。其固定 job ring 可防止对端过慢或 Win32
@@ -39,8 +39,9 @@ ctest --preset test-native-release
 接收 SPSC ring 本身并不是 Dispatcher 的唤醒源。其生产者在空→非空时 arm
 `RxKickGate`,并通过 Coordinator 提交唯一的静态 `Signal::RxKick`;staging 的
 wake latch 因此在没有回调分配、OS 消息队列或热路径锁的前提下唤醒 Dispatcher。
-低频控制 EventPool 使用真实的 spin critical section。Rx 与显示数据采用固定
-槽位的所有权转移,不涉及 EventPool 引用计数。
+低频控制 EventPool 使用真实的 spin critical section。RX 数据按块使用
+`coact::EventPool` 的引用计数:同一块以两份引用分发给显示与原始/文件通道,最后一个
+释放者归还池(控制面与数据面共用同一套 EventPool 原语,数据面热路径不加锁)。
 
 信号与优先级是限定作用域的定宽枚举;资源预算是类型化的 `constexpr` 量;HSM
 定义是 `constexpr std::array` 值;数据面使用显式 64 字节对齐的块和固定容量的

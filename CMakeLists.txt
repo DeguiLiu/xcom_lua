@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.21)
 
-project(XCOM VERSION 1.2.0 LANGUAGES CXX)
+project(XCOM VERSION 1.4.0 LANGUAGES CXX)
 
 if(NOT WIN32)
     message(FATAL_ERROR "XCOM currently supports the native Win32 serial backend only.")

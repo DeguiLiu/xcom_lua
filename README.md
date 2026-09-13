@@ -9,37 +9,47 @@ auto-send, a Lua script system, a scope plot, and a D3D11/WARP renderer.
 ## Topology
 
 ```mermaid
+%%{init: {'theme':'base','themeVariables':{'fontFamily':'monospace'}}}%%
 flowchart LR
-  EXE["xcom.exe launcher"] --> LJ["luvjit.exe<br/>LuaJIT UI thread<br/>Win32 loop + libuv"]
-  LJ -->|"versioned C ABI (xcom.h v1.5)"| CORE["xcom_core.dll<br/>C++17 + coact"]
-  LJ -->|"fixed C exports, int buffers"| IMG["xcom_imgui.dll<br/>ImGui + ImPlot / D3D11"]
-  CORE --> D["coact Dispatcher thread"]
-  CORE --> W["SessionWriter thread"]
-  CORE --> R["serial read thread"]
-  R <--> COM[("COM port")]
-  W --> COM
+  classDef proc fill:#E8F0FE,stroke:#2E5AAC,color:#111,stroke-width:1.5px
+  classDef dll fill:#FDE9D9,stroke:#C55A11,color:#111
+  classDef th fill:#E2F0D9,stroke:#548235,color:#111
+
+  EXE["xcom.exe<br/>launcher"]:::proc -->|"hidden console"| LJ["luvjit.exe<br/>LuaJIT UI thread<br/>Win32 loop + libuv"]:::proc
+  LJ -->|"versioned C ABI<br/>xcom.h v1.5"| CORE["xcom_core.dll<br/>C++17 + coact"]:::dll
+  LJ -->|"fixed C exports<br/>int buffers"| IMG["xcom_imgui.dll<br/>ImGui + ImPlot / D3D11"]:::dll
+  CORE --> D["coact Dispatcher"]:::th
+  CORE --> W["SessionWriter"]:::th
+  CORE --> R["serial read"]:::th
+  R <-->|"OVERLAPPED"| COM[("COM port")]
+  W -->|"OVERLAPPED"| COM
   D -->|"Rx pool -> DisplayLane"| LJ
 ```
 
 ## Dependencies
 
 ```mermaid
+%%{init: {'theme':'base','themeVariables':{'fontFamily':'monospace'}}}%%
 flowchart LR
-  MAIN["main.lua"] --> UI["ui/*.lua"]
-  MAIN --> CORE["core/*.lua"]
-  UI --> BR["imgui_bridge.lua"] --> IMGDLL["xcom_imgui.dll"]
-  CORE --> FFI["xcom_ffi.lua"] --> COREDLL["xcom_core.dll"]
-  COREDLL --> COACT["coact framework"]
-  IMGDLL --> VEND["third_party: imgui + implot"]
-  CORE --> LIBS["libs/ vendored pure-Lua"]
+  classDef lua fill:#D6E4FF,stroke:#2E5AAC,color:#111
+  classDef cpp fill:#FDE9D9,stroke:#C55A11,color:#111
+  classDef ext fill:#F2F2F2,stroke:#7F7F7F,color:#111
+
+  MAIN["main.lua"]:::lua --> UI["ui/*.lua"]:::lua
+  MAIN --> CORE["core/*.lua"]:::lua
+  UI --> BR["imgui_bridge.lua"]:::lua --> IMGDLL["xcom_imgui.dll"]:::cpp
+  CORE --> FFI["xcom_ffi.lua"]:::lua --> COREDLL["xcom_core.dll"]:::cpp
+  IMGDLL --> VEND["imgui + implot"]:::ext
+  COREDLL --> COACT["coact framework<br/>AO / HSM / bounded queues"]:::cpp
+  CORE --> LIBS["libs/<br/>vendored pure-Lua"]:::ext
 ```
 
 - `xcom_core/` — versioned C ABI DLL and Win32 OVERLAPPED serial backend;
-  `framework/coact/` is the sole business event runtime (AO/HSM/bounded queues).
+  coact is the sole business event runtime (AO / HSM / bounded queues / fixed pools).
 - `xcom_lua/` — production client: pure-Lua `ui/` + `core/`, the `xcom_imgui`
   bridge DLL and the `xcom_ffi` ABI binding.
 - `xcom_lua/native/launcher/` — Win32 `xcom.exe` with a hidden console.
-- `xcom_client/` — legacy PySide6 client, reference only; `docs/` — design docs.
+- `docs/` — architecture, design summary, performance and coding conventions.
 
 ## Prerequisites
 
@@ -59,16 +69,6 @@ The root build produces `xcom_core.dll` (into `build/native-release/bin`) and th
 `xcom.exe` launcher (into `xcom_lua/runtime`). The ImGui bridge has its own
 CMakeLists and is not referenced by the root project.
 
-## Bytecode
-
-App modules ship as `.ljbc`; `require` prefers bytecode over `.lua`. Rebuild after
-editing `main.lua` / `core/*.lua` / `ui/*.lua` (`scripts/` and `libs/` stay source):
-
-```powershell
-cd xcom_lua
-powershell -ExecutionPolicy Bypass -File build_bytecode.ps1 -Incremental
-```
-
 ## Run
 
 ```powershell
@@ -80,21 +80,5 @@ runtime\xcom.exe               # packaged launcher (main.ljbc, no console)
 `xcom.exe` prefers `main.ljbc` and falls back to `main.lua`; set `XCOM_CORE_DLL`
 to point at a specific `xcom_core.dll`.
 
-## Release
-
-```powershell
-powershell -ExecutionPolicy Bypass -File build_release.ps1 -Version 1.4.0
-```
-
-Produces `dist/xcom-release-v1.4.0.zip`: app modules as `.ljbc` only, `libs/` and
-`scripts/` verbatim, and `runtime/` with exes, DLLs and `assets/`.
-
-## Tests
-
-```powershell
-runtime\luvjit.exe tests\test_script_engine.lua
-runtime\luvjit.exe tests\stress_warp_ui.lua 30 90   # 30 s @ ~90 KiB/s
-```
-
-CI has four jobs: portable Lua suites, ABI layout pins and a C++ syntax gate on
-Linux, plus the MSVC build and `ctest` on Windows. See `xcom_lua/tests/`.
+Design docs: `docs/architecture.md` (architecture) and
+`docs/design-summary.md` (design summary).

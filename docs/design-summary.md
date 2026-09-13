@@ -57,7 +57,7 @@
 | `xcom_core/src/ao/xcom_ao.cpp` | SerialAo/ReceiveAo/SendAo/AutoSendAo/DiagnosticAo 行为与状态转移 |
 | `xcom_core/src/io/serial_backend_win.cpp` | Win32 OVERLAPPED 串口后端：读线程、写、行错误监控 |
 | `xcom_core/src/io/log_writer.cpp` | 专用日志 writer 线程（有序 append、原子替换、完成轮询） |
-| `xcom_core/framework/coact/` | 项目自有事件运行时（Dispatcher/AO/HSM/有界队列/SPSC/事件池） |
+| 外部 coact checkout `../coact`（`windows` 分支） | coact 事件运行时（Dispatcher/AO/HSM/有界队列/SPSC/事件池） |
 
 ## 关键数据结构
 
@@ -136,7 +136,9 @@ flowchart LR
   classDef lua fill:#D6E4FF,stroke:#2E5AAC,color:#111
   classDef cpp fill:#FDE9D9,stroke:#C55A11,color:#111
   subgraph RX["接收"]
-    R1["读线程 -> RxBlockPool"]:::cpp --> R2["Dispatcher 格式化"]:::cpp --> R3["DisplayLane"]:::cpp --> R4["Lua 10ms drain"]:::lua --> R5["ImGui clipper 绘制"]:::cpp
+    R1["读线程 -> coact::EventPool<br/>128 × 4 KiB，引用计数共享块"]:::cpp
+    R1 --> R2["Dispatcher 格式化"]:::cpp --> R3["DisplayLane"]:::cpp --> R4["Lua 10ms drain"]:::lua --> R5["ImGui clipper 绘制"]:::cpp
+    R1 --> R6["LogWriter 线程 -> 日志文件<br/>原始字节，反压"]:::cpp
   end
   subgraph TX["发送"]
     T1["Lua 编码(HEX/CRLF)"]:::lua --> T2["xcom_send 同步复制入 TxBlockPool"]:::cpp --> T3["Dispatcher -> SessionWriter"]:::cpp --> T4["OVERLAPPED 写"]:::cpp

@@ -29,7 +29,7 @@
 | 应用（Lua） | `xcom_lua/main.lua`、`xcom_lua/ui/*.lua`、`xcom_lua/core/*.lua` | 窗口与消息循环、状态镜像、控件驱动、配置持久化、脚本引擎、波形数据、FFI 绑定 | 不直接做阻塞串口 I/O、不直接调 ImGui API |
 | 渲染桥 | `xcom_lua/native/xcom_imgui/xcom_imgui_bridge.cpp` | ImGui/ImPlot 控件绘制、D3D11 设备与交换链、Win32 消息转发、控件状态经 `int*` 缓冲读写 | 不做串口业务、不持有权威应用状态 |
 | 核心 | `xcom_core/` | 版本化 C ABI、coact AO/HSM、固定块池、Win32 OVERLAPPED 串口后端、日志与诊断 writer | 不做 UI、不做策略决策 |
-| 框架 | `xcom_core/framework/coact/` | 项目自有 Dispatcher、Active Object、HSM、有界队列、SPSC 环、事件池 | 不引入 Qt/Boost 等第二事件框架 |
+| 框架 | 外部 coact checkout `../coact`（`windows` 分支） | Dispatcher、Active Object、HSM、有界队列、SPSC 环、事件池 | 不引入 Qt/Boost 等第二事件框架 |
 
 Lua 侧模块约定：`require` 优先加载 `.ljbc` 字节码，回退 `.lua`；`ui/` 存放
 窗口与桥接，`core/` 存放可单测的纯逻辑（`view_model`、`charset`、`config`、
@@ -143,8 +143,10 @@ flowchart LR
 - **C++ 内部线程**：Dispatcher（`_beginthreadex`）；每会话一个 SessionWriter
   （唯一调用可能阻塞的原生写）；串口读线程（OVERLAPPED）；日志/诊断 writer
   线程；自动发送用低优先级 PeriodicTimer，位于 Dispatcher 与串口 I/O 之下。
-- **热数据面无锁**：Rx/Display 块是固定槽所有权转移，热路径不分配事件、不
-  引用计数、不加互斥；控制面才使用 OS 等待原语。
+- **数据面引用计数、无数据锁**：RX 块来自唯一 `coact::EventPool`（128 × 4 KiB），
+  同一块以两份引用扇出显示与原始/文件通道（`event_ref_inc` / `event_gc`），最后释放
+  者归还池；热路径不堆分配、不持互斥（仅池的空闲表用短自旋），控制面才使用 OS
+  等待原语。
 
 ## 端口状态机
 
@@ -157,11 +159,15 @@ flowchart LR
   classDef abi fill:#DDEBF7,stroke:#2E75B6,color:#111
   classDef ui fill:#E2F0D9,stroke:#548235,color:#111
 
-  subgraph A["C++ coact SerialAo HSM（文档化简化）"]
+  subgraph A["C++ coact SerialAo HSM（5 态，表驱动）"]
     direction LR
-    SC["Closed"]:::hsm -->|SIG_OPEN| SO["Open"]:::hsm
-    SO -->|SIG_CLOSE| SC
-    SO -->|SIG_FAULT| SF["Fault"]:::hsm
+    SC["Closed"]:::hsm -->|SIG_OPEN| SO["Opening"]:::hsm
+    SO -->|OpenDone 成功| SOPEN["Open"]:::hsm
+    SO -->|OpenDone 失败| SF["Fault"]:::hsm
+    SO -->|SIG_CANCEL| SCL["Closing"]:::hsm
+    SOPEN -->|SIG_CLOSE| SCL
+    SCL -->|CloseDone| SC
+    SOPEN -->|SIG_FAULT| SF
     SC -->|SIG_FAULT| SF
     SF -->|SIG_OPEN| SO
   end
@@ -184,10 +190,11 @@ flowchart LR
 
 关系与语义：
 
-- **C++ HSM（3 态，`S_CLOSED/S_OPEN/S_FAULT`）是文档化的简化**：计划中的
-  Opening/Closing 是 owner 线程上的短命中间态，不单独建 state；端口的权威
-  反映始终是 `CoreCtx::port_state` 原子。因此不要以 C++ HSM 只有 3 态推断
-  端口只有 3 种对外状态。
+- **C++ HSM 现为 5 态**（`S_CLOSED/S_OPENING/S_OPEN/S_CLOSING/S_FAULT`，
+  `xcom_ao.hpp:152`），由表驱动 `serial_transition()` 唯一迁移（`xcom_ao.cpp:530`），
+  取值与 ABI 的 `XCOM_PORT_*` 逐一对齐；`CoreCtx::port_state` 是它的发布视图。
+  ABI 已不再直接写该原子，但故障兜底仍有直接 store（`xcom_core.cpp:707/760/769/891`），
+  单写者不变量尚未完全达成。
 - **ABI 5 态**（`XCOM_PORT_CLOSED/OPENING/OPEN/CLOSING/FAULT`）是跨语言可观测
   的权威状态，`xcom_get_snapshot` 每次读取。
 - **Lua UI HSM 6 态**在镜像 5 态之外增加 `reconnecting`：这是**纯 UI 策略**，
@@ -209,20 +216,23 @@ flowchart LR
   classDef cpp fill:#FDE9D9,stroke:#C55A11,color:#111
   classDef lua fill:#D6E4FF,stroke:#2E5AAC,color:#111
   RD["读线程<br/>OVERLAPPED 读 + ClearCommError"]:::cpp
-  POOL["RxBlockPool<br/>固定 2^n 槽"]:::cpp
-  RING["ready ring + RxKickGate<br/>静态 SIG_RX_KICK"]:::cpp
+  POOL["coact::EventPool<br/>128 × 4 KiB，引用计数共享块"]:::cpp
+  RING["display/raw 两条 SPSC 环 + RxKickGate<br/>静态 SIG_RX_KICK"]:::cpp
   RA["ReceiveAo (Dispatcher)<br/>HEX/时间戳/ANSI 格式化"]:::cpp
   DL["DisplayLane<br/>有界批次"]:::cpp
+  LOG["LogWriter 线程<br/>原始字节落盘"]:::cpp
   POLL["Lua poll_display (10ms luv)<br/>xcom_drain_display 64KiB"]:::lua
   APP["xcom_imgui_receive_append<br/>零重建增量"]:::cpp
   DRAW["ImGui clipper 逐可视行绘制"]:::cpp
   RD --> POOL --> RING --> RA --> DL --> POLL --> APP --> DRAW
+  RING --> LOG
 ```
 
-背压与可观测：块池与 DisplayLane 均有界；池耗尽计 `rx_pool_exhausted_bytes`，
-块全占用时读回调**主动 withhold**（不丢字节）并计 `rx_backpressure_events`；
-真正的接收丢失用 `rx_loss_offset` 标出在已接受流中的位置。显示按需分级帧率
-（交互 16ms / 数据到达 100ms / 空闲 500ms）避免满带宽刷屏烧帧。
+背压与可观测：块池与 DisplayLane 均有界。文件通道取不到块时读线程阻塞反压并计
+`rx_backpressure_events`（`save_rejected_bytes` 对 RX 恒 0）；显示通道取不到块时计
+`rx_pool_exhausted_bytes`，其语义在**已打开日志**时是显示积压而非丢失（文件持有完整
+流），未打开日志时不成立。真正的接收丢失用 `rx_loss_offset` 标出在已接受流中的位置。
+显示按需分级帧率（交互 16ms / 数据到达 100ms / 空闲 500ms）避免满带宽刷屏烧帧。
 
 ### 发送（Lua → ABI → writer 线程）
 
@@ -252,7 +262,9 @@ flowchart LR
 - 故障（拔线、I/O 中止、访问被拒）由读线程/后端上报为 FAULT；Lua 进入
   `reconnecting` 宽限窗（默认 8000ms，可配）尝试重开，窗口内恢复即续传，超时
   转 FAULT 交用户手动处理。看门狗保证 opening/closing 不永久卡死。
-- 显示暂停时被保留的 Rx 通过背压施加到上游，而不是静默丢弃。
+- 显示暂停时 Rx 块在 ReceiveAo 的 deferred 槽中保留（`display_paused_bytes`），
+  显示就绪环填满后显示通道计 `rx_pool_exhausted_bytes` 并继续读，文件通道不受影响；
+  暂停不再向上游施加背压（只有文件通道池空才反压读线程）。
 
 ## 脚本引擎：故障隔离与热重载
 
@@ -312,3 +324,7 @@ flowchart LR
 - 已发现并保留（以代码为准，供后续修正）：
   1. 根 `CMakeLists.txt` 的 `project(XCOM VERSION 1.2.0)` 与 launcher 版本
      `1.2.0`，同 `xcom.h` 的 ABI `1.5.0` 属不同版本命名空间，未对齐。
+- 已清理：Python 时代前端（PySide6 / QThread / CoreWorker / `config.toml`）的
+  陈旧组件引用已从 `xcom_core/` 全量移除，ABI 与线程注释现表述为 Lua UI
+  线程（`Window:poll_display` 的 10 ms drain）；`xcom_lua/` 侧的同类清理单独
+  处理。

@@ -171,7 +171,8 @@ flowchart LR
 ```
 
 - 拔线、用户关闭、进程退出和库错误都走同一幂等路径。`RxIngress` 用 `admission` 原子位和 `in_callback` 原子计数：回调先计数再 acquire 检查 admission，退出时 release 减计数；关闭先 release 关闭 admission，再在 `close()` 返回后 acquire 确认计数为零（未满足即报告后端契约故障，禁止释放 RxBlockPool）。
-- `WinSerialBackend::close()` 可能同步 join 内部读线程，故它允许阻塞，最多占用关闭 SLO 的 2 s（`xcom_ffi.close` 默认 timeout 2000 ms）；Closing 期间新请求立即失败，UI 线程不等待。
+- 关闭预算分三层，管不同路径，不要混用：**UI 点击关闭 / 重连收尾** 200 ms（`CLOSE_WAIT_MS`，是 `Window:core_close` 的默认形参；`_imgui_close`、`on_btn_close` 与 `_drive_reconnect` 都走该默认值，均**不**显式传参）；**进程退出** 2000 ms（`Window:on_close`，显式传参）；**FFI 默认** 2000 ms（`xcom_lua/core/xcom_ffi.lua` 的 `close`）。后端内部宽限另成一层：在途 TX 排水 `kTxDrainGraceMs` 200 ms（`xcom_core/src/io/serial_backend_win.hpp`，`abort_pending_write`）＋被取消读线程收尾 `kCancelledReadGraceMs` 1500 ms（`xcom_core/src/io/serial_backend_win.cpp`，`close()` 的 join），故整个后端 teardown 最多约 1.7 s（慢盘时 `owner_close` 的写线程 join 上界达 60 s）；Closing 期间新请求立即失败。
+- 点击关闭**不阻塞消息泵**：等待长度就是冻结长度——`xcom_close` 是同步轮询（`sleep_ms(剩余 < 20 ? 剩余 : 20)`，`xcom_core/src/abi/xcom_abi.cpp`），而 ABI 契约规定唯一调用线程就是 Lua UI 线程——所以 `CLOSE_WAIT_MS` 刻意取得短。短等待下**超时是正常结果**（后端 teardown 宽限本身可达 ~1.7 s），因此 `core_close` **不**把超时当失败上报；否则每次「慢但健康」的关闭都会弹一次假超时。UI 保持 CLOSING 呈现，由 5 s 看门狗在「核心已离开 CLOSING 却没到 CLOSED」时强制 FAULT 并上报。唯一例外是**被拒绝的关闭**（事件根本没提交、会话仍活着），那条必须上报。超时只返回 `XCOM_ERR_TIMEOUT`，**不回滚** `port_state`（同处注释 "there is no ABI rollback write"），AO 继续完成 CLOSING→CLOSED。
 - 会话 generation 每次关闭后递增，迟到事件/回调被拒绝。`xcom_destroy` 只在 CLOSED 且无 in-flight 事件时释放，否则执行有限时的后台清理。
 
 ## 接收、展示与保存：三个独立消费者
@@ -198,7 +199,7 @@ flowchart LR
 | UI drain | 单次 ≤ 64 KiB 且 ≤ 5 ms |
 | GUI 事件循环间隙 | P99 < 50 ms |
 | 手工发送排队（端口空闲） | P99 ≤ 100 ms |
-| 关闭 | ≤ 2 s |
+| 关闭（核心 teardown 完成；UI 点击等待预算 200 ms，不阻塞消息泵） | ≤ 2 s |
 | 长稳 | 30 min @ 115200 / 921600 / 1 Mbps loopback |
 
 指标：I/O（`rx_bytes`、`tx_bytes`、`callback_count`、打开/关闭次数、Win32 错误码）；背压/丢弃（`rx_pool_exhausted_bytes`、`rx_backpressure_events`、`rx_loss_offset`、`tx_rejected`、`auto_tick_coalesced`、`display_paused_bytes`、`ui_trimmed_bytes`、`save_rejected_bytes`）；线路错误（`framing_errors`、`parity_errors`、`overrun_errors`、`break_events`）；延迟（callback、coact queue、ReceiveAo、drain、渲染的 P50/P95/P99）；资源（队列当前/峰值、块池占用、EventPool 失败、HANDLE 数）；正确性（generation 拒绝、接收 sequence gap、保存失败）。`rx_callback_oversize_bytes`、`flow_hold_events` 是核心内部计数，未导出到 `XcomSnapshot`。状态栏显示端口状态、收发量和关键丢弃数；诊断和日志保留完整快照，且使用固定环，不增加无界资源。
@@ -219,7 +220,7 @@ flowchart LR
 
 **基线（200 轮，真实 DLL）**：回调热路径 P99 0.199 ms、接收排队 P99 0.051 ms、UI drain P99 0.162 ms，三线均远低于门禁，说明当时吞吐瓶颈不在 C++ 侧。
 
-**改动清单（`xcom_core/src/xcom_ao.cpp`，行 244 起）**
+**改动清单（`xcom_core/src/ao/xcom_ao.cpp`，行 244 起为 2026-08-31 的历史行号）**
 
 1. HEX 路径边界检查外提：每输入字节固定产出 3 字符，预计算可容纳输入字节数，把逐迭代容量比较移出循环。
 2. `static const char kHex[]` 提出循环（消除 MSVC 每迭代 guarded-init 检查）。
