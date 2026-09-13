@@ -3,7 +3,13 @@
 // This is the evidence the owner asked for: the FILE lane must never lose
 // serial data even while the display is stalled (window opening, modal dialog,
 // pause), and the reader must block rather than drop when the disk itself has
-// stalled. It is Win32-free, so it compiles and runs on Linux with g++:
+// stalled.
+//
+// POSIX-only, NOT Windows: the double-release probe runs the aborting path in a
+// forked child so the test can require SIGABRT, which needs <sys/wait.h> and
+// <unistd.h>. Its CMake target is therefore guarded with if(NOT WIN32) - an
+// unguarded build failed on the Windows runner with C1083 on sys/wait.h. It
+// compiles and runs on Linux with g++:
 //
 //   g++ -std=c++17 -O2 -pthread \
 //       -Ixcom_core/src -Ixcom_core/src/runtime -Ixcom_core/src/foundation \

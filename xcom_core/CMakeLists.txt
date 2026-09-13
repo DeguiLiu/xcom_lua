@@ -216,9 +216,15 @@ if(BUILD_TESTING)
 endif()
 
 # Ref-counted RX lane: file-lane reservation (display must never starve the
-# file), lossless file backpressure, and exact block lifetime. Win32-free, so
-# it also builds and runs on a Linux host with g++ directly (see the header
-# comment in the test); no xcom_core link is needed.
+# file), lossless file backpressure, and exact block lifetime.
+#
+# Host-only, and NOT Win32-free: the double-release probe runs the aborting
+# path in a forked child so the test can require SIGABRT, which needs
+# <sys/wait.h>/<unistd.h> and cannot compile under MSVC. Building it on the
+# Windows runner failed with C1083 on sys/wait.h, so the target is guarded like
+# the other host suites; tools/check_cpp_syntax.sh still parses it on every CI
+# run so it cannot rot. See the header comment in the test for the g++ recipe.
+if(NOT WIN32)
 add_executable(xcom_rx_block_lane_test tests/rx_block_lane_test.cpp)
 target_compile_features(xcom_rx_block_lane_test PRIVATE cxx_std_17)
 target_include_directories(xcom_rx_block_lane_test PRIVATE
@@ -230,6 +236,7 @@ set_target_properties(xcom_rx_block_lane_test PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 if(BUILD_TESTING)
     add_test(NAME xcom.rx_block_lane COMMAND xcom_rx_block_lane_test)
+endif()
 endif()
 
 # Thread-liveness logic (design §4.2 item 3): timeout detection, once-per-
