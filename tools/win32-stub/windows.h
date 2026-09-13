@@ -191,10 +191,14 @@ HANDLE WINAPI CreateSemaphoreW(SECURITY_ATTRIBUTES*, LONG, LONG, const wchar_t*)
 BOOL WINAPI ReleaseSemaphore(HANDLE, LONG, LONG*);
 
 // CRT thread creation. The real declaration lives in <process.h>; declared here
-// so the PAL compiles against this stub without the MSVC CRT.
+// so the PAL compiles against this stub without the MSVC CRT. Skipped under
+// mingw-w64: its CRT already declares _beginthreadex with C linkage, and a
+// second (C++) declaration conflicts when pthread.h pulls in process.h.
+#ifndef __MINGW32__
 unsigned long long __stdcall _beginthreadex(void*, unsigned,
                                             unsigned (__stdcall*)(void*),
                                             void*, unsigned, unsigned*);
+#endif
 
 // ---- process-launch API used by the shipped launcher ----------------------
 // xcom_lua/native/launcher/xcom_launcher.cpp resolves its own path, locates the

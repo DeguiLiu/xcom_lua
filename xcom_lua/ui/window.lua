@@ -675,7 +675,7 @@ Window._create_class = create_class
 load_window_icon = function(w)
     -- A NULL return is nil in LuaJIT (a null cdata compares equal to nil), so a
     -- plain truthiness test is the correct "did this load?" check.
-    local module = w.user32.GetModuleHandleA(nil)
+    local module = w.kernel32.GetModuleHandleA(nil)
     local icon = w.user32.LoadIconA(module, ffi.cast("const char*", w.IDI_APP))
     if icon then
         return icon
