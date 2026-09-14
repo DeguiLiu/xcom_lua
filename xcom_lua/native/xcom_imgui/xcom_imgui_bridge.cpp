@@ -397,6 +397,14 @@ public:
     std::string status_text_{};
     bool receive_follow_tail_ = true;
     float receive_scroll_y_ = 0.0f;
+    // Press offset inside the receive log's custom scrollbar grab (see
+    // ArrowScrollbar): kept from the frame that grabbed the thumb so the drag
+    // seeks absolutely without teleporting the content under the cursor.
+    float receive_scroll_grab_delta_ = 0.0f;
+    // Which part of that scrollbar is being stepped: -2/+2 arrow (one log row
+    // per repeat), -1/+1 track (one page), 0 grab drag.  Latched on the frame
+    // the bar is pressed, like ImGui's own ScrollbarSeekMode.
+    int receive_scroll_seek_ = 0;
     // Receive-clipper metrics carried from one frame to the next so the next
     // frame can force the log child's content height (see ReceiveContent):
     // rows_top_ is the rows' top offset in content space (0 now that the
@@ -1283,6 +1291,138 @@ bool QueueReceiveCopy(ImGuiRuntime& runtime, std::size_t begin_abs,
 // than any tail (receive_limit_ caps the content at 1 MiB).
 constexpr float kFollowTailTargetY = 1.0e9f;
 
+// Windows-style vertical scrollbar WITH arrow buttons for the CURRENT window's
+// right edge.  The vendored ImGui 1.93 has no scrollbar arrows left --
+// ScrollbarEx draws a bare track + grab and no style field brings the buttons
+// back -- and the receive log is the one surface where a user walks a long
+// buffer line by line, so the log child drops the built-in bar (NoScrollbar;
+// the wheel keeps working, see UpdateMouseWheel) and draws this one instead.
+//
+// Input mirrors ImGui's own bar: ONE item covers the whole column (a region per
+// item would drop the active id the moment a sliding thumb reaches the cursor,
+// which killed the hold-to-page), and the region -- line-up / line-down, track,
+// or grab -- is decided once, on the activation frame.  An arrow then steps one
+// log row per click and keeps stepping while held (ImGuiItemFlags_ButtonRepeat:
+// what a Windows scrollbar arrow does); the track pages by one screen minus a
+// row of overlap; the grab seeks absolutely with the press offset preserved, so
+// grabbing the middle of the thumb does not teleport the content.
+//
+// Only public ImGui API is used and the window's own scroll state is written
+// directly (as ImGui::Scrollbar does for its bar): no frame of latency, and the
+// follow-tail latch reads the user's input at the start of the next frame.
+// `bar_min`/`bar_max` come from the caller, which also needs them to keep the
+// log's press-to-select away from the bar.
+void ArrowScrollbar(const ImVec2 bar_min, const ImVec2 bar_max, float row_h,
+                    float& grab_drag_delta, int& seek_mode) {
+    const ImGuiStyle& style = ImGui::GetStyle();
+    const float scroll_max = ImGui::GetScrollMaxY();
+    const float bar_w = bar_max.x - bar_min.x;
+    const float arrow_h = ImMin(bar_w, ImMin(14.0f, (bar_max.y - bar_min.y) * 0.25f));
+    const float track_top = bar_min.y + arrow_h;
+    const float track_bottom = bar_max.y - arrow_h;
+    const float track_h = track_bottom - track_top;
+    // No overflow (or no room): no bar at all, like the built-in one.
+    if (scroll_max <= 0.0f || track_h <= 2.0f) return;
+
+    ImDrawList* const draw = ImGui::GetWindowDrawList();
+    // The whole column is painted, so a log line wider than the panel cannot
+    // show through beside the track.
+    draw->AddRectFilled(bar_min, bar_max, ImGui::GetColorU32(ImGuiCol_ScrollbarBg));
+    float scroll = ImGui::GetScrollY();
+    // Borderless child, no window padding: the content is exactly the scroll
+    // range plus one viewport (the same two quantities ImGui's own bar uses).
+    const float visible_h = ImGui::GetWindowHeight();
+    const float content_h = (std::max)(scroll_max + visible_h, 1.0f);
+    const float grab_h = ImClamp(track_h * visible_h / content_h,
+                                 ImMin(track_h, style.GrabMinSize), track_h);
+    const float grab_travel = track_h - grab_h;
+    const float grab_top = track_top + (scroll / scroll_max) * grab_travel;
+    // --- one item for the whole column ------------------------------------
+    ImGui::SetCursorScreenPos(bar_min);
+    ImGui::PushItemFlag(ImGuiItemFlags_ButtonRepeat, true);
+    const bool pressed =
+        ImGui::InvisibleButton("##rx_scrollbar", ImVec2(bar_w, bar_max.y - bar_min.y));
+    ImGui::PopItemFlag();
+    const bool held = ImGui::IsItemActive();
+    const bool hovered = ImGui::IsItemHovered();
+    const ImVec2 mouse = ImGui::GetIO().MousePos;
+    const float mouse_norm = ImSaturate((mouse.y - track_top) / track_h);
+    const float grab_norm = (grab_top - track_top) / track_h;
+    const float grab_ratio = grab_h / track_h;
+    const float page = ImMax(visible_h - row_h, row_h);
+
+    // Latch the region on the activation frame (see the note above): -2/+2 =
+    // arrow (one row per step), -1/+1 = track (one page), 0 = grab drag.
+    if (ImGui::IsItemActivated()) {
+        if (mouse.y < track_top) {
+            seek_mode = -2;
+        } else if (mouse.y >= track_bottom) {
+            seek_mode = 2;
+        } else if (mouse_norm < grab_norm || mouse_norm > grab_norm + grab_ratio) {
+            seek_mode = (mouse_norm < grab_norm) ? -1 : 1;
+        } else {
+            seek_mode = 0;
+            grab_drag_delta = mouse_norm - grab_norm - grab_ratio * 0.5f;
+        }
+    }
+    // Click + every repeat tick step the latched region by its unit.
+    if (pressed && seek_mode != 0) {
+        const float unit = (seek_mode == -2 || seek_mode == 2) ? row_h : page;
+        scroll += (seek_mode > 0) ? unit : -unit;
+    }
+    if (held && seek_mode == 0) {
+        scroll = ImSaturate((mouse_norm - grab_drag_delta - grab_ratio * 0.5f) /
+                            (1.0f - grab_ratio)) *
+                 scroll_max;
+    }
+
+    // --- paint -------------------------------------------------------------
+    // Filled triangle on the light track; the chip and the inverted glyph on
+    // hover/press reuse the scrollbar's own colors and the toolbar-icon
+    // vocabulary (kTextBody, no ghost grey).
+    const auto paint_arrow = [&](float band_y, bool up, bool active, bool hovered_band) {
+        const ImVec2 mn(bar_min.x, band_y);
+        const ImVec2 mx(bar_max.x, band_y + arrow_h);
+        if (active || hovered_band) {
+            draw->AddRectFilled(mn, mx,
+                                ImGui::GetColorU32(active ? ImGuiCol_ScrollbarGrabActive
+                                                          : ImGuiCol_ScrollbarGrabHovered),
+                                3.0f);
+        }
+        const float cx = (mn.x + mx.x) * 0.5f;
+        const float cy = (mn.y + mx.y) * 0.5f;
+        const float r = ImMax(3.0f, arrow_h * 0.30f);
+        const ImU32 glyph = active ? IM_COL32(255, 255, 255, 255)
+                                   : ImGui::GetColorU32(rgb(palette::kTextBody));
+        if (up) {
+            draw->AddTriangleFilled(ImVec2(cx, cy - r), ImVec2(cx - r, cy + r),
+                                    ImVec2(cx + r, cy + r), glyph);
+        } else {
+            draw->AddTriangleFilled(ImVec2(cx, cy + r), ImVec2(cx - r, cy - r),
+                                    ImVec2(cx + r, cy - r), glyph);
+        }
+    };
+    paint_arrow(bar_min.y, true, held && seek_mode == -2, hovered && mouse.y < track_top);
+    paint_arrow(track_bottom, false, held && seek_mode == 2,
+                hovered && mouse.y >= track_bottom);
+    // The grab is inset the way ImGui's own bar is; its hit area stays the full
+    // column, so a thumb with rounded corners is still grabbable edge to edge.
+    const bool grab_dragging = held && seek_mode == 0;
+    const bool grab_hovered = hovered && !grab_dragging && mouse.y >= track_top &&
+                              mouse.y < track_bottom && mouse_norm >= grab_norm &&
+                              mouse_norm <= grab_norm + grab_ratio;
+    const float pad = ImTrunc(ImMin(style.ScrollbarPadding, bar_w * 0.5f));
+    draw->AddRectFilled(
+        ImVec2(bar_min.x + pad, grab_top), ImVec2(bar_max.x - pad, grab_top + grab_h),
+        ImGui::GetColorU32(grab_dragging  ? ImGuiCol_ScrollbarGrabActive
+                           : grab_hovered ? ImGuiCol_ScrollbarGrabHovered
+                                          : ImGuiCol_ScrollbarGrab),
+        style.ScrollbarRounding);
+
+    scroll = ImClamp(scroll, 0.0f, scroll_max);
+    if (scroll != ImGui::GetScrollY()) ImGui::GetCurrentWindow()->Scroll.y = scroll;
+}
+
 [[nodiscard]] int ReceiveContent(int rx_bytes, int tx_bytes, int* receive_hex, int* timestamp,
                    int* pause_display, int* auto_clear, int* auto_clear_bytes,
                    int* auto_save) {
@@ -1350,7 +1490,7 @@ constexpr float kFollowTailTargetY = 1.0e9f;
     }
     const auto receive = Panel("##receive",
                                ImVec2(0, layout.receive_height == 0.0f ? -transmit_block : layout.receive_height),
-                               false, 0, rgb(palette::kSurfaceLight));
+                               false, ImGuiWindowFlags_NoScrollbar, rgb(palette::kSurfaceLight));
     if (runtime.receive_text_.empty()) {
         EmptyState(ImGuiRuntime::instance().lang().waiting, {});
         runtime.receive_follow_tail_ = true;
@@ -1371,6 +1511,16 @@ constexpr float kFollowTailTargetY = 1.0e9f;
     // '\n' as a line break (a trailing '\r' rendered as a glyph and broke the
     // row metric), and its own cursor/scroll state raced the follow logic.
     const std::vector<std::size_t>& offsets = runtime.receive_line_offsets_;
+    // The log child draws its own scrollbar (ArrowScrollbar): NoScrollbar above
+    // turns ImGui's bar off, so this column is ours to reserve.  It is also what
+    // keeps a press meant for the bar from starting a text selection -- both
+    // checks below need the same rectangle.
+    const float bar_w = ImGui::GetStyle().ScrollbarSize;
+    const ImVec2 scrollbar_min(ImGui::GetWindowPos().x + ImGui::GetWindowSize().x - bar_w,
+                               ImGui::GetWindowPos().y);
+    const ImVec2 scrollbar_max(ImGui::GetWindowPos().x + ImGui::GetWindowSize().x,
+                               ImGui::GetWindowPos().y + ImGui::GetWindowSize().y);
+    const bool over_scrollbar = ImGui::IsMouseHoveringRect(scrollbar_min, scrollbar_max, false);
     // Capture the at-bottom state BEFORE any rendering mutates the scroll
     // range.  Scrolling away (wheel/drag/scrollbar) makes this false, which
     // detaches the follow; scrolling back to the bottom re-attaches it.
@@ -1392,7 +1542,7 @@ constexpr float kFollowTailTargetY = 1.0e9f;
     // during the clipper pass (GetItemRectMin/Max is authoritative, no
     // manual scroll math).
     const bool sel_drag_start =
-        log_hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left);
+        log_hovered && !over_scrollbar && ImGui::IsMouseClicked(ImGuiMouseButton_Left);
     if (sel_drag_start) {
         runtime.receive_sel_anchor_ = kSelDragging;
         runtime.receive_sel_begin_ = 0;
@@ -1793,6 +1943,13 @@ constexpr float kFollowTailTargetY = 1.0e9f;
     if (runtime.receive_follow_tail_ && !ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
         ImGui::SetScrollY(kFollowTailTargetY);
     }
+    // The log's own bar with arrow buttons (see ArrowScrollbar), after the pin
+    // so the user's input is the last word inside the frame -- a held button
+    // already suppresses the pin above, which is what lets an arrow click or a
+    // thumb drag win while the view is pinned at the bottom.
+    ArrowScrollbar(scrollbar_min, scrollbar_max, line_h,
+                   runtime.receive_scroll_grab_delta_,
+                   runtime.receive_scroll_seek_);
     runtime.receive_scroll_y_ = ImGui::GetScrollY();
     // Right-click context menu: the read-only multiline editor doesn't expose
     // one by default, so attach one explicitly.  The popup id is scoped to
