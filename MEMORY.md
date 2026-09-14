@@ -88,7 +88,7 @@
 | 窗口收缩重索引 | 配置变更 | 后缀不变性：旧 offsets 减删除量（`lower_bound`+线性平移） | 全量重扫 |
 | 渲染（`ReceiveContent`） | 每帧 | `ImGuiListClipper` O(可视行)；官方 `ShowExampleAppLog` 模式 | `InputTextMultiline`（stb_textedit 全量重排 + 只认 `\n` + 光标/滚动状态竞争） |
 | 选择命中/背景 | 拖拽帧 | **等宽字体 O(1) 数学**：一次测量 64 个 'M' 均摊字形宽，`count × glyph_w` | 每字节一次 `CalcTextSize`（O(line²)）；每选中行两次整段测量 |
-| 滚动跟随 | 每帧 | demo 精确规则：帧首 `GetScrollY()>=GetScrollMaxY()` 判定 + 行提交后 `SetScrollHereY(1.0f)` | 事后 `SetScrollY(GetScrollMaxY())`（新 max 上追赶，两帧间振荡） |
+| 滚动跟随 | 每帧 | 帧首 `GetScrollY()>=GetScrollMaxY()` 判定脱开/重挂 + 帧尾写"尽可能靠下"的滚动目标（`SetScrollY` 大值，由下一次 Begin 用**本轮强制的**内容高度 clamp）；按住左键时冻结 | ① 旧实现 `SetScrollHereY(1.0f)` 写**具体位置**：写入与生效隔一帧，而尾窗是**帧外**追加的，于是贴底位置永远差一个批次（最新行进不了可视区）；② 子窗口的滚动条在 `Begin()` 内（body 之前）写目标、下一次 `Begin` 才生效，帧尾的 pin 会把箭头/拖动输入原地覆盖 → 贴底时滚动条"点不动" |
 | Lua 接收裁剪 | 每次 drain | 游标淘汰整块 O(1) | `table.remove(chunks,1)` O(n) 搬移 |
 
 要点与约束：
