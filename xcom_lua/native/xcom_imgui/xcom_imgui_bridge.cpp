@@ -1370,9 +1370,14 @@ void ArrowScrollbar(const ImVec2 bar_min, const ImVec2 bar_max, float row_h,
         const float unit = (seek_mode == -2 || seek_mode == 2) ? row_h : page;
         scroll += (seek_mode > 0) ? unit : -unit;
     }
-    if (held && seek_mode == 0) {
-        scroll = ImSaturate((mouse_norm - grab_drag_delta - grab_ratio * 0.5f) /
-                            (1.0f - grab_ratio)) *
+    // A grab that fills the track has nothing to drag through, and the clamp
+    // above can produce exactly that: once track_h reaches style.GrabMinSize
+    // (12px), i.e. a log panel of 24px or less, grab_h is clamped up to track_h,
+    // and the ratio below would divide by zero -- parking a NaN in Scroll.y that
+    // outlives the frame and keeps the follow from ever re-arming.
+    const float drag_range = 1.0f - grab_ratio;
+    if (held && seek_mode == 0 && drag_range > 0.0f) {
+        scroll = ImSaturate((mouse_norm - grab_drag_delta - grab_ratio * 0.5f) / drag_range) *
                  scroll_max;
     }
 
