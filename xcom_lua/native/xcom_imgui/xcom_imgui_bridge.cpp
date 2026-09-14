@@ -1420,7 +1420,21 @@ void ArrowScrollbar(const ImVec2 bar_min, const ImVec2 bar_max, float row_h,
         style.ScrollbarRounding);
 
     scroll = ImClamp(scroll, 0.0f, scroll_max);
-    if (scroll != ImGui::GetScrollY()) ImGui::GetCurrentWindow()->Scroll.y = scroll;
+    if (scroll >= scroll_max) {
+        // Parked on the very bottom: ask for the TAIL TARGET instead of this
+        // frame's last pixel.  The follow latch compares pixels, and this
+        // buffer grows between frames in whole rows, so a concrete position
+        // that was the bottom a frame ago is one appended row short by the
+        // time the latch reads it -- the re-attach then loses the race about a
+        // third of the time (measured).  The target is resolved at the next
+        // Begin against THAT frame's content, exactly like the follow pin, so
+        // arriving at the bottom always re-arms the follow.
+        ImGui::SetScrollY(kFollowTailTargetY);
+    } else if (scroll != ImGui::GetScrollY()) {
+        // Direct write, like ImGui::Scrollbar does for its own bar: no frame of
+        // latency, and the latch reads it at the start of the next frame.
+        ImGui::GetCurrentWindow()->Scroll.y = scroll;
+    }
 }
 
 [[nodiscard]] int ReceiveContent(int rx_bytes, int tx_bytes, int* receive_hex, int* timestamp,
