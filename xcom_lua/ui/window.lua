@@ -4594,6 +4594,14 @@ function Window:start()
     -- pipeline once a VIRTUAL/TEST* session is opened.
     self.sim = serial_sim.new({
         xcom = xcom, win = self, uv = uv,
+        -- XCOM_SIM_FORCE=1 forces the simulator on even when the registry
+        -- enumeration does see ports.  The hardware-absence rule above is what
+        -- keeps real machines bit-identical, but a box with a PHANTOM port
+        -- (an enumerated COM that no driver backs) can never reach the E2E
+        -- smoke path otherwise, and the tail/scroll verification needs the
+        -- data to arrive from outside the ImGui frame -- which is exactly
+        -- what the sim pump does.  Unset in normal runs: no behaviour change.
+        enabled = os.getenv("XCOM_SIM_FORCE") == "1",
         -- Low-frequency lifecycle diagnostics (arm/stop/overflow) -> stderr.
         log = function(tag, msg) io.stderr:write("[" .. tag .. "] " .. msg .. "\n") end,
     })

@@ -96,6 +96,7 @@
 - **等宽 O(1) 数学的前提是 mono 字体**：字形宽测量用 `CalcTextSize(64×'M')/64` 而非 1.93 内部 `ImFontBaked` API（baked-font 结构是 1.93 WIP 的过渡接口，勿依赖）。ASCII 日志字节 1:1 映射字形；非 ASCII 用 '?' 近似，选择命中足够。
 - **行命中测试用 `GetItemRectMin/Max`**（每行提交后的真实矩形），不要手算 scroll 偏移——`GetCursorScreenPos` 与滚动的语义极易算错。
 - **接收区工具栏不得进滚动子窗**：作为日志内容会被滚走；用 `SetCursorScreenPos` 钉屏幕空间更糟——屏幕坐标不随滚动平移，行的内容空间偏移变成 `f(Scroll.y)`，内容高度随滚动增长、滚动上限自我放大（探针实测 190 行日志到 7 万 px），尾部永远够不到。现结构：工具栏是监控列的一行（该窗口 `NoScrollbar|NoScrollWithMouse`，不滚动），日志子窗只装行。
+- **DLP：git 写出的工作区源码是密文**（头 `%TSD-Header-###%`，PowerShell 读到的是密文、`.NET` 写回的是明文）。后果是 `git checkout/merge/switch` 之后 **MSVC 编译必挂**：`C2018 未知字符 0x..` + `C1004 意外的文件尾`，看着像源码损坏。编译前先解密受影响文件：`python D:\DLP_Tools\dlp_decrypt_all.py <路径>`（或用 `git show HEAD:<path> | .NET WriteAllBytes` 直写，等价 `dlpctl.ps1` 的 git-blob 路线）。第 5 轮记的"源码永不走 bash 重定向写"是同一现象的早期版本。
 - **CRLF 归一只在 core 显示路径**（`format_payload<false>`）：hex 视图与 auto-save 日志（同源 display 缓冲）分别保持字节忠实/随归一；行偏移扫描因此可以只找 `\n`（孤立 `\r` 已在上游归一，历史分支已删）。
 - **`reserve` 时机**：热路径 vector 反复 clear+push_back 必须配 reserve；估算粒度无需精确（`n/32+2` 对 32 字节平均行宽，过估 2× 无害）。
 - Lua 侧同源优化见"接收显示窗口"节的游标裁剪；GC 按 ≥128 KiB 堆增量触发（勿按"有无输入"，输入密集会饿死收集器、持续流量会过度步进）。
@@ -230,3 +231,12 @@
 - **v23-vs-1.png 十项视觉差距（agent 像素审计，留作下轮 restyle 输入，按影响排序）**：①头部 chip→无边框图标 ②侧栏位置/底色（右#EEEEF0 vs 参考左白+1px #EFEFEF ③缺 3px #005A9E 工作/发送区分隔线 ④页脚顶线+琥珀计数+链接应 #004275 ⑤头分隔线 #C6C6C6→#EDEDED ⑥Logo 实心块→轮廓字形 ⑦内部 hairline 偏重 ⑧工具条字形应 #1B1B1B ⑨离线状态移页脚（可选）⑩发送按钮箭头→#FFFFFF。多数为 bridge palette 一行改色。
 - **验证状态**：DLL 已部署 runtime/（22:07 版含 base 重构 + 拖拽冻结）；应用以 `XCOM_SMOKE_OPEN=1 XCOM_SMOKE_SIM_PROFILE=text` 运行中（PID 38836）。**注意**：WARP 下 PrintWindow 可能截到纯黑帧（DX11 呈现线程空闲时不重绘），需先 `SetWindowPos` 挪 2px 逼一次真实帧再截（snap.py 已含 ShowWindow+SetForeground，但挪窗技巧未固化进脚本——待办）。
 - **本轮快照**：v30–v41（含 `pic/sel_v41.png` = text 流 109 行取证）。
+
+### 本轮（第 7 轮：接收区贴底/滚动条修复的实机验证 × DLL 重编，2026-09-14）
+> 承接 `story-fix(dm): reach the receive log's tail and keep its toolbar put`（daded13：bridge 源码已改，但提交信息自认 `runtime/xcom_imgui.dll` **仍需 Windows 重编**）。本轮把 DLL 编出来，并逐条实测用户提的三个行为。行号以符号/函数为准。
+- **DLL 重编（本轮关键交付）**：`runtime/xcom_imgui.dll` 之前是**修复前**的二进制（daded13 只改了 bridge.cpp），仓库、MSI、直接跑树都发旧件。按 `xcom_lua/native/xcom_imgui/build_imgui.cmd` 同参数（vcvars64 + `D:\Python314\Scripts` 的 cmake/ninja）重编并部署，sha256 `C4C61958…`；修复前件（49ed3c8 源码）留在 `D:\workspace\_xcom_verify\xcom_imgui_prefix_dll_D72E6561.dll` 供 A/B。**注意**：`native/xcom_imgui/build/` 里是旧对象，改完源码要让它重编（mtime 变了即可），别只看 `copy`。
+- **三个行为的实测结论（全通过）**：数据源 `XCOM_SIM_FORCE=1 XCOM_SMOKE_OPEN=1 XCOM_SMOKE_SIM_PROFILE=text`（sim 的 20ms pump 在**帧外**注入，正是尾窗增长的真实时序），并把 auto-save 日志当外部基准比对"最新已生成行"。① **持续收数据时最后一行可见**：4/4 采样，日志底行行号落在截图前/后基准之间（样本 3：底行 000299，基准 298→300），且该行完整绘制未被截断。② **贴底时滚动条可动**：滚轮 5 格把滑块 406..429 → 370..391；按住滑块本体上拖 150px → 418..429 → 268..279（按下瞬间滑块转 `ScrollbarGrabActive` 色，证明命中）；在滑块上方轨道按住 = 连续翻页。随后**跟随脱开**：继续来数据 2s，滑块停在 347..366 不动。③ **回到最底重新挂上**：把滑块拖到轨底释放后停在 413..429，之后 3s 持续数据仍钉在底部（最新行 516→565），底行即最新行。
+- **A/B 对照（修复前件）**：同样三个探针全部失败——日志区显示 **000001..000025** 而最新已生成 **456**（尾部根本够不到，与 daded13 描述的"内容空间随滚动自我放大"吻合）；同一次 150px 上拖把视图推向**反方向**（滑块 375..386 → 418..429）。
+- **滚动条没有上下箭头（用户追问）**：不是本次改动引入的——vendored **ImGui 1.93.0 WIP 的 `ScrollbarEx` 已不含 ArrowButton**（`imgui_widgets.cpp` :1031+，`ArrowButton` 只被滑块/输入控件用），style 里也没有箭头尺寸字段可开；`pic/1.png` 参考图同样只有轨道+滑块（3× 放大核对）。可动的等价交互 = 滚轮 / 轨道按住翻页 / 拖滑块，三者本轮均实测可用。若要真箭头，应自绘 12×12 按钮驱动 `SetScrollY`（勿改 vendored ImGui）。
+- **修正第 5 轮结论**：当年记的"合成鼠标点击到不了 ImGui Win32 后端"**不成立**——`SetCursorPos` + `mouse_event` + `SetForegroundWindow` 能完整驱动 ImGui（滑块 hover/active 配色、拖拽、滚轮全部有反应）。当时的"3 次点击 3 张相同帧"应是点在无可见副作用的控件上。做 UI 输入测试时：确认 `GetForegroundWindow() == hwnd`，并**按像素图定位命中目标**（本轮有一次按在滑块下方 4px 的"翻页区"，行为完全相反，白排查了半天）。
+- **测试基建**：新增 `XCOM_SIM_FORCE=1`（`ui/window.lua` 的 sim 构造把 `enabled` 交给环境变量），让 registry 里只有**幻影 COM 口**（本机 COM3，枚举得到但打不开）的机器也能进 E2E 冒烟路径；不设该变量时策略与原来逐位一致。探针脚本 + 两张取证截图留在 `D:\workspace\_xcom_verify\`。
