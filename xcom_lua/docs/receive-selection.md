@@ -80,14 +80,37 @@ stateDiagram-v2
   `imgui_bridge.lua:set_receive_text(text, base)` 里 `base = total - #tail`，经
   `optional_export` 探测后先推；**旧 DLL 缺该符号时自动退化**为 base=0（等价历史行为，不崩）。
 
-**拖拽中冻结贴底跟随**：
+**贴底跟随（每帧）**：
 
 ```cpp
-if (runtime.receive_follow_tail_ && !sel_dragging) ImGui::SetScrollHereY(1.0f);
+// 帧首判定（同一帧内 Scroll.y 已被上一次 Begin 应用；脱开/重挂靠它）
+const bool was_at_bottom = ImGui::GetScrollY() >= ImGui::GetScrollMaxY();
+// ... 行提交 ...
+// 帧尾：写"尽可能靠下"的目标（不是具体位置），并按住左键时冻结
+if (was_at_bottom && !ImGui::IsMouseDown(ImGuiMouseButton_Left))
+    ImGui::SetScrollY(kFollowTailTargetY);
 ```
 
-按住左键时新数据不再把文本从鼠标下抽走（否则选不到第三行以下）；松开后选区恢复随流上滚直至滑出。
-`IsMouseDown` 每帧权威，不存在 capture 丢失导致永久冻结。
+两条都踩过坑，改动时不要回退：
+
+- **必须写"目标"而不是"位置"**：`SetScrollY` 写的是 target，下一次 `Begin` 才应用并 clamp。
+  若按 `SetScrollHereY(1.0f)` 写具体位置，写入时的内容与生效时的内容差一帧；而尾窗是
+  **帧外**追加的（Lua 轮询在 render 之外推数据），于是贴底位置永远差"一个批次"——最新行
+  根本进不了可视区，滚动条下键也够不到底。写大值让下一次 Begin 用**当轮内容** clamp 才对。
+- **内容高度每帧强制**：ImGui 的 `ScrollMax` 来自**上一帧**的 content size
+  （`CalcWindowContentSizes` 在 `Begin()` 重置光标之前跑），帧外追加的行不在其中，
+  于是可达下界比真实尾部少一个批次。`ReceiveContent` 在创建日志子窗前用
+  `SetNextWindowContentSize` 按**行数 × 行高 + 行首偏移**（上一帧量得）强制内容高度，
+  让滚动条与跟随 pin 都对齐"这一帧屏幕上的尾部"。
+- **按住左键必须冻结**：子窗口的滚动条在 `Begin()` 内（body 之前）写自己的滚动目标，
+  下一次 `Begin` 才生效；帧尾的 pin 会把箭头点击/滑块拖动**原地覆盖**，于是贴底时
+  滚动条表现为"点不动"。`IsMouseDown` 每帧权威，松开后帧首判定自然重挂跟随，
+  不存在 capture 丢失导致永久冻结。
+- **工具栏（清空/保存/路径）必须在滚动子窗之外**：放在日志内容里会被滚走；改用
+  `SetCursorScreenPos` 钉在屏幕空间则更糟——屏幕坐标不随滚动平移，行的**内容空间**偏移
+  就变成 `f(Scroll.y)`：内容高度随滚动增长，滚动上限自我放大（探针实测 190 行日志可达
+  7 万 px），行也不再与滚动位置对应，尾部彻底够不到。现结构：工具栏是**监控列**的一行
+  （该窗口 `NoScrollbar|NoScrollWithMouse`，永不滚动），日志子窗只装行，几何自洽。
 
 **为什么不用内容前缀匹配**：曾想对比新旧缓冲求丢弃头部字节数，但换行边界处内容可能逐字节相同、
 匹配窗口可达 64KiB，热路径不可控，且本质是让 DLL 反向猜 Lua 窗口代数。改为 Lua 显式推 base，

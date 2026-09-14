@@ -397,6 +397,14 @@ public:
     std::string status_text_{};
     bool receive_follow_tail_ = true;
     float receive_scroll_y_ = 0.0f;
+    // Receive-clipper metrics carried from one frame to the next so the next
+    // frame can force the log child's content height (see ReceiveContent):
+    // rows_top_ is the rows' top offset in content space (0 now that the
+    // toolbar is a row of the parent, kept measured so a future band does not
+    // silently break the scroll range), row_h_ one row's height.  They are the
+    // same two quantities ImGui's own content-size calculation derives.
+    float receive_rows_top_ = 0.0f;
+    float receive_row_h_ = 0.0f;
     // Text selection over the receive log (drag with the left button).
     // sel_begin/sel_end are the ordered pair the renderer shades, kept in
     // ABSOLUTE lifetime bytes (see receive_base_) so a window slide cannot
@@ -1266,6 +1274,15 @@ bool QueueReceiveCopy(ImGuiRuntime& runtime, std::size_t begin_abs,
     return true;
 }
 
+// "As far down as the content goes": written as the follow-tail scroll target
+// and resolved at the NEXT Begin (SetScrollY stores a target, ImGui applies it
+// at the next Begin) against THAT frame's content size.  A concrete position
+// computed here is one frame -- one appended batch -- stale by the time it is
+// applied, which is what parked the viewport above the newest row.  Any value
+// past the content clamps to ScrollMax, so the constant only has to be larger
+// than any tail (receive_limit_ caps the content at 1 MiB).
+constexpr float kFollowTailTargetY = 1.0e9f;
+
 [[nodiscard]] int ReceiveContent(int rx_bytes, int tx_bytes, int* receive_hex, int* timestamp,
                    int* pause_display, int* auto_clear, int* auto_clear_bytes,
                    int* auto_save) {
@@ -1275,53 +1292,27 @@ bool QueueReceiveCopy(ImGuiRuntime& runtime, std::size_t begin_abs,
     // The receive panel reserves only the transmit workspace below it.
     constexpr float kTransmitSectionReserve = 0.0f;
     const float transmit_block = layout.send_height + kTransmitSectionReserve;
-    // 1.png: the receive log has no rectangular border — whitespace plus the
-    // hairlines around it do the separation.
-    const auto receive = Panel("##receive",
-                               ImVec2(0, layout.receive_height == 0.0f ? -transmit_block : layout.receive_height),
-                               false, 0, rgb(palette::kSurfaceLight));
     // Log utility toolbar (user: the path/save/clear icons were clipped at the
     // 180px sidebar's right edge; UartAssist/SSCOM keep them on the receive
     // area, which is always wide enough).  Right-aligned row of icon buttons
     // above the log; rendered BEFORE the empty-state early-return so the
     // buttons stay available even with no data yet.
-    // The pinned row's screen-space top and bottom.  Everything the panel draws
-    // below the bottom is clipped so the log cannot paint over the icons.
-    float icon_strip_top = 0.0f;
-    float icon_strip_bottom = 0.0f;
+    //
+    // It is a row of the MONITOR COLUMN, above the log child -- deliberately
+    // NOT part of the log's scrolling content.  As content it scrolled out of
+    // view the moment data arrived; pinning it in SCREEN space instead (the
+    // previous attempt) made the log's content-space geometry scroll-dependent,
+    // so a scrolled view moved the row offsets with it: the scroll range then
+    // grew as it was scrolled and the tail could never be reached.  This parent
+    // never scrolls (NoScrollbar | NoScrollWithMouse), so a plain content-space
+    // row stays put under follow-tail scrolling and is immune to a log line
+    // wider than the panel.
     {
-        // Anchor to the panel's VISIBLE top-right corner, in screen space.
-        //
-        // GetWindowWidth() is the scrollable CONTENT width: one log line longer
-        // than the panel widens it past the viewport, and a cursor X measured
-        // from it lands outside what the user can see — the three buttons
-        // disappeared entirely on any run with a wide line (reported twice;
-        // reproduces only once a line overflows, e.g. when the window is
-        // narrowed). GetContentRegionAvail() cannot fix that either when fed
-        // back through GetCursorPosX, because it is already relative to the
-        // cursor: the sum is identically GetWindowWidth().
-        //
-        // Screen space is immune to the scroll offset, so take the cursor's
-        // screen position (which is the panel's inner left edge plus whatever
-        // the cursor already advanced, i.e. its left edge here) and add the
-        // visible width. The row then stays pinned to the corner regardless of
-        // how far the content scrolls horizontally.
-        // X stays in screen space: GetWindowWidth() is the scrollable CONTENT
-        // width, so one log line wider than the panel puts the row past the
-        // viewport.  Y must be the VIEWPORT top, not the content cursor's
-        // screen Y -- that tracks the CONTENT origin, so the moment the log
-        // outgrows the panel and follow-tail scrolls it, the row is drawn
-        // above the visible area and disappears, which is exactly why the
-        // buttons still vanished after the X fix.  The scrollbar is reserved
-        // too: ImGui draws it LAST, so a row flush to the right edge loses its
-        // rightmost icon under the track.
-        const ImVec2 panel_pos = ImGui::GetWindowPos();
-        const float visible_right = panel_pos.x + ImGui::GetWindowSize().x -
-                                    ImGui::GetStyle().ScrollbarSize;
-        icon_strip_top = panel_pos.y + 2.0f;
-        ImGui::SetCursorScreenPos(ImVec2(
-            visible_right - 3.0f * 28.0f - 2.0f * 4.0f - kSidebarInset,
-            icon_strip_top));
+        constexpr float kIconStripW = 3.0f * 28.0f + 2.0f * 4.0f + kSidebarInset;
+        const float strip_avail = ImGui::GetContentRegionAvail().x;
+        if (strip_avail > kIconStripW) {
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + strip_avail - kIconStripW);
+        }
         actions |= Command<Action::ActionClear>::Execute(
             [] { return IconButton("##clear_log", UtilityIcon::Clear,
                                    ImGuiRuntime::instance().lang().clear_tip); });
@@ -1333,17 +1324,33 @@ bool QueueReceiveCopy(ImGuiRuntime& runtime, std::size_t begin_abs,
         actions |= Command<Action::ActionChooseLogPath>::Execute(
             [] { return IconButton("##choose_log_path", UtilityIcon::Path,
                                    ImGuiRuntime::instance().lang().path_tip); });
-        icon_strip_bottom = ImGui::GetItemRectMax().y;
     }
-    // Clip the panel's remaining output below the pinned row.  The log is
-    // submitted after the icons, so without this it would draw over them and,
-    // because ImGui resolves hover against the clip rect, also take their
-    // clicks.  Both returns below pop this.
-    ImGui::PushClipRect(
-        ImVec2(ImGui::GetWindowPos().x, icon_strip_bottom),
-        ImVec2(ImGui::GetWindowPos().x + ImGui::GetWindowSize().x,
-               ImGui::GetWindowPos().y + ImGui::GetWindowSize().y),
-        true);
+    // The log child fills everything above the transmit workspace.  The negative
+    // height is measured from the cursor -- i.e. below the toolbar row -- so the
+    // toolbar's band comes out of the log with no arithmetic here.  The child
+    // then holds nothing but log rows, which is what keeps its content space
+    // self-consistent (see the toolbar note above).
+    //
+    // Its scroll range also has to cover the tail that is on screen THIS frame:
+    // ImGui computes ScrollMax from the content size of the PREVIOUS frame
+    // (CalcWindowContentSizes runs before Begin() resets the cursor), and this
+    // buffer grows between frames -- the Lua poll appends outside the frame --
+    // so the reachable bottom otherwise stays exactly one appended batch short
+    // and the newest line(s) can never be scrolled into view.  Force it from the
+    // row count about to be rendered (0 keeps the horizontal axis automatic);
+    // the row metrics are the previous frame's, so a font or geometry change
+    // costs at most one frame of a few pixels.
+    // 1.png: the receive log has no rectangular border — whitespace plus the
+    // hairlines around it do the separation.
+    const std::size_t row_count = runtime.receive_line_offsets_.size();
+    if (row_count > 1U && runtime.receive_row_h_ > 0.0f) {
+        ImGui::SetNextWindowContentSize(
+            ImVec2(0.0f, runtime.receive_rows_top_ +
+                            static_cast<float>(row_count) * runtime.receive_row_h_));
+    }
+    const auto receive = Panel("##receive",
+                               ImVec2(0, layout.receive_height == 0.0f ? -transmit_block : layout.receive_height),
+                               false, 0, rgb(palette::kSurfaceLight));
     if (runtime.receive_text_.empty()) {
         EmptyState(ImGuiRuntime::instance().lang().waiting, {});
         runtime.receive_follow_tail_ = true;
@@ -1354,7 +1361,6 @@ bool QueueReceiveCopy(ImGuiRuntime& runtime, std::size_t begin_abs,
         runtime.receive_sel_end_ = 0;
         runtime.receive_sel_drag_hit_ = false;
         runtime.receive_base_ = 0;
-        ImGui::PopClipRect();
         return actions;
     }
     // Official ImGui log-window pattern (imgui_demo.cpp ShowExampleAppLog):
@@ -1449,6 +1455,16 @@ bool QueueReceiveCopy(ImGuiRuntime& runtime, std::size_t begin_abs,
     // (see receive_base_); line offsets and hit tests below are window
     // offsets, so every absolute <-> window crossing goes through `base`.
     const std::size_t base = runtime.receive_base_;
+    // Row metrics for the next frame's forced content size (see the panel
+    // setup above).  The rows start at the cursor right here: its screen Y
+    // minus the window origin, plus the scroll, is the rows' top offset in
+    // content space -- the same measure CalcWindowContentSizes takes between
+    // the cursor and the content start.  Nothing but the rows is in this child,
+    // so the offset is the child's own padding (0 here: style.WindowPadding is
+    // 0 and the child is borderless).
+    runtime.receive_rows_top_ = ImGui::GetCursorScreenPos().y -
+                                ImGui::GetWindowPos().y + ImGui::GetScrollY();
+    runtime.receive_row_h_ = ImGui::GetTextLineHeight();
     ImGuiListClipper clipper;
     clipper.Begin(static_cast<int>(offsets.size()));
     while (clipper.Step()) {
@@ -1758,15 +1774,24 @@ bool QueueReceiveCopy(ImGuiRuntime& runtime, std::size_t begin_abs,
     // the next frame, so popping before the popup costs nothing. popped_mono
     // keeps the ScopedAction from popping a second time at function exit.
     if (mono_ok) { ImGui::PopFont(); popped_mono = true; }
-    // Follow-tail pin, official pattern: only when the view was at the bottom
-    // at the START of the frame, called after all rows are submitted so the
-    // scroll range reflects the new content.  An IN-PROGRESS drag freezes the
-    // pin: chasing the tail while the mouse is held would slide the text out
-    // from under the drag and cap the selection at the first visible row.
-    // A persisted selection (button released) deliberately does NOT freeze —
-    // the highlight travels upward with its lines until it leaves the window.
-    if (runtime.receive_follow_tail_ && !sel_dragging) {
-        ImGui::SetScrollHereY(1.0f);
+    // Follow-tail pin: only when the view was at the bottom at the START of the
+    // frame (the latch above), called after all rows are submitted so the scroll
+    // range reflects the new content.  The target is "as far down as the content
+    // goes", resolved at the next Begin against that frame's forced content size
+    // (see the panel setup) -- a position computed here is one frame stale by
+    // then and would park the viewport one appended batch above the newest row.
+    //
+    // A held left button freezes the pin.  ImGui hands a CHILD window's
+    // scrollbar its own scroll target during Begin(), i.e. BEFORE this body
+    // runs, and that target is applied at the following Begin() -- so a pin
+    // written here silently overwrote an arrow click or a thumb drag and the
+    // scrollbar looked dead whenever the view sat at the bottom.  The latch
+    // re-decides the follow on the frame after the input lands, so releasing the
+    // button hands the viewport back to the follow; holding it also keeps the
+    // drag-selection freeze (chasing the tail would slide the text out from
+    // under the drag and cap the selection at the first visible row).
+    if (runtime.receive_follow_tail_ && !ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+        ImGui::SetScrollY(kFollowTailTargetY);
     }
     runtime.receive_scroll_y_ = ImGui::GetScrollY();
     // Right-click context menu: the read-only multiline editor doesn't expose
@@ -1849,7 +1874,6 @@ bool QueueReceiveCopy(ImGuiRuntime& runtime, std::size_t begin_abs,
         }
         ImGui::EndPopup();
     }
-    ImGui::PopClipRect();
     return actions;
 }
 

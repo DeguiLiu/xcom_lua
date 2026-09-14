@@ -88,13 +88,14 @@
 | 窗口收缩重索引 | 配置变更 | 后缀不变性：旧 offsets 减删除量（`lower_bound`+线性平移） | 全量重扫 |
 | 渲染（`ReceiveContent`） | 每帧 | `ImGuiListClipper` O(可视行)；官方 `ShowExampleAppLog` 模式 | `InputTextMultiline`（stb_textedit 全量重排 + 只认 `\n` + 光标/滚动状态竞争） |
 | 选择命中/背景 | 拖拽帧 | **等宽字体 O(1) 数学**：一次测量 64 个 'M' 均摊字形宽，`count × glyph_w` | 每字节一次 `CalcTextSize`（O(line²)）；每选中行两次整段测量 |
-| 滚动跟随 | 每帧 | demo 精确规则：帧首 `GetScrollY()>=GetScrollMaxY()` 判定 + 行提交后 `SetScrollHereY(1.0f)` | 事后 `SetScrollY(GetScrollMaxY())`（新 max 上追赶，两帧间振荡） |
+| 滚动跟随 | 每帧 | 帧首 `GetScrollY()>=GetScrollMaxY()` 判定脱开/重挂 + 帧尾写"尽可能靠下"的滚动目标（`SetScrollY` 大值，由下一次 Begin 用**本轮强制的**内容高度 clamp）；按住左键时冻结 | ① 旧实现 `SetScrollHereY(1.0f)` 写**具体位置**：写入与生效隔一帧，而尾窗是**帧外**追加的，于是贴底位置永远差一个批次（最新行进不了可视区）；② 子窗口的滚动条在 `Begin()` 内（body 之前）写目标、下一次 `Begin` 才生效，帧尾的 pin 会把箭头/拖动输入原地覆盖 → 贴底时滚动条"点不动" |
 | Lua 接收裁剪 | 每次 drain | 游标淘汰整块 O(1) | `table.remove(chunks,1)` O(n) 搬移 |
 
 要点与约束：
 
 - **等宽 O(1) 数学的前提是 mono 字体**：字形宽测量用 `CalcTextSize(64×'M')/64` 而非 1.93 内部 `ImFontBaked` API（baked-font 结构是 1.93 WIP 的过渡接口，勿依赖）。ASCII 日志字节 1:1 映射字形；非 ASCII 用 '?' 近似，选择命中足够。
 - **行命中测试用 `GetItemRectMin/Max`**（每行提交后的真实矩形），不要手算 scroll 偏移——`GetCursorScreenPos` 与滚动的语义极易算错。
+- **接收区工具栏不得进滚动子窗**：作为日志内容会被滚走；用 `SetCursorScreenPos` 钉屏幕空间更糟——屏幕坐标不随滚动平移，行的内容空间偏移变成 `f(Scroll.y)`，内容高度随滚动增长、滚动上限自我放大（探针实测 190 行日志到 7 万 px），尾部永远够不到。现结构：工具栏是监控列的一行（该窗口 `NoScrollbar|NoScrollWithMouse`，不滚动），日志子窗只装行。
 - **CRLF 归一只在 core 显示路径**（`format_payload<false>`）：hex 视图与 auto-save 日志（同源 display 缓冲）分别保持字节忠实/随归一；行偏移扫描因此可以只找 `\n`（孤立 `\r` 已在上游归一，历史分支已删）。
 - **`reserve` 时机**：热路径 vector 反复 clear+push_back 必须配 reserve；估算粒度无需精确（`n/32+2` 对 32 字节平均行宽，过估 2× 无害）。
 - Lua 侧同源优化见"接收显示窗口"节的游标裁剪；GC 按 ≥128 KiB 堆增量触发（勿按"有无输入"，输入密集会饿死收集器、持续流量会过度步进）。
