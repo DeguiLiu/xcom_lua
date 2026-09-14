@@ -5,6 +5,7 @@
 XCOM 是 Windows 串口调试工具：核心为原生 C++17 DLL（`xcom_core`），界面为
 LuaJIT + Dear ImGui 客户端（`xcom_lua`），支持异步文本/十六进制收发、时间戳、
 自动发送、Lua 脚本系统、波形面板，以及 DirectX 11（WARP 软件兜底）渲染。
+<img width="1024" height="720" alt="image" src="https://github.com/user-attachments/assets/b43da6dd-b5fc-497d-8dc5-a763531db028" />
 
 ## 进程与线程拓扑
 
