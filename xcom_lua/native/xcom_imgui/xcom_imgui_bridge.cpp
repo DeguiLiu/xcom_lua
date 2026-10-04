@@ -423,6 +423,17 @@ public:
     std::string status_text_{};
     bool receive_follow_tail_ = true;
     float receive_scroll_y_ = 0.0f;
+    // Scroll range companion of receive_scroll_y_ (same capture point, same
+    // frame).  Published for the automated drag-selection check: the freeze
+    // contract is "scroll_y holds while scroll_max grows", and neither number
+    // is observable from Lua any other way.
+    float receive_scroll_max_ = 0.0f;
+    // Screen rect of the receive log child, published for the same check.  It
+    // is the only authoritative answer to "where can a driver press a text
+    // row": re-deriving it in Lua from layout.toml is what made the earlier
+    // pixel probe a false negative -- its click landed outside the log, so the
+    // drag state was never entered and nothing was being tested.
+    ImRect receive_log_rect_{};
     // Press offset inside the receive log's custom scrollbar grab (see
     // ArrowScrollbar): kept from the frame that grabbed the thumb so the drag
     // seeks absolutely without teleporting the content under the cursor.
@@ -1594,6 +1605,7 @@ void ArrowScrollbar(const ImVec2 bar_min, const ImVec2 bar_max, float row_h,
         EmptyState(ImGuiRuntime::instance().lang().waiting, {});
         runtime.receive_follow_tail_ = true;
         runtime.receive_scroll_y_ = 0.0f;
+        runtime.receive_scroll_max_ = 0.0f;
         // Nothing left to select: an empty buffer invalidates any range.
         runtime.receive_sel_anchor_ = kNoSelAnchor;
         runtime.receive_sel_begin_ = 0;
@@ -1620,6 +1632,11 @@ void ArrowScrollbar(const ImVec2 bar_min, const ImVec2 bar_max, float row_h,
     const ImVec2 scrollbar_max(ImGui::GetWindowPos().x + ImGui::GetWindowSize().x,
                                ImGui::GetWindowPos().y + ImGui::GetWindowSize().y);
     const bool over_scrollbar = ImGui::IsMouseHoveringRect(scrollbar_min, scrollbar_max, false);
+    // Publish the log rect for xcom_imgui_get_receive_rect (see the field).
+    runtime.receive_log_rect_ =
+        ImRect(ImGui::GetWindowPos(),
+               ImVec2(ImGui::GetWindowPos().x + ImGui::GetWindowSize().x,
+                      ImGui::GetWindowPos().y + ImGui::GetWindowSize().y));
     // NoScrollbar does not reserve a gutter, so the custom bar is painted on
     // top of the rows.  Clip them to its left edge when the bar is needed;
     // the bar itself is drawn after the matching pop.
@@ -2197,6 +2214,7 @@ void ArrowScrollbar(const ImVec2 bar_min, const ImVec2 bar_max, float row_h,
                    runtime.receive_scroll_grab_delta_,
                    runtime.receive_scroll_seek_);
     runtime.receive_scroll_y_ = ImGui::GetScrollY();
+    runtime.receive_scroll_max_ = ImGui::GetScrollMaxY();
     // Right-click context menu: the read-only multiline editor doesn't expose
     // one by default, so attach one explicitly.  The popup id is scoped to
     // the receive panel so other panels' right-clicks are unaffected.
@@ -4496,6 +4514,7 @@ extern "C" __declspec(dllexport) void xcom_imgui_set_receive_text(
         runtime.receive_line_offsets_.assign(1, 0);
         runtime.receive_follow_tail_ = true;
         runtime.receive_scroll_y_ = 0.0f;
+        runtime.receive_scroll_max_ = 0.0f;
         runtime.receive_base_ = 0;
         runtime.receive_sel_anchor_ = kNoSelAnchor;
         runtime.receive_sel_begin_ = 0;
@@ -4886,6 +4905,50 @@ extern "C" __declspec(dllexport) int xcom_imgui_selection_dragging(void) {
     auto& runtime = ImGuiRuntime::instance();
     if (!extension_ready(runtime)) return 0;
     return runtime.receive_sel_anchor_ == kSelDragging ? 1 : 0;
+}
+
+// Read-only telemetry for the automated receive-selection check
+// (xcom_lua/tests/e2e_drag_freeze.lua).  Whether the tail-follow freezes during
+// a drag-select is decided by state inside the render frame, so pixels cannot
+// prove it: a synthetic click that misses the log looks identical to a held
+// drag that works.  These getters let the driver assert the whole contract from
+// inside the process -- press point, drag state, and "scroll_y held while
+// scroll_max grew".  Pixels truncate to ints: the check compares equality and
+// bounds, never sub-pixel deltas.
+extern "C" __declspec(dllexport) void xcom_imgui_get_receive_scroll(
+    int* scroll_y_out, int* scroll_max_out) {
+    auto& runtime = ImGuiRuntime::instance();
+    if (!extension_ready(runtime)) return;
+    if (scroll_y_out != nullptr) *scroll_y_out = static_cast<int>(runtime.receive_scroll_y_);
+    if (scroll_max_out != nullptr) *scroll_max_out = static_cast<int>(runtime.receive_scroll_max_);
+}
+
+// Screen rect (left/top/width/height) of the receive log child.  A driver that
+// guesses the point from layout.toml can land on the sidebar, the send box or
+// the custom scrollbar column instead -- all three swallow the press without
+// starting a selection, and the check then silently tests nothing.
+extern "C" __declspec(dllexport) void xcom_imgui_get_receive_rect(
+    int* x_out, int* y_out, int* w_out, int* h_out) {
+    auto& runtime = ImGuiRuntime::instance();
+    if (!extension_ready(runtime)) return;
+    const ImRect& rect = runtime.receive_log_rect_;
+    if (x_out != nullptr) *x_out = static_cast<int>(rect.Min.x);
+    if (y_out != nullptr) *y_out = static_cast<int>(rect.Min.y);
+    if (w_out != nullptr) *w_out = static_cast<int>(rect.Max.x - rect.Min.x);
+    if (h_out != nullptr) *h_out = static_cast<int>(rect.Max.y - rect.Min.y);
+}
+
+// The live selection as ABSOLUTE stream bytes (the same coordinate space the
+// base reported by xcom_imgui_get_receive_text uses).  end - begin > 0 proves
+// the gesture selected real bytes: xcom_imgui_selection_dragging() alone only
+// says a press entered the drag state, and a drag whose hit test never landed
+// on a row keeps an empty range.
+extern "C" __declspec(dllexport) void xcom_imgui_get_receive_selection(
+    int* begin_out, int* end_out) {
+    auto& runtime = ImGuiRuntime::instance();
+    if (!extension_ready(runtime)) return;
+    if (begin_out != nullptr) *begin_out = static_cast<int>(runtime.receive_sel_begin_);
+    if (end_out != nullptr) *end_out = static_cast<int>(runtime.receive_sel_end_);
 }
 
 // Send-box command history, pushed by Lua newest-first (it owns the list:

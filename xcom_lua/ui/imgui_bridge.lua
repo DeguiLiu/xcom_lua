@@ -25,6 +25,14 @@ void xcom_imgui_set_copy_strip(int* enabled);
  * selection by design (correct for an explicit clear, wrong mid-gesture).
  * Probed optionally, so an older DLL keeps today's behaviour. */
 int xcom_imgui_selection_dragging(void);
+/* Read-only telemetry for the automated drag-selection check
+ * (tests/e2e_drag_freeze.lua).  The freeze contract "scroll_y holds while the
+ * stream grows" lives inside the render frame, so pixels cannot prove it: a
+ * synthetic click that misses the log and a held drag that works look the same
+ * on screen.  The rect is the authoritative press point. */
+void xcom_imgui_get_receive_scroll(int* scroll_y_out, int* scroll_max_out);
+void xcom_imgui_get_receive_rect(int* x_out, int* y_out, int* w_out, int* h_out);
+void xcom_imgui_get_receive_selection(int* begin_out, int* end_out);
 /* Send-box command history (Lua owns the list; newest first, NUL-separated).
  * The editor shows it as a visible list rather than Up/Down: ImGui asserts
  * CallbackHistory is incompatible with a Multiline box, so the widget uses a
@@ -365,6 +373,51 @@ end
 -- guard degrades to today's behaviour instead of hiding a feature.
 function M:selection_dragging()
     return selection_dragging_export ~= nil and selection_dragging_export() ~= 0
+end
+
+-- Telemetry for the same check, probed once like every other extension: an
+-- older DLL resolves the exports to nil and the wrappers return nil, so the
+-- driver reports "rebuild the DLL" instead of asserting on stale state.
+local get_receive_scroll_export = optional_export("xcom_imgui_get_receive_scroll")
+local get_receive_rect_export = optional_export("xcom_imgui_get_receive_rect")
+local get_receive_selection_export = optional_export("xcom_imgui_get_receive_selection")
+
+-- Shared scratch for the out params: the driver polls on a timer, and four new
+-- cints per tick would be pure garbage.
+local function out_scratch(self)
+    local buf = self._view_out_scratch
+    if not buf then
+        buf = ffi.new("int[4]")
+        self._view_out_scratch = buf
+    end
+    return buf
+end
+
+--- Live scroll state of the receive log: pixels from the top, pixels of range.
+--- y >= max is the "sitting on the tail" state the follow pin must hold.
+function M:receive_scroll()
+    if not get_receive_scroll_export then return nil end
+    local o = out_scratch(self)
+    get_receive_scroll_export(o, o + 1)
+    return tonumber(o[0]), tonumber(o[1])
+end
+
+--- Screen rect of the receive log child: left, top, width, height.  The only
+--- trustworthy place to press a text row (see the cdef comment above).
+function M:receive_rect()
+    if not get_receive_rect_export then return nil end
+    local o = out_scratch(self)
+    get_receive_rect_export(o, o + 1, o + 2, o + 3)
+    return tonumber(o[0]), tonumber(o[1]), tonumber(o[2]), tonumber(o[3])
+end
+
+--- Current selection as absolute stream bytes: begin, end (end > begin once a
+--- drag has hit a row).
+function M:receive_selection()
+    if not get_receive_selection_export then return nil end
+    local o = out_scratch(self)
+    get_receive_selection_export(o, o + 1)
+    return tonumber(o[0]), tonumber(o[1])
 end
 
 function M:append_receive(delta)
