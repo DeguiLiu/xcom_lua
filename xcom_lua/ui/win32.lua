@@ -112,7 +112,7 @@ M.IDI_APP = 1
 
 -- Load the launcher exe as a data file purely to read its icon resource. The
 -- window belongs to the interpreter process, so GetModuleHandleA(NULL) returns
--- luvjit.exe — whose resources hold no IDI_APP — and the taskbar fell back to
+-- luvjit.exe ? whose resources hold no IDI_APP ? and the taskbar fell back to
 -- the generic application icon. Mapping xcom.exe lets LoadIconA find the real
 -- one without executing it.
 M.LOAD_LIBRARY_AS_DATAFILE = 0x00000002
@@ -330,7 +330,7 @@ typedef unsigned short WORD;
 typedef int BOOL;
 typedef unsigned char BYTE;
 typedef char CHAR;
-/* WPARAM is UINT_PTR (unsigned); LPARAM is LONG_PTR (signed) — verified
+/* WPARAM is UINT_PTR (unsigned); LPARAM is LONG_PTR (signed) ? verified
  * against ref/win32_api_luajit-master/winapi_winusertypes.lua. */
 typedef uintptr_t WPARAM;
 typedef intptr_t LPARAM;
@@ -528,6 +528,16 @@ BOOL GetClassNameW(HWND hWnd, LPWSTR lpClassName, int nMaxCount);
 
 void GetCursorPos(POINT* lpPoint);
 BOOL SetCursorPos(int X, int Y);
+/* Injected button events, for the automated receive-selection check
+ * (tests/e2e_drag_freeze.lua).  The ImGui Win32 backend consumes ordinary
+ * WM_MOUSEMOVE / WM_LBUTTONDOWN messages, so a real OS-level injection drives
+ * the same gesture state machine a hand does.  What injection cannot control
+ * is which window receives the click, so the caller has to convert its own
+ * client coordinates to screen first (WindowFromPoint takes POINT by value,
+ * which this FFI layer cannot express, so the driver proves the press landed
+ * by watching the drag state instead). */
+void mouse_event(DWORD dwFlags, DWORD dx, DWORD dy,
+                 DWORD cButtons, uintptr_t dwExtraInfo);
 
 /* winmm timer resolution: MsgWaitForMultipleObjectsEx sleeps in units of the
  * system timer (15.6 ms by default), which delays the 10 ms luv drain
@@ -560,7 +570,7 @@ int WideCharToMultiByte(UINT codePage, DWORD flags, const unsigned short* src,
                         int srcLen, char* dst, int dstLen, const char* defChar,
                         BOOL* usedDefChar);
 
-// Common Item Dialog (comdlg32) — save dialog.
+// Common Item Dialog (comdlg32) ? save dialog.
 // OFN_ENABLEHOOK hook proc, the same shape as LPOFNHOOKPROC in commdlg.h
 // (UINT_PTR return, __stdcall).  window.lua installs one via lpfnHook so the
 // luv receive drain keeps running while the dialog's modal message loop owns
