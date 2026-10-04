@@ -14,6 +14,7 @@
 #include <array>
 #include <cstdint>
 #include <cfloat>
+#include <cmath>
 #include <cstring>
 
 #include "imgui.h"
@@ -1329,6 +1330,11 @@ void ArrowScrollbar(const ImVec2 bar_min, const ImVec2 bar_max, float row_h,
     // show through beside the track.
     draw->AddRectFilled(bar_min, bar_max, ImGui::GetColorU32(ImGuiCol_ScrollbarBg));
     float scroll = ImGui::GetScrollY();
+    // A NaN left by the old grab division never compares equal to the bottom,
+    // so follow stays detached.  Park the thumb on the tail instead.
+    if (!std::isfinite(scroll)) {
+        scroll = scroll_max;
+    }
     // Borderless child, no window padding: the content is exactly the scroll
     // range plus one viewport (the same two quantities ImGui's own bar uses).
     const float visible_h = ImGui::GetWindowHeight();
@@ -1425,7 +1431,10 @@ void ArrowScrollbar(const ImVec2 bar_min, const ImVec2 bar_max, float row_h,
         style.ScrollbarRounding);
 
     scroll = ImClamp(scroll, 0.0f, scroll_max);
-    if (scroll >= scroll_max) {
+    // Only while this bar is held.  Writing the tail target whenever the view
+    // already sits on the bottom re-pins follow every frame and undoes the
+    // left-button freeze, so a drag-selection on the live tail chases new rows.
+    if (held && scroll >= scroll_max) {
         // Parked on the very bottom: ask for the TAIL TARGET instead of this
         // frame's last pixel.  The follow latch compares pixels, and this
         // buffer grows between frames in whole rows, so a concrete position
@@ -1540,9 +1549,22 @@ void ArrowScrollbar(const ImVec2 bar_min, const ImVec2 bar_max, float row_h,
     const ImVec2 scrollbar_max(ImGui::GetWindowPos().x + ImGui::GetWindowSize().x,
                                ImGui::GetWindowPos().y + ImGui::GetWindowSize().y);
     const bool over_scrollbar = ImGui::IsMouseHoveringRect(scrollbar_min, scrollbar_max, false);
+    // NoScrollbar does not reserve a gutter, so the custom bar is painted on
+    // top of the rows.  Clip them to its left edge when the bar is needed;
+    // the bar itself is drawn after the matching pop.
+    const bool clip_log_to_bar = ImGui::GetScrollMaxY() > 0.0f;
     // Capture the at-bottom state BEFORE any rendering mutates the scroll
     // range.  Scrolling away (wheel/drag/scrollbar) makes this false, which
     // detaches the follow; scrolling back to the bottom re-attaches it.
+    // Recover a non-finite Scroll.y (the short-log 0/0) before the latch.
+    // Comparisons with NaN are all false, so follow would never re-arm.
+    {
+        ImGuiWindow* const log_window = ImGui::GetCurrentWindow();
+        if (!std::isfinite(log_window->Scroll.y)) {
+            const float recovered = ImGui::GetScrollMaxY();
+            log_window->Scroll.y = std::isfinite(recovered) ? recovered : 0.0f;
+        }
+    }
     const bool was_at_bottom =
         ImGui::GetScrollY() >= ImGui::GetScrollMaxY();
     runtime.receive_follow_tail_ = was_at_bottom;
@@ -1634,6 +1656,10 @@ void ArrowScrollbar(const ImVec2 bar_min, const ImVec2 bar_max, float row_h,
     runtime.receive_rows_top_ = ImGui::GetCursorScreenPos().y -
                                 ImGui::GetWindowPos().y + ImGui::GetScrollY();
     runtime.receive_row_h_ = ImGui::GetTextLineHeight();
+    if (clip_log_to_bar) {
+        ImGui::PushClipRect(ImGui::GetWindowPos(),
+                            ImVec2(scrollbar_min.x, scrollbar_max.y), true);
+    }
     ImGuiListClipper clipper;
     clipper.Begin(static_cast<int>(offsets.size()));
     while (clipper.Step()) {
@@ -1652,7 +1678,12 @@ void ArrowScrollbar(const ImVec2 bar_min, const ImVec2 bar_max, float row_h,
             // shortcut, rows with non-ASCII bytes fall back to measured
             // advances (GB2312->UTF-8 log text is 3 bytes per CJK glyph,
             // so a byte*glyph_w column math would land inside sequences).
+            // Selection and highlight are the only consumers of per-byte columns.
+            // The steady follow path skips the scan.
+            const bool measure_columns =
+                has_selection || sel_dragging || !runtime.highlight_rules_.empty();
             const bool ascii_only =
+                !measure_columns ||
                 std::none_of(line_begin, line_end,
                              [](char c) { return (c & 0x80) != 0; });
             // Pixel x of a byte offset inside this row (row-relative).  The
@@ -1955,10 +1986,13 @@ void ArrowScrollbar(const ImVec2 bar_min, const ImVec2 bar_max, float row_h,
     // runs, and that target is applied at the following Begin() -- so a pin
     // written here silently overwrote an arrow click or a thumb drag and the
     // scrollbar looked dead whenever the view sat at the bottom.  The latch
-    // re-decides the follow on the frame after the input lands, so releasing the
-    // button hands the viewport back to the follow; holding it also keeps the
-    // drag-selection freeze (chasing the tail would slide the text out from
-    // under the drag and cap the selection at the first visible row).
+    // re-decides the follow on the frame after the input lands: releasing hands
+    // the viewport back to the follow ONLY when the view is on the tail again
+    // (a thumb drag parked on the bottom), whereas a text drag-selection that
+    // left the tail stays parked on release -- by design, so the rows under the
+    // cursor cannot scroll out from under the copy.  Holding the button keeps
+    // that freeze either way (chasing the tail mid-drag would slide the text
+    // out from under the drag and cap the selection at the first visible row).
     if (runtime.receive_follow_tail_ && !ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
         ImGui::SetScrollY(kFollowTailTargetY);
     }
@@ -1966,6 +2000,9 @@ void ArrowScrollbar(const ImVec2 bar_min, const ImVec2 bar_max, float row_h,
     // so the user's input is the last word inside the frame -- a held button
     // already suppresses the pin above, which is what lets an arrow click or a
     // thumb drag win while the view is pinned at the bottom.
+    if (clip_log_to_bar) {
+        ImGui::PopClipRect();
+    }
     ArrowScrollbar(scrollbar_min, scrollbar_max, line_h,
                    runtime.receive_scroll_grab_delta_,
                    runtime.receive_scroll_seek_);
@@ -4216,11 +4253,15 @@ extern "C" __declspec(dllexport) void xcom_imgui_receive_append(
     // the trim is DEFERRED, so every absolute selection byte keeps the same
     // window offset for the whole drag -- otherwise a heavy stream would erase
     // the prefix, advance receive_base_ and slide the selected text out from
-    // under the held cursor.  The deferred trim is performed by the render loop
-    // on the frame the left button is observed released (ReceiveContent), which
-    // restores text.size() <= receive_limit_ after every drag.
-    if (text.size() > runtime.receive_limit_ &&
-        runtime.receive_sel_anchor_ != kSelDragging) {
+    // under the held cursor.  The deferral is capped at 256 KiB past the
+    // limit; past that the prefix is trimmed back to the limit in one step so
+    // a held button cannot grow the tail without bound.  Whatever remains is
+    // trimmed by the render loop on the frame the button is released.
+    constexpr std::size_t kDragTrimSlack = 256U * 1024U;
+    const bool dragging = runtime.receive_sel_anchor_ == kSelDragging;
+    const std::size_t trim_at = dragging ? runtime.receive_limit_ + kDragTrimSlack
+                                         : runtime.receive_limit_;
+    if (text.size() > trim_at) {
         const std::size_t erase_n = text.size() - runtime.receive_limit_;
         text.erase(0, erase_n);
         runtime.receive_base_ += erase_n;
