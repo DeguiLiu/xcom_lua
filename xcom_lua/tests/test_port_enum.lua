@@ -106,6 +106,24 @@ if os.getenv("XCOM_PORT_PROBE") == nil then
     eq("probe_enabled_by_env default false", x.probe_enabled_by_env(), false)
 end
 
+-- 2b) an EXPLICIT probe=false must survive XCOM_PORT_PROBE=1 --------------
+-- The 1 Hz backstop passes false on purpose: probing exclusively opens every
+-- present port, which is the most expensive enumeration AND pulses DTR on some
+-- bridges (a board wired for auto-reset would reboot).  The env flag is a
+-- default for callers that expressed no preference, never an override of one.
+local real_getenv = os.getenv
+os.getenv = function(key)
+    if key == "XCOM_PORT_PROBE" then return "1" end
+    return real_getenv(key)
+end
+local _, _ = x.list_ports({ probe = false })
+eq("explicit probe=false beats XCOM_PORT_PROBE=1", last_flags, 0)
+local _, _ = x.list_ports()
+eq("env default still applies with no opts", last_flags, x.PROBE_BUSY)
+local _, _ = x.list_ports({ probe = true })
+eq("explicit probe=true still probes", last_flags, x.PROBE_BUSY)
+os.getenv = real_getenv
+
 -- 3) enumeration failure with an empty result -----------------------------
 lib.xcom_list_ports_ex = function(buf, cap, count, flags, err)
     count[0] = 0
@@ -328,10 +346,43 @@ do
     win._port_want = "COM7"
     win:on_btn_refresh()
     eq("regression: composed label keeps COM7 selected", sel_key(win, model), "COM7")
-    eq("regression: COM7 label is composed", model.items[2], "COM7  USB Serial  (busy)")
+    eq("regression: COM7 label is composed", model.items[2], "COM7  USB Serial  （被占用）")
     eq("regression: selection is NOT index 0", model.sel, 1)
     -- The ABI must receive the BARE name, not the composed label.
     eq("regression: _serial_config port is bare", win:_serial_config().port, "COM7")
+end
+
+-- 1b) ImGui combo: the "（被占用）" mark rides AFTER A TAB so the bridge can
+--     show the label and still copy only the bare key into its port buffer
+--     (native/xcom_imgui_bridge.cpp splits on '\t').  The bridge itself needs
+--     the DLL, so what is pinned here is the string Lua hands it.
+do
+    local win = new_win()
+    local shown = nil
+    win.imgui = {
+        set_ports = function(_, ports) shown = ports end,
+        set_status = function() end,
+    }
+    win._port_busy_name = "COM7"
+    win:_refresh_imgui_ports({
+        { name = "COM3", description = "", busy = false },
+        { name = "COM7", description = "USB Serial", busy = true },
+        { name = "COM9", description = "", busy = false },
+    }, nil)
+    ok("imgui label: list handed to the bridge", shown ~= nil and #shown == 3)
+    eq("imgui label: busy port carries the tab suffix", shown[2].name,
+       "COM7\t（被占用）")
+    eq("imgui label: clean port keeps the bare name", shown[1].name, "COM3")
+    -- The passively-marked port is suffixed even when the enumeration did not
+    -- report busy (that is the whole point of _port_busy_name).
+    win._port_busy_name = "COM9"
+    win:_refresh_imgui_ports({
+        { name = "COM3", description = "", busy = false },
+        { name = "COM9", description = "", busy = false },
+    }, nil)
+    eq("imgui label: failed-open port is suffixed without a probe",
+       shown[2].name, "COM9\t（被占用）")
+    eq("imgui label: no other port is suffixed", shown[1].name, "COM3")
 end
 
 -- 2) Port removed: explicit "(not present)" entry stays selected; no other port

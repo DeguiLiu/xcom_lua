@@ -36,6 +36,7 @@ local script_engine = require("script_engine")
 local waveform = require("waveform")
 local charset = require("charset")
 local serial_sim = require("serial_sim")
+local send_history = require("send_history")
 
 -- Frame pacing under WARP (software) rendering.  A full frame costs ~45-60 ms
 -- of CPU, so the old fixed 16 ms cadence burned ~70% of a core redrawing an
@@ -100,7 +101,27 @@ local FLOW_HOLD_QUIET_MS = 2000
 -- receive whole lines.  No CR handling belongs here: ③ guarantees LF is the
 -- only line break by the time Lua sees the bytes.
 local function split_complete_lines(text)
-    local last_nl = text:match(".*()\n")
+    -- Plain-substring scan, NOT text:match(".*()\n"): the greedy pattern
+    -- backtracks over every prefix when the batch holds no LF at all — which is
+    -- exactly the case the caller holds as a partial line — and that measured
+    -- 5 ms for 1 KiB, 48 ms for 3 KiB and 327 ms for 8 KiB (LuaJIT 2.1 x64,
+    -- best of 20), i.e. quadratic against a 10 ms drain timer (binary or
+    -- unterminated text then outruns the view and can back the 512 KiB rx pool
+    -- into rx_pool_exhausted_bytes).
+    -- Each find resumes after the previous match, so this stays linear: the
+    -- same 8 KiB terminates in microseconds.  A batch that DOES carry LFs pays
+    -- one C-level scan per line separator instead of one pattern match over the
+    -- whole batch, which is a small constant-factor loss (~0.013 ms vs
+    -- ~0.0025 ms for 1638 lines) and is bounded by the read chunk size (4 KiB),
+    -- so the partial-line case is the only one that can matter.
+    local last_nl = nil
+    local from = 1
+    while true do
+        local found = text:find("\n", from, true)
+        if not found then break end
+        last_nl = found
+        from = found + 1
+    end
     if not last_nl then
         return "", text
     end
@@ -347,7 +368,15 @@ function M.new(cfg, cfg_data, config_path)
     self.generation = 0
     self._handlers = {}             -- id -> handler name string
     self._autosend_on = false
-    self._max_display_bytes = 2 * 1024 * 1024
+    -- Display-side cap on the retained RX text, passed to the core's display
+    -- options.  Taken from [display] max_display_bytes in config.ini: this was
+    -- a hardcoded literal, so the key main.lua reads had no effect at all.
+    -- The core documents the field as ABI-reserved and does not enforce it, so
+    -- no floor is invented here; a missing or non-positive value keeps the
+    -- historical 2 MiB.
+    local configured_cap = tonumber(cfg.max_display_bytes)
+    self._max_display_bytes = (configured_cap and configured_cap > 0)
+        and math.floor(configured_cap) or (2 * 1024 * 1024)
     -- Receive-tail window (bytes).  Configurable via [display]
     -- receive_window_bytes in config.ini (clamped to 16 KiB..1 MiB); the
     -- historical fixed 64 KiB is the default.  Pushed into the ImGui bridge
@@ -460,6 +489,18 @@ function M.new(cfg, cfg_data, config_path)
     -- are raw observations the overlay in Window:ui_state() turns into the five
     -- derived flags; none of them changes the HSM or the core ABI.
     self._reconnect_candidate_names = nil -- uniquely-matching re-enumerated names
+    self._config_dirty = false            -- a widget changed something unwritten
+    self._config_save_timer = nil         -- debounce handle for the above
+    -- Send-box command history, newest first ([send] history.N in the config).
+    -- sanitize() drops blanks and caps the list, so a hand-edited file cannot
+    -- produce a widget that shows empty rows.
+    self._send_history = send_history.sanitize(cfg.send_history)
+    self._reconnect_port_hwid = nil       -- hardware_id captured when grace arms
+    self._port_hwid = nil                 -- last seen id of the selected port
+    self._port_busy_name = nil            -- passive "open failed: in use" mark
+    self._modem_prev = nil                -- last sampled CTS/DSR/RLSD bits
+    self._modem_drop_reported = false
+    self._modem_lost = nil
     self._silent_warn_ms = nil            -- per-profile idle threshold (cached)
     self._flow_hold_last = nil            -- last seen flow_hold_events counter
     self._flow_hold_active_until = nil    -- tx_stalled decays after this uv.now()
@@ -484,7 +525,7 @@ function M.new(cfg, cfg_data, config_path)
     -- opening can drive DTR on some USB-UART bridges — which resets a board
     -- wired for auto-reset. That is too destructive to do behind the user's
     -- back on every refresh, so it is an explicit opt-in for people who want
-    -- to see "(busy)" in the list and accept the risk. Without it, an occupied
+    -- to see "（被占用）" in the list and accept the risk. Without it, an occupied
     -- port still reports its cause when the open fails.
     self._probe_port_busy = config.get(cfg_data, "serial", "probe_port_busy",
                                        false) == true
@@ -583,7 +624,11 @@ function Window:_init_imgui()
     self.imgui = bridge
     local port = self.cfg.port or ""
     if port ~= "" then ffi.copy(self.imgui.port, port, math.min(#port, 126)) end
-    self.imgui:set_pages(self.cfg.quick_pages or { { text = {}, enabled = {} } })
+    self.imgui:set_pages(self.cfg.quick_pages or { { text = {}, enabled = {} } },
+                         self.cfg.multi_page)
+    -- Seed the send box's history list before the first frame, so the commands
+    -- from the previous session are pickable immediately.
+    self.imgui:set_send_history(self._send_history)
     self:_refresh_imgui_ports()
     -- Keep every native control alive as a fallback, but remove it from the
     -- visual tree while the ImGui dashboard is active.
@@ -620,7 +665,18 @@ function Window:_refresh_imgui_ports(ports, enum_err)
             ports[#ports + 1] = p
         end
     end
-    self.imgui:set_ports(ports)
+    -- The combo copies the displayed string into the port buffer, so the
+    -- busy suffix rides after a tab and the bridge copies only the key.
+    local shown = {}
+    local busy_name = self._port_busy_name
+    for _, p in ipairs(ports) do
+        local name = p.name
+        if name and name ~= "" and (p.busy or name == busy_name) then
+            name = name .. "\t（被占用）"
+        end
+        shown[#shown + 1] = { name = name }
+    end
+    self.imgui:set_ports(shown)
 end
 
 -- SIM helper: did the just-issued open target one of the simulator's virtual
@@ -1042,6 +1098,18 @@ jit.off(Window._on_power_broadcast)
 local DEVICE_CHANGE_DEBOUNCE_MS = 500
 Window.DEVICE_CHANGE_DEBOUNCE_MS = DEVICE_CHANGE_DEBOUNCE_MS
 
+-- Config durability.  _save_config runs at shutdown only, so a process killed
+-- by Task Manager, a crash or a power cut loses every tick set in that session
+-- -- the same class of complaint as the multipage ticks that were written but
+-- never read back.  LLCOM is the opposite extreme (a full settings.json
+-- rewrite inside every property setter, including each window-drag event), so
+-- this takes the middle: a real widget interaction marks the config dirty, and
+-- the write happens once the interaction has been quiet for this long.  The
+-- write itself is atomic (core/config.lua save renames a temp file over the
+-- target), which is what makes a periodic save safe to do while running.
+local CONFIG_SAVE_DEBOUNCE_MS = 5000
+Window.CONFIG_SAVE_DEBOUNCE_MS = CONFIG_SAVE_DEBOUNCE_MS
+
 -- True while the port list may be rebuilt safely: OFFLINE (CLOSED/FAULT) and
 -- not inside the reconnect grace window.  OPEN/OPENING/CLOSING all return
 -- false; so does RECONNECTING, whose retry loop owns its own enumeration.
@@ -1086,6 +1154,7 @@ end
 
 -- Timer callback: the single coalesced refresh for a burst.
 function Window:_refresh_ports_after_change()
+    self._port_busy_name = nil
     if not self:_ports_refresh_allowed() then
         -- Session live: do not rebuild the list, do not touch the selection,
         -- do not probe (the backstop will refresh once idle).
@@ -1105,6 +1174,7 @@ function Window:_poll_ports_backstop()
     end
     local ports, enum_err = xcom.list_ports({ probe = false })
     if port_list_signature(ports) ~= self._ports_signature then
+        self._port_busy_name = nil
         self:schedule_defer(function()
             if self:_ports_refresh_allowed() then
                 self:_apply_ports(ports, enum_err)
@@ -1331,6 +1401,13 @@ function Window:on_close()
     if self._script_watch_timer then self._script_watch_timer:stop() end
     if self._device_change_timer then self._device_change_timer:stop() end
     if self._ports_backstop_timer then self._ports_backstop_timer:stop() end
+    -- The debounced config write must not fire during teardown: the explicit
+    -- _save_config below is the last write, and the timer's callback would
+    -- run against a half-torn-down window (bridge destroyed, core closed).
+    if self._config_save_timer then
+        self._config_save_timer:stop()
+        self._config_dirty = false
+    end
     if self._sequence_timer then self:_stop_sequence() end
     -- Abandon any in-flight reset sequence: the timer must not fire after the
     -- core handle is torn down, and a running sequence is left at rest.
@@ -1453,8 +1530,86 @@ function Window:_save_config()
                 config.set_multi_entry(data, page_index - 1, entry_index - 1, "enabled", page.enabled[entry_index] == true)
             end
         end
+        -- Multi-tab option ticks + the page the user sat on.  The auto-cycle
+        -- and single-tab autosend TICKS are deliberately not persisted: they
+        -- are running states (an armed timer that transmits), and restoring one
+        -- would either fire traffic the moment a port opens or leave the switch
+        -- drawn on with no timer behind it.  Their periods are persisted.
+        config.set(data, "multipage", "hex", self.imgui.multi_hex[0] ~= 0)
+        config.set(data, "multipage", "crlf", self.imgui.multi_crlf[0] ~= 0)
+        config.set(data, "multipage", "period_ms", math.max(10, self.imgui.multi_period[0]))
+        config.set(data, "multipage", "page", self.imgui.multi_page[0])
+        if self.imgui.multi_gap then
+            config.set(data, "multipage", "gap_ms", math.max(0, self.imgui.multi_gap[0]))
+        end
+        -- Display-side ticks the drain funnel consults.  自动清空 keeps its
+        -- tick and its byte count as separate keys (see main.lua), and the auto
+        -- frame-break persists as "0 = off" because its enabled flag IS the
+        -- gap being positive.
+        config.set(data, "display", "auto_clear", self.imgui.auto_clear[0] ~= 0)
+        config.set(data, "display", "auto_clear_bytes",
+                   math.max(0, self.imgui.auto_clear_bytes[0]))
+        if self.imgui.frame_gap_enabled and self.imgui.frame_gap_ms then
+            local gap_on = self.imgui.frame_gap_enabled[0] ~= 0
+            config.set(data, "display", "frame_gap_ms", gap_on
+                and math.min(60000, math.max(10, self.imgui.frame_gap_ms[0])) or 0)
+        end
+        if self.imgui.copy_strip_timestamp then
+            config.set(data, "display", "strip_timestamp_on_copy",
+                       self.imgui:copy_strip_enabled())
+        end
+        -- Font preferences (settings page).  Both buffers are Lua-owned, so
+        -- this is the same storage the widgets edit; unregistered (older DLL)
+        -- means the widgets never existed and nothing is written.
+        if self.imgui.font_body_index and self.imgui.font_mono_cjk then
+            config.set(data, "font", "size_index", self.imgui.font_body_index[0])
+            config.set(data, "font", "show_chinese_in_receive",
+                       self.imgui.font_mono_cjk[0] ~= 0)
+        end
+    end
+    -- Send-box command history: newest first, count-bounded so the stale keys a
+    -- longer previous session left behind are simply ignored on the way back in.
+    -- A multi-line command is stored verbatim -- core/config.lua writes any
+    -- value that would not survive a bare round trip as a quoted literal, which
+    -- is what keeps an embedded newline from breaking the file.
+    local history = self._send_history or {}
+    config.set(data, "send", "history_count", #history)
+    for index = 1, #history do
+        config.set(data, "send", "history." .. (index - 1), history[index])
     end
     config.save(self.config_path, data)
+end
+
+-- Durability of the settings the user just changed, without the write-through
+-- storm: mark on a real interaction, coalesce, write once the interaction has
+-- been quiet (see CONFIG_SAVE_DEBOUNCE_MS).  A no-op when there is no config
+-- path to write to (the fake windows in the headless suites) but the dirty
+-- flag still latches, so the tests can pin the coalescing.
+function Window:_mark_config_dirty()
+    if not self.config_path or not self._config_save_timer then
+        -- No path, or the startup block never built the timer.  Nothing to arm:
+        -- the shutdown save is still the safety net, and writing synchronously
+        -- here would be the write-through pattern this deliberately avoids.
+        return
+    end
+    self._config_dirty = true
+    -- restart() is not on the luv timer surface this file already uses
+    -- elsewhere; stop+start is the same single-shot with a fresh deadline, and
+    -- it is what coalesces a burst of interactions into one write.
+    self._config_save_timer:stop()
+    self._config_save_timer:start(CONFIG_SAVE_DEBOUNCE_MS, 0,
+                                  self._config_save_callback)
+end
+
+-- Timer callback: one write for a burst of interactions.  The flag is cleared
+-- BEFORE the save so a failure (or a nested mark from the save path) leaves
+-- the next mark armed rather than being swallowed by this one.
+function Window:_flush_config_save()
+    if not self._config_dirty then
+        return
+    end
+    self._config_dirty = false
+    self:_save_config()
 end
 
 -- ---------------------------------------------------------------------------
@@ -1664,6 +1819,9 @@ function Window:core_close(timeout)
     if not self.vm:intent_close() then
         return
     end
+    -- The open request this flag remembers is answered (or abandoned) once the
+    -- session starts closing, so a later error must not be attributed to it.
+    self._pending_port = nil
     -- A batch sender must not survive a close.  The port is about to go away,
     -- so every remaining step would silently fail while the UI still advanced
     -- and finally reported "sequence done" -- a false success the user cannot
@@ -1752,6 +1910,14 @@ function Window:core_send(data_bytes, flags)
             return false, rc
         else
             self:_echo_tx(data_bytes)
+            -- Pull the next frame at the INTERACTIVE cadence.  The send ran
+            -- inside _dispatch_imgui_actions, i.e. AFTER this frame was drawn,
+            -- so the TX echo row, the status line and the TX counter are all
+            -- next-frame content.  Without this request the frame only comes
+            -- from the idle heartbeat (500 ms) or the next input message, which
+            -- is exactly the "clicked Send, nothing happened yet" lag: the
+            -- bytes were already queued, only the feedback was late.
+            self:request_frame(FRAME_INTERVAL_ACTIVE_MS)
             if self._sim_active and self.sim:is_running() then
                 -- SIM: a successful TX on a virtual session lets the echo /
                 -- at-modem profiles queue their reply.  Only reached while
@@ -1814,7 +1980,13 @@ function Window:_echo_tx(payload)
     end
     -- Display copy: guarantee the row closes even for payloads that lack a
     -- terminator, and fold CRLF the way the receive text view does.
-    local display = line:gsub("\r\n", "\n")
+    -- Fold only when there is a CRLF to fold: gsub over a 4 KiB payload
+    -- measured ~55 us per echo (LuaJIT 2.1 x64, best of 200) against ~0.2 us
+    -- for the plain-substring pre-check, and most payloads carry no CR at all.
+    local display = line
+    if display:find("\r\n", 1, true) then
+        display = display:gsub("\r\n", "\n")
+    end
     if display:sub(-1) ~= "\n" then
         display = display .. "\n"
     end
@@ -2255,7 +2427,15 @@ function Window:_append_imgui_receive(text)
     -- is owned entirely by the core's raw-byte lane (design §4 item 1), and
     -- the core counters stay untouched.
     local limit = self._auto_clear_bytes or 0
-    if limit > 0 and self._imgui_receive_total >= limit then
+    -- ...except while a drag is in flight.  The native empty push drops the
+    -- selection by design (correct for an explicit clear), so clearing under a
+    -- held cursor destroys the gesture the user is still making -- the same
+    -- hazard the bridge already defers its own tail trim for.  The clear is
+    -- deferred, not dropped: _imgui_receive_total keeps growing, so the next
+    -- append after the release crosses the threshold and clears as usual.
+    local selecting = self.imgui ~= nil and
+        self.imgui.selection_dragging ~= nil and self.imgui:selection_dragging()
+    if limit > 0 and self._imgui_receive_total >= limit and not selecting then
         self:_clear_imgui_view()
     end
 end
@@ -2461,6 +2641,24 @@ function Window:_dispatch_imgui_actions(actions)
             self[command[2]](self, command[3])
         end
     end
+    -- The handlers above change what is on screen (port list, page, settings
+    -- window, TX echo), but the frame that RETURNED these bits was already
+    -- submitted before they ran — ImGui hands the action mask back only after
+    -- its body has been built.  Pull one interactive frame so the result is
+    -- visible ~16 ms later instead of waiting for the next input message or
+    -- the idle heartbeat.  Guarded on non-zero bits: a frame with no action
+    -- must not request another one, or the demand latch would self-perpetuate
+    -- and reinstate the 16 ms idle burn this pacing exists to remove.  (Bits
+    -- are only set by real widget interaction -- click, typed edit, tab
+    -- switch -- never by merely hovering a frame.)
+    if (actions or 0) ~= 0 then
+        self:request_frame(FRAME_INTERVAL_ACTIVE_MS)
+        -- Same signal, second use: non-zero action bits mean a real widget
+        -- interaction, which is exactly when a setting may have changed.  The
+        -- save itself is debounced (CONFIG_SAVE_DEBOUNCE_MS), so holding a
+        -- stepper or typing does not rewrite the INI per keystroke.
+        self:_mark_config_dirty()
+    end
 end
 
 function Window:_imgui_open()
@@ -2493,7 +2691,33 @@ function Window:_imgui_send_single()
         self:set_status_deferred("send: blank HEX, nothing sent")
         return
     end
-    self:core_send(payload, xcom.send_text)
+    -- Remember what was TYPED, not the encoded payload: recalling "AT" is
+    -- useful, recalling the bytes of a HEX conversion is not, and the HEX/NEWLINE
+    -- ticks are still in force when the recalled text is sent again.  Only a
+    -- send that the core accepted is remembered, so a refused command (interlock,
+    -- busy) does not pollute the list.  Pushed to the bridge so the list the user
+    -- can pick from is current in the same session.
+    if self:core_send(payload, xcom.send_text) then
+        self:_remember_send_command(send_text)
+    end
+end
+
+-- Add one command to the send history and publish it.  The policy (dedupe,
+-- cap, blanks) lives in core/send_history.lua so it is testable without the
+-- DLL; this only wires it to the widget and to persistence.
+function Window:_remember_send_command(text)
+    local next_list = send_history.push(self._send_history, text)
+    -- push() never mutates, so an unchanged list (a blank entry, or the same
+    -- command twice in a row) must not re-push to the DLL or mark the config
+    -- dirty: both would be pure churn.
+    if #next_list == #self._send_history and next_list[1] == self._send_history[1] then
+        return
+    end
+    self._send_history = next_list
+    if self.imgui then
+        self.imgui:set_send_history(self._send_history)
+    end
+    self:_mark_config_dirty()
 end
 
 -- Snapshot the current Multi page for a batch sender.  Captures the enabled,
@@ -3276,6 +3500,20 @@ function Window:_poll_errors()
             self:set_status_deferred(text)
         end
         c.set_text(self.status.labels[4], text)
+        -- 5 = ERROR_ACCESS_DENIED, 32 = ERROR_SHARING_VIOLATION. Windows uses
+        -- both for "another handle has the port". Mark the name until the
+        -- next refresh. Do not probe: a probe can pulse DTR.
+        -- Three conditions, because the ring also carries READ faults and
+        -- their raw Win32 codes: source 2 (Win32) plus one of these two codes
+        -- plus an open request this window issued and never saw reach OPEN
+        -- (_pending_port; cleared on the OPEN edge and on close). A read fault
+        -- lands while a session is live, so the flag is nil and it cannot
+        -- mislabel the previous open target as occupied.
+        local code = tonumber(err.code)
+        if (err.source == 2) and (code == 5 or code == 32) and
+           self._pending_port then
+            self:_mark_port_occupied(self._pending_port)
+        end
     end
 end
 
@@ -3292,6 +3530,101 @@ end
 -- deliberately do NOT rewrite the HSM from take_open_result's return value;
 -- doing so would fight the snapshot's authoritative transition (a fast
 -- take_open_result failure races the snapshot that already carries FAULT).
+-- One receive-view and log boundary. The core raw lane is RX only, so this
+-- line is not a second copy of device bytes. No-op without the ImGui view.
+function Window:_note_link_boundary(line)
+    if not self.imgui or not line or line == "" then
+        return
+    end
+    local sep = "\n[XCOM] " .. line .. "\n"
+    self:_append_imgui_receive(sep)
+    if self._log_active and self.core and xcom.log_append then
+        xcom.log_append(self.core, sep, #sep)
+    end
+end
+
+-- Passive occupancy mark. Cleared by an explicit refresh or a device-list
+-- change, not by the open-failure path that sets it.
+function Window:_mark_port_occupied(name)
+    if not name or name == "" or name == self._port_busy_name then
+        return
+    end
+    self._port_busy_name = name
+    -- Rebuild only a real combo. A test double without set_ports must not
+    -- throw out of the error drain, and the status line just written stays.
+    if self.imgui and self.imgui.set_ports then
+        self:_refresh_imgui_ports()
+    elseif self.conn and self.conn.port then
+        self:_reload_port_combo()
+    end
+end
+
+-- CTS/DSR/RLSD falling edge while the port stays OPEN. A USB-UART bridge
+-- keeps its COM node when the MCU behind it loses power, so the line inputs
+-- are the only signal that survives. Never closes the port.
+--
+-- Coverage, stated so the message is not read as more than it is: this fires
+-- only when a modem INPUT is actually wired to the peer. A 3-wire cable
+-- (TXD/RXD/GND, the common MCU hookup) leaves CTS/DSR/RLSD tied at the bridge,
+-- so they never move and this detector is silent -- the RX-silence warning is
+-- the only signal there. An unwired pin that simply stays low is not a drop
+-- (prev == now, no edge) and cannot produce a false positive. DSR alone is
+-- suppressed while our own DTR is low, because a peer with DTR-driven DSR
+-- would show our line change rather than its own power loss.
+-- Bit 31 clear means "no sample" (closed, virtual, or the API call failed).
+local MODEM_CTS = 0x1
+local MODEM_DSR = 0x2
+local MODEM_RLSD = 0x8
+local MODEM_WATCH = 0xB
+local MODEM_VALID = 0x80000000
+
+function Window:_note_modem_lines(snap)
+    if not snap or snap.port_state ~= xcom.port_open then
+        self._modem_prev = nil
+        return
+    end
+    local lines = tonumber(snap.modem_lines) or 0
+    if bit.band(lines, MODEM_VALID) == 0 then
+        self._modem_prev = nil
+        return
+    end
+    local now = bit.band(lines, MODEM_WATCH)
+    local prev = self._modem_prev
+    self._modem_prev = now
+    if prev == nil then
+        return
+    end
+    local dropped = bit.band(prev, bit.bnot(now))
+    if dropped == 0 then
+        local lost = self._modem_lost or 0
+        if self._modem_drop_reported and lost ~= 0 and
+           bit.band(now, lost) == lost then
+            self._modem_drop_reported = false
+            self._modem_lost = nil
+            self:set_status_deferred("对端线路恢复")
+        end
+        return
+    end
+    local dtr_on = self.imgui and self.imgui.dtr and self.imgui.dtr[0] ~= 0
+    if dropped == MODEM_DSR and not dtr_on then
+        return
+    end
+    if self._modem_drop_reported then
+        return
+    end
+    self._modem_drop_reported = true
+    self._modem_lost = dropped
+    local names = {}
+    if bit.band(dropped, MODEM_CTS) ~= 0 then names[#names + 1] = "CTS" end
+    if bit.band(dropped, MODEM_DSR) ~= 0 then names[#names + 1] = "DSR" end
+    if bit.band(dropped, MODEM_RLSD) ~= 0 then names[#names + 1] = "RLSD" end
+    -- "如果" not "是": an unwired-but-floating input can also fall, and only a
+    -- wired line can mean anything about the peer. The wording keeps the hint
+    -- worth acting on without asserting a cause the tool cannot see.
+    self:set_status_deferred("对端线路落下（" .. table.concat(names, "/") ..
+        "），串口仍打开；若该线接到对端电源/握手，可能是 MCU 掉电或复位")
+end
+
 function Window:poll_status()
     if not self.core then
         return
@@ -3501,7 +3834,11 @@ function Window:poll_status()
             self._flow_hold_last = snap.flow_hold_events or 0
             self._flow_hold_active_until = nil
             self._silent_warn_ms = nil
+            self._modem_prev = nil
+            self._modem_drop_reported = false
+            self._modem_lost = nil
         end
+        self:_note_modem_lines(snap)
         -- Remember this poll's raw ledger values so the NEXT generation change
         -- can measure what accrued after it (see the carry comments above).
         self._loss_last_log = snap.save_rejected_bytes or 0
@@ -3529,6 +3866,7 @@ function Window:poll_status()
             self._reconnect_pending = false
             self._reconnect_phase = nil
             self._reconnect_port_desc = nil
+            self._reconnect_port_hwid = nil
             self._reconnect_known_ports = nil
             self._reconnect_candidate_names = nil
         end
@@ -3552,6 +3890,9 @@ function Window:poll_status()
                 -- follow the device to its new name once it reappears.
                 self._reconnect_port_desc =
                     self:_port_description(self:_serial_config().port)
+                self._reconnect_port_hwid =
+                    self:_port_hardware_id(self:_serial_config().port) or
+                    self._port_hwid
                 -- Fresh window: no re-enumeration candidate has been observed
                 -- yet (the overlay derives port_gone/reenum/ambiguous from this).
                 self._reconnect_candidate_names = nil
@@ -3598,6 +3939,7 @@ function Window:poll_status()
                         self._reconnect_pending = false
                         self._reconnect_phase = nil
                         self._reconnect_port_desc = nil
+                        self._reconnect_port_hwid = nil
                         self._reconnect_known_ports = nil
                     end
                     if latched and self.vm:settle_recovering() then
@@ -3611,22 +3953,10 @@ function Window:poll_status()
                             -- it cannot be mistaken for device data, and a
                             -- blank line keeps it off the tail of the last
                             -- pre-reset line.
-                            local sep = "\n[XCOM] reconnected to " ..
+                            self:_note_link_boundary(
+                                "reconnected to " ..
                                 (self._imgui_port or "serial port") ..
-                                " - device output resumes below\n"
-                            self:_append_imgui_receive(sep)
-                            -- The log spans sessions (it is not closed on a
-                            -- reconnect), so without the same boundary in the
-                            -- file a reader of the .log cannot tell where one
-                            -- session ended.  This is the synthetic-write form
-                            -- the TX echo uses, and it is NOT a double write:
-                            -- the core's raw-byte lane carries RX only (see
-                            -- _echo_tx / poll_display), so the separator is new
-                            -- content.  Same bytes as the viewport so both read
-                            -- alike.
-                            if self._log_active and self.core then
-                                xcom.log_append(self.core, sep, #sep)
-                            end
+                                " - device output resumes below")
                             self.imgui:set_status("Reconnected: " ..
                                 (self._imgui_port or "serial port"))
                         end
@@ -3651,6 +3981,13 @@ function Window:poll_status()
                 elseif snap.port_state == xcom.port_fault then
                     self.imgui:set_status("Open failed; check the port and parameters")
                 end
+            end
+            -- The request this flag remembers is resolved as soon as the
+            -- session reaches OPEN: from here on an error belongs to the live
+            -- session, not to the open attempt (_poll_errors keys the passive
+            -- "被占用" mark on this flag being set).
+            if snap.port_state == xcom.port_open then
+                self._pending_port = nil
             end
         end
         -- Skip the string.format allocations when the counters are unchanged
@@ -3876,6 +4213,23 @@ function Window:_port_description(name)
     return nil
 end
 
+-- PnP hardware id of `name`, or nil when the port is gone or exposes none.
+-- Empty id is "unknown", not a wildcard: two adapters of one model share it.
+function Window:_port_hardware_id(name)
+    if not name or name == "" then
+        return nil
+    end
+    for _, p in ipairs(xcom.list_ports() or {}) do
+        if p.name == name then
+            if p.hardware_id and p.hardware_id ~= "" then
+                return p.hardware_id
+            end
+            return nil
+        end
+    end
+    return nil
+end
+
 -- Names enumerated right now, as a set (name -> true).  The reconnect path
 -- snapshots this when the grace window is armed so _resolve_reconnect_port can
 -- tell a genuinely NEW port (the original adapter re-enumerated under a new
@@ -3905,27 +4259,50 @@ function Window:_resolve_reconnect_port(original, desc)
         return original, false
     end
     local known = self._reconnect_known_ports
+    local hwid = self._reconnect_port_hwid
     local present = false
     local candidate = nil
     local candidate_count = 0
-    -- Names of NEWLY-appeared same-description peers.  Retained on `self` so the
-    -- recovery overlay can distinguish a unique re-enumeration (port_reenum)
-    -- from an ambiguous one (port_ambiguous); only the count is used here.
+    local hwid_candidate = nil
+    local hwid_count = 0
+    -- hardware_id wins over the registry description: the COM name changes
+    -- when USB re-enumerates and the id does not. Both still require a NEW
+    -- name. Two adapters of the same model share a VID/PID id, so a peer
+    -- that was already plugged in is never adopted. An ambiguous id does
+    -- not fall through to description.
     local candidates = {}
+    local hwid_candidates = {}
     for _, p in ipairs(xcom.list_ports() or {}) do
         if p.name == original then
             present = true
-        elseif desc and p.description and p.description ~= "" and
-               p.description == desc and not (known and known[p.name]) then
-            candidate = p.name
-            candidate_count = candidate_count + 1
-            candidates[#candidates + 1] = p.name
+        elseif not (known and known[p.name]) then
+            if hwid and hwid ~= "" and p.hardware_id and p.hardware_id ~= "" and
+               p.hardware_id == hwid then
+                hwid_candidate = p.name
+                hwid_count = hwid_count + 1
+                hwid_candidates[#hwid_candidates + 1] = p.name
+            end
+            if desc and p.description and p.description ~= "" and
+               p.description == desc then
+                candidate = p.name
+                candidate_count = candidate_count + 1
+                candidates[#candidates + 1] = p.name
+            end
         end
     end
-    self._reconnect_candidate_names = candidates
     if present then
+        self._reconnect_candidate_names = {}
         return original, true
     end
+    if hwid_count > 1 then
+        self._reconnect_candidate_names = hwid_candidates
+        return original, false
+    end
+    if hwid_count == 1 then
+        self._reconnect_candidate_names = hwid_candidates
+        return hwid_candidate, true
+    end
+    self._reconnect_candidate_names = candidates
     if candidate_count == 1 then
         return candidate, true
     end
@@ -3949,7 +4326,11 @@ function Window:_drive_reconnect(generation)
         self._reconnect_pending = false
         self._reconnect_phase = nil
         self._reconnect_port_desc = nil
+        self._reconnect_port_hwid = nil
         self._reconnect_known_ports = nil
+        self:_note_link_boundary(
+            "reconnect failed; link lost - " ..
+            (self._imgui_port or "serial port"))
         if self.imgui then
             self.imgui:set_status("串口连接已断开，请手动重连")
         end
@@ -4433,6 +4814,14 @@ function Window:_render_ui_state()
     if self.recv and self.recv.set_monitor_connected then
         self.recv.set_monitor_connected(state.connected)
     end
+    -- The interlock this function just recomputed (connect/disconnect edges,
+    -- OPENING/CLOSING transitions, DTR/RTS applies) is drawn from self.connected
+    -- and the HSM state at the TOP of the next frame.  Every caller is an
+    -- event/timer edge rather than a paint, and the action paths reach here from
+    -- _dispatch_imgui_actions -- i.e. AFTER the frame that produced the click was
+    -- drawn -- so without a request the button/chip state stays stale until an
+    -- unrelated producer asks for a frame.  Coalesced by request_frame's min().
+    self:request_frame(FRAME_INTERVAL_ACTIVE_MS)
 end
 
 -- dispatch helpers used by panels.
@@ -4770,6 +5159,17 @@ function Window:start()
     self._ports_backstop_callback = ports_backstop_callback
     self._ports_backstop_timer:start(1000, 1000, ports_backstop_callback)
 
+    -- Config debounce.  Created here rather than lazily (same as the two
+    -- pollers above) so the callback is built once and the timer never has to
+    -- be created from inside a frame.
+    self._config_save_timer = uv.new_timer()
+    local config_save_callback = function()
+        local ok, err = pcall(self._flush_config_save, self)
+        if not ok then io.stderr:write("[uv config] " .. tostring(err) .. "\n") end
+    end
+    jit.off(config_save_callback, true)
+    self._config_save_callback = config_save_callback
+
     self:poll_status()
     collectgarbage("collect")
 end
@@ -4838,14 +5238,24 @@ local run_message_loop = function(self)
         -- immediately on any newly queued message.
         local timeout_ms = uv.backend_timeout()
         if not timeout_ms or timeout_ms < 0 then timeout_ms = 100 end
-        local frame_wait = self._imgui_next_frame and
-            (self._imgui_next_frame - uv.now()) or 0
-        if frame_wait <= 0 then
+        -- Only the ImGui path HAS a frame deadline: with no DLL loaded
+        -- (imgui == nil) _init_imgui returns before the bridge exists and
+        -- request_frame goes on its first line, so _imgui_next_frame is never
+        -- assigned.  Folding that nil into the expression below would pin
+        -- frame_wait to 0 and make every iteration wait 0 ms -- MsgWait returns
+        -- immediately and the loop spins on a core while an idle GDI-mode app
+        -- has nothing to do.  Keep the timer deadline in that configuration.
+        local frame_wait = nil
+        if self.imgui then
+            frame_wait = self._imgui_next_frame and
+                (self._imgui_next_frame - uv.now()) or 0
+        end
+        if frame_wait and frame_wait <= 0 then
             -- The frame deadline already passed while the layers above ran
             -- (e.g. a WARP frame or drain overran the budget): render on the
             -- very next iteration instead of sleeping out the timer deadline.
             timeout_ms = 0
-        elseif frame_wait < timeout_ms then
+        elseif frame_wait and frame_wait < timeout_ms then
             timeout_ms = frame_wait
         end
         w.user32.MsgWaitForMultipleObjectsEx(
@@ -5182,7 +5592,7 @@ function Window:_set_autosend_enabled(enabled)
         self._autosend_on = false
         return
     end
-    local period = tonumber(c.get_text(self.send.single.period)) or 1000
+    local period = math.max(10, tonumber(c.get_text(self.send.single.period)) or 1000)
     xcom.set_auto_template(self.core, payload, period, xcom.send_text)
 end
 
@@ -5199,7 +5609,7 @@ function Window:on_chk_multi_auto_toggled()
     local enabled = c.checkbox_checked(self.send.multi.auto)
     self._multi_auto_on = enabled
     if enabled then
-        local period = tonumber(c.get_text(self.send.multi.period)) or 1000
+        local period = math.max(10, tonumber(c.get_text(self.send.multi.period)) or 1000)
         if not self._multi_timer then
             self._multi_timer = uv.new_timer()
         else
@@ -5267,7 +5677,7 @@ port_combo_entries = function(ports)
         if p.description and p.description ~= "" then
             label = label .. "  " .. p.description
         end
-        if p.busy then label = label .. "  (busy)" end
+        if p.busy then label = label .. "  （被占用）" end
         items[#items + 1] = label
         keys[#keys + 1] = port_key(p)
     end
@@ -5311,6 +5721,24 @@ unique_port_by_desc = function(ports, desc)
     local found, count = nil, 0
     for _, p in ipairs(ports or {}) do
         if p.description and p.description ~= "" and p.description == desc then
+            found = p.name
+            count = count + 1
+        end
+    end
+    if count == 1 then
+        return found
+    end
+    return nil
+end
+
+-- Same "exactly one" rule as unique_port_by_desc, keyed on hardware_id.
+unique_port_by_hwid = function(ports, hwid)
+    if not hwid or hwid == "" then
+        return nil
+    end
+    local found, count = nil, 0
+    for _, p in ipairs(ports or {}) do
+        if p.hardware_id and p.hardware_id ~= "" and p.hardware_id == hwid then
             found = p.name
             count = count + 1
         end
@@ -5396,6 +5824,13 @@ function Window:_reload_port_combo(ports, enum_err)
         ports, enum_err = xcom.list_ports({ probe = self:_port_probe_flag() })
     end
     ports = ports or {}
+    if self._port_busy_name and self._port_busy_name ~= "" then
+        for _, p in ipairs(ports) do
+            if p.name == self._port_busy_name then
+                p.busy = true
+            end
+        end
+    end
     local want = self._port_want
     local items, keys = port_combo_entries(ports)
     local sel = find_key_index(keys, want)
@@ -5422,6 +5857,8 @@ function Window:_reload_port_combo(ports, enum_err)
         for _, p in ipairs(ports) do
             if p.name == want then
                 self._port_desc = (p.description ~= "" and p.description) or nil
+                self._port_hwid = (p.hardware_id and p.hardware_id ~= "" and
+                                   p.hardware_id) or nil
                 break
             end
         end
@@ -5431,7 +5868,8 @@ function Window:_reload_port_combo(ports, enum_err)
         -- Announce a probable renumbering instead of switching; description is
         -- instance-stable but ambiguous across identical adapters (see
         -- unique_port_by_desc), so this is a hint only.
-        local alt = unique_port_by_desc(ports, self._port_desc)
+        local alt = unique_port_by_hwid(ports, self._port_hwid) or
+                    unique_port_by_desc(ports, self._port_desc)
         if alt then
             self:_set_port_status(string.format(
                 "port %s not present; %s may be the same device - select it",
@@ -5444,6 +5882,8 @@ function Window:_reload_port_combo(ports, enum_err)
         self:_report_empty_ports(enum_err)
     elseif not present then
         self:_set_port_status("select a port")
+    elseif not self._port_busy_name then
+        self:_set_port_status(string.format("ports: %d", #ports))
     end
 end
 
@@ -5470,7 +5910,8 @@ function Window:_apply_ports(ports, enum_err)
         end
         self:_set_port_present(present)
         if not present and want and want ~= "" then
-            local alt = unique_port_by_desc(ports, self._port_desc)
+            local alt = unique_port_by_hwid(ports, self._port_hwid) or
+                        unique_port_by_desc(ports, self._port_desc)
             if alt then
                 self.imgui:set_status(string.format(
                     "port %s not present; %s may be the same device - select it",
@@ -5479,6 +5920,8 @@ function Window:_apply_ports(ports, enum_err)
                 self.imgui:set_status(string.format(
                     "port %s not present - select a port", want))
             end
+        elseif enum_err == nil and not self._port_busy_name and ports and #ports > 0 then
+            self.imgui:set_status(string.format("ports: %d", #ports))
         end
     elseif self.conn and self.conn.port then
         self:_reload_port_combo(ports, enum_err)
@@ -5492,6 +5935,8 @@ function Window:_remember_imgui_desc(ports, want)
     for _, p in ipairs(ports or {}) do
         if p.name == want then
             self._port_desc = (p.description ~= "" and p.description) or nil
+            self._port_hwid = (p.hardware_id and p.hardware_id ~= "" and
+                               p.hardware_id) or nil
             return
         end
     end
@@ -5500,6 +5945,7 @@ end
 -- Manual Refresh button (native fallback path).  Only the list + selection
 -- change; no device I/O beyond enumeration.
 function Window:on_btn_refresh()
+    self._port_busy_name = nil
     local ports, enum_err = xcom.list_ports({ probe = self:_port_probe_flag() })
     self:_apply_ports(ports, enum_err)
 end
@@ -5510,6 +5956,7 @@ M._port_combo_entries = port_combo_entries
 M._find_key_index = find_key_index
 M._port_list_signature = port_list_signature
 M._unique_port_by_desc = unique_port_by_desc
+M._unique_port_by_hwid = unique_port_by_hwid
 
 function Window:on_btn_send_single()
     local text = c.get_text(self.send.single.edit)

@@ -20,6 +20,16 @@ void xcom_imgui_set_receive_base(size_t absolute_offset);
  * copy (Ctrl+C / context menu) instead of touching the clipboard, so this Lua
  * layer owns the optional timestamp strip before the clipboard write. */
 void xcom_imgui_set_copy_strip(int* enabled);
+/* 1 while the left button is held and a selection drag is in flight.  Lua
+ * consults it before an AUTOMATIC view clear: the empty push drops the native
+ * selection by design (correct for an explicit clear, wrong mid-gesture).
+ * Probed optionally, so an older DLL keeps today's behaviour. */
+int xcom_imgui_selection_dragging(void);
+/* Send-box command history (Lua owns the list; newest first, NUL-separated).
+ * The editor shows it as a visible list rather than Up/Down: ImGui asserts
+ * CallbackHistory is incompatible with a Multiline box, so the widget uses a
+ * combo and this export is how the list reaches it. */
+void xcom_imgui_set_send_history(const char* packed, int count);
 size_t xcom_imgui_take_receive_copy(char* out, size_t capacity);
 void xcom_imgui_set_clipboard_text(const char* text, size_t length);
 void xcom_imgui_set_status(const char* text);
@@ -47,6 +57,12 @@ void xcom_imgui_set_open_lines(int* dtr_open, int* rts_open);
 void xcom_imgui_set_multi_extra(int* gap_ms);
 void xcom_imgui_set_charset(int* index);
 void xcom_imgui_set_frame_gap(int* enabled, int* ms);
+/* Font preferences ([font] in config.ini): Lua owns both ints, the DLL applies
+ * them at the top of each frame.  get_* seeds a fresh bridge with the values
+ * the DLL resolved from layout.toml, so an absent config key keeps the shipped
+ * default instead of duplicating it in Lua. */
+void xcom_imgui_set_font_prefs(int* body_index, int* mono_cjk);
+void xcom_imgui_get_font_prefs(int* body_index_out, int* mono_cjk_out);
 void xcom_imgui_set_highlight_rules(const char* packed, int count);
 void xcom_imgui_set_scripts(const char* names_packed, int* enabled, int count);
 void xcom_imgui_set_script_labels(const char* labels_packed);
@@ -168,6 +184,18 @@ function M.new(hwnd, cfg)
     local receive_capacity = M.clamp_receive_window(
         cfg and cfg.receive_window_bytes or DEFAULT_RECEIVE_CAPACITY)
     local baud_index, baud_custom_value = M.resolve_baud(cfg.baud_rate, cfg.baud_custom)
+    -- 自动清空 tick: the config carries it explicitly (main.lua), while a
+    -- caller that only set a byte count keeps the historical derived tick.
+    local auto_clear_seed = cfg.auto_clear
+    if auto_clear_seed == nil then
+        auto_clear_seed = (tonumber(cfg.auto_clear_bytes) or 0) > 0
+    end
+    -- 0 is a real Lua value, so `period or 1000` does not replace it. A missing
+    -- or sub-10 ms period used to arm the core timer at 10 ms (100 sends/s).
+    local saved_period = tonumber(cfg.autosend_period_ms)
+    if not saved_period or saved_period < 10 then
+        saved_period = 1000
+    end
     local self = {
         lib = M.available,
         port = ffi.new("char[?]", PORT_CAPACITY),
@@ -192,20 +220,24 @@ function M.new(hwnd, cfg)
         receive_hex = bool1(cfg.receive_hex),
         timestamp = bool1(cfg.timestamp),
         pause_display = bool1(cfg.pause_display),
-        auto_clear = bool1((cfg.auto_clear_bytes or 0) > 0),
+        auto_clear = bool1(auto_clear_seed),
         auto_clear_bytes = int1(cfg.auto_clear_bytes),
         send_hex = bool1(cfg.send_hex),
         send_crlf = bool1(cfg.send_crlf),
         send_auto = int1(),
-        send_period = int1(cfg.autosend_period_ms or 1000),
+        send_period = int1(math.floor(saved_period)),
         multi_text = ffi.new("char[?]", MULTI_SLOTS * MULTI_SLOT_CAPACITY),
         multi_enabled = ffi.new("int[?]", MULTI_SLOTS),
-        multi_hex = int1(),
-        multi_crlf = int1(),
+        -- Multi-tab options: persisted in [multipage] (see _save_config).
+        -- send_auto / multi_auto stay 0 on purpose: they are RUNNING states
+        -- (a timer that transmits), so restoring the tick would start traffic
+        -- the moment a port is opened.  Only their period is remembered.
+        multi_hex = int1(cfg.multi_hex and 1 or 0),
+        multi_crlf = int1(cfg.multi_crlf and 1 or 0),
         multi_page = int1(),
         multi_page_count = int1(1),
         multi_auto = int1(),
-        multi_period = int1(1000),
+        multi_period = int1(math.max(10, tonumber(cfg.multi_period_ms) or 1000)),
         auto_save = bool1(cfg.auto_save),
         pages = { { text = {}, enabled = {} } },
         receive_capacity = receive_capacity,
@@ -253,11 +285,36 @@ function M.new(hwnd, cfg)
         self.copy_strip_timestamp = bool1(cfg.copy_strip_timestamp)
         set_copy_strip(self.copy_strip_timestamp)
     end
+    -- Font preferences ([font] in config.ini).  The DLL owns the shipped
+    -- defaults (fontsz index, layout.toml show_chinese_in_receive), so seed
+    -- from it FIRST and only then let a persisted choice win: a config-less
+    -- first run keeps the built-in values instead of a copy of them here.
+    -- Both buffers stay Lua-owned, so the settings widgets and _save_config
+    -- read/write the same storage.
+    local set_font_prefs = optional_export("xcom_imgui_set_font_prefs")
+    local get_font_prefs = optional_export("xcom_imgui_get_font_prefs")
+    if set_font_prefs and get_font_prefs then
+        self.font_body_index = int1(0)
+        self.font_mono_cjk = int1(0)
+        get_font_prefs(self.font_body_index, self.font_mono_cjk)
+        if cfg.font_size_index ~= nil then
+            self.font_body_index[0] = math.floor(tonumber(cfg.font_size_index) or 0)
+        end
+        if cfg.font_show_chinese ~= nil then
+            self.font_mono_cjk[0] = cfg.font_show_chinese and 1 or 0
+        end
+        set_font_prefs(self.font_body_index, self.font_mono_cjk)
+    end
     -- Push the configured window into the native receive buffer so both
     -- sides trim to the same tail size.
     M.available.xcom_imgui_set_receive_window(receive_capacity)
     return setmetatable(self, { __index = M })
 end
+
+-- Probed ONCE at load, not per push: this function runs on the receive path
+-- every frame that carries data, and optional_export() is a pcall (the file's
+-- own rule for the other copy/append exports below).
+local set_receive_base_export = optional_export("xcom_imgui_set_receive_base")
 
 function M:set_receive_text(text, base)
     text = text or ""
@@ -267,8 +324,9 @@ function M:set_receive_text(text, base)
     -- stored in those absolute coordinates so it travels with its text as
     -- the Lua tail slides.  Older DLLs lack the export and simply keep the
     -- historical window-relative behaviour.
-    local push_base = optional_export("xcom_imgui_set_receive_base")
-    if push_base then push_base(math.floor(base or 0)) end
+    if set_receive_base_export then
+        set_receive_base_export(math.floor(base or 0))
+    end
     self.lib.xcom_imgui_set_receive_text(text, n)
 end
 
@@ -284,6 +342,30 @@ local get_export = optional_export("xcom_imgui_get_receive_text")
 -- hides cleanly.
 local take_copy_export = optional_export("xcom_imgui_take_receive_copy")
 local set_clipboard_export = optional_export("xcom_imgui_set_clipboard_text")
+local selection_dragging_export = optional_export("xcom_imgui_selection_dragging")
+local set_send_history_export = optional_export("xcom_imgui_set_send_history")
+
+-- Push the send-box command history (newest first).  Packed NUL-separated, the
+-- same marshalling the highlight rules use; an older DLL resolves the export to
+-- nil and the widget simply has no list to show, while the Lua side keeps
+-- remembering the commands for the next run.
+function M:set_send_history(list)
+    if not set_send_history_export then return end
+    local count = #(list or {})
+    if count == 0 then
+        set_send_history_export(nil, 0)
+        return
+    end
+    local packed = table.concat(list, "\0")
+    set_send_history_export(packed, count)
+end
+
+-- True while the left button is held and the user is still drawing a selection
+-- in the receive log.  False when the DLL lacks the export, so the caller's
+-- guard degrades to today's behaviour instead of hiding a feature.
+function M:selection_dragging()
+    return selection_dragging_export ~= nil and selection_dragging_export() ~= 0
+end
 
 function M:append_receive(delta)
     if not append_export then return false end
@@ -375,7 +457,9 @@ function M:set_highlight_rules(rules)
     local parts = {}
     for _, rule in ipairs(rules) do
         parts[#parts + 1] = tostring(rule.pattern)
-        parts[#parts + 1] = string.format("%06X", rule.color or 0xE53935)
+        -- Same fallback red as script_engine.lua's highlight.rule: the old
+        -- 0xE53935 read only 4.23:1 on the white log, 0xC62828 reads 5.62:1.
+        parts[#parts + 1] = string.format("%06X", rule.color or 0xC62828)
         parts[#parts + 1] = rule.style == "bg" and "bg" or "text"
     end
     local packed = table.concat(parts, "\0")
@@ -718,11 +802,14 @@ function M:remove_page()
     self:_load_page()
 end
 
-function M:set_pages(pages)
+-- initial_page (optional, 0-based) restores the page the user last sat on; it
+-- is clamped so a shrunken page list can never index out of range.
+function M:set_pages(pages, initial_page)
     if type(pages) ~= "table" or #pages == 0 then return end
     self.pages = pages
     self.multi_page_count[0] = #pages
-    self.multi_page[0] = 0
+    self.multi_page[0] = math.max(0, math.min(#pages - 1,
+        math.floor(tonumber(initial_page) or 0)))
     self:_load_page()
 end
 

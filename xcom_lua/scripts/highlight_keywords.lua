@@ -8,8 +8,12 @@
 --   color   : 0xRRGGBB 数字
 --   style   : "text"=彩色文字（默认） / "bg"=半透明背景色块
 
-highlight.rule("ERROR", 0xE53935)          -- 红
-highlight.rule("WARN",  0xFFB300, "text")  -- 琥珀
-highlight.rule("FAIL",  0xE53935)
-highlight.rule("OK",    0x2E7D32, "text")  -- 绿
-highlight.rule("timeout", 0xE53935, "bg")  -- 背景色块风格
+-- 文字色按白色接收区实测的 WCAG 对比度选取（AA 正文需 4.5:1）：旧的红
+-- 0xE53935 只有 4.23:1，琥珀 0xFFB300 只有 1.79:1（白底上几乎看不见），
+-- 故改为 0xC62828（5.62:1）与 0x8A6D00（4.92:1）；绿 0x2E7D32 本就
+-- 5.13:1，保留。
+highlight.rule("ERROR", 0xC62828)          -- 红 5.62:1
+highlight.rule("WARN",  0x8A6D00, "text")  -- 暗琥珀 4.92:1
+highlight.rule("FAIL",  0xC62828)
+highlight.rule("OK",    0x2E7D32, "text")  -- 绿 5.13:1
+highlight.rule("timeout", 0xC62828, "bg")  -- 背景色块风格（0.35 alpha 色块）

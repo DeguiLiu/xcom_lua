@@ -22,6 +22,12 @@
 #include "imgui_impl_win32.h"
 #include "implot.h"
 
+// Pure double-click / drag-selection geometry.  Kept out of this file (and
+// therefore out of this translation unit's Win32 + DX11 dependencies) so the
+// host test runner can execute it on a Linux box: see
+// xcom_core/tests/receive_selection_test.cpp.
+#include "receive_selection.hpp"
+
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(
     HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam);
 
@@ -49,6 +55,23 @@ struct LayoutConfig final {
     float item_spacing = kItemSpacing;
     float frame_padding_y = kFramePaddingY;
     float section_gap = kSectionGap;
+
+    // Text colours ([colors] in assets/layout.toml).  The values are the ones
+    // sampled from pic/1.png (see the palette namespace); they live here as
+    // well so the log's font colours can be retuned without a rebuild — the
+    // static style table keeps every other slot.
+    std::uint32_t text_body = 0x1B1B1B;
+    // text_muted and timestamp are the two 1.png samples that were retuned.
+    // On the pure-white log both failed WCAG AA, measured 2026-10-03 with the
+    // sRGB relative-luminance formula: 0x8C8C8C read 3.36:1 and the timestamp
+    // orange 0xF8AA00 read 1.96:1 — under even the 3:1 non-text threshold,
+    // for the single most printed coloured string in the app.  The
+    // replacements keep the sampled hue families and only darken them:
+    // 0x6A6A6A reads 5.41:1 and 0x9C6000 reads 5.14:1.
+    std::uint32_t text_muted = 0x6A6A6A;
+    std::uint32_t timestamp = 0x9C6000;
+    std::uint32_t tx_echo = 0xD04138;
+    std::uint32_t selection = 0x005A98;
 };
 static_assert(LayoutConfig::kSidebarWidth > 0.0f);
 static_assert(LayoutConfig::kSendHeight >= 100.0f);
@@ -56,7 +79,6 @@ constexpr float kFooterHeight = 22.0f;
 constexpr float kControlHeight = 26.0f;
 constexpr float kToggleHeight = 20.0f;
 constexpr float kSidebarInset = 1.2f;
-constexpr std::uint32_t kPanelBorder = 0xD5D5D5;   // 1.png combo / input border sampled
 
 template <typename T>
 class Slice final {
@@ -129,6 +151,7 @@ struct Lang final {
     const char* run;
     const char* loop;
     const char* gap;
+    const char* history;                // send-box command history label
     const char* waiting;
     const char* ready;
     const char* open_a_port;
@@ -201,7 +224,7 @@ struct Lang final {
         fn(charset); fn(frame_gap); fn(ms);
         fn(tab_single); fn(tab_multi);
         fn(send_hex); fn(send_newline); fn(send_auto);
-        fn(send); fn(run); fn(loop); fn(gap);
+        fn(send); fn(run); fn(loop); fn(gap); fn(history);
         fn(waiting); fn(ready); fn(open_a_port);
         fn(refresh_tip); fn(save_tip); fn(clear_tip); fn(path_tip);
         fn(settings_title); fn(general_tab); fn(appearance); fn(font_size);
@@ -255,6 +278,7 @@ constexpr Lang kLangZh{
     /*tab_single*/ "单条", /*tab_multi*/ "多条",
     /*send_hex*/ "十六进制", /*send_newline*/ "加回车换行", /*send_auto*/ "自动发送",
     /*send*/ "发送", /*run*/ "执行", /*loop*/ "循环", /*gap*/ "间隔",
+    /*history*/ "历史命令",
     /*waiting*/ "等待串口数据", /*ready*/ "就绪", /*open_a_port*/ "请打开串口",
     /*refresh_tip*/ "刷新串口", /*save_tip*/ "保存接收日志",
     /*clear_tip*/ "清空接收日志", /*path_tip*/ "选择日志路径",
@@ -300,6 +324,7 @@ constexpr Lang kLangEn{
     /*tab_single*/ "Single", /*tab_multi*/ "Multi",
     /*send_hex*/ "HEX", /*send_newline*/ "NEWLINE", /*send_auto*/ "AUTO",
     /*send*/ "Send", /*run*/ "Run", /*loop*/ "Loop", /*gap*/ "gap",
+    /*history*/ "History",
     /*waiting*/ "WAITING FOR SERIAL DATA", /*ready*/ "Ready", /*open_a_port*/ "Open a port",
     /*refresh_tip*/ "Refresh ports", /*save_tip*/ "Save receive log",
     /*clear_tip*/ "Clear receive log", /*path_tip*/ "Choose log path",
@@ -460,6 +485,22 @@ public:
     int* copy_strip_ts_ = nullptr;    // receive copy: strip injected timestamps
     int* dtr_open_ = nullptr;         // open-time DTR: XCOM_LINE_* (0/1/2)
     int* rts_open_ = nullptr;         // open-time RTS: XCOM_LINE_* (0/1/2)
+    // Font preferences (settings page -> config.ini [font]).  Both are
+    // Lua-owned for the same reason as the switches above: the Lua side owns
+    // persistence, so the widgets write straight into Lua's storage and the
+    // effective value is applied here at the top of the next frame (a font
+    // atlas rebuild is only legal between frames).  A missing registration
+    // (older Lua/DLL pairing) leaves the compiled-in defaults in charge.
+    int* font_pref_body_ = nullptr;   // 0..2 index into body_fonts_/fontsz::kBodySizes
+    int* font_pref_cjk_ = nullptr;    // "接收窗口显示中文" tick
+    // Send-box command history, newest first.  Lua owns the LIST (it persists
+    // and caps it, see core/send_history.lua) and pushes it here whenever it
+    // changes, so this side only has to walk it.  send_history_pos_ is the
+    // navigation cursor: -1 means "the user is typing a new command", 0 is the
+    // newest entry.  A push resets it, which is also what makes the command the
+    // user just sent the first one Up recalls.
+    std::vector<std::string> send_history_;
+    int send_history_pos_ = -1;
     // Keyword-highlight rules pushed from the Lua script engine.  Rendering
     // walks only clipper-visible lines x rules (see ReceiveContent), so the
     // per-frame cost is bounded regardless of log size.
@@ -510,9 +551,9 @@ public:
     // budget (silent no-draw failure), a ~120-glyph merge cannot.  Same
     // pointer-lifetime contract as cjk_ranges_ above.
     ImVector<ImWchar> ui_glyph_ranges_{};
-    // [font] mono_cjk switch from assets/layout.toml.  Default OFF so the
-    // optional ~26 MB receive-log CJK merge is not resident unless the user
-    // explicitly turns "show Chinese in receive" on (memory-first default).
+    // [font] mono_cjk switch (assets/layout.toml default, config.ini once the
+    // user has touched the settings checkbox).  Default OFF: the merge face is
+    // only registered when the user asks for it.
     bool font_mono_cjk_ = false;
     // Set by the settings checkbox when the mono-CJK toggle changes; consumed
     // at the top of xcom_imgui_new_frame (never mid-draw) to rebuild fonts.
@@ -674,18 +715,23 @@ namespace palette {
     constexpr std::uint32_t kHeaderChromeDown = 0x004270; // window button press
     constexpr std::uint32_t kTextInverse = 0xFFFFFF;  // on-dark text / knob
     constexpr std::uint32_t kTextHeading = 0x004270;  // section heading (1.png deep blue)
-    constexpr std::uint32_t kTextMuted = 0x8C8C8C;    // field labels / disabled
+    constexpr std::uint32_t kTextMuted = 0x6A6A6A;    // field labels / disabled.  1.png
+                                                      // sampled 0x8C8C8C, which read
+                                                      // only 3.36:1 on the white log
     constexpr std::uint32_t kTextBody = 0x1B1B1B;     // default text (1.png near-black)
     constexpr std::uint32_t kStatusOnline = 0x7AD8D8; // ONLINE badge (kept)
     constexpr std::uint32_t kStatusOffline = 0xFFD28A; // OFFLINE badge (kept)
     constexpr std::uint32_t kHeaderSubtitle = 0xCDEBFA; // header strapline
-    constexpr std::uint32_t kToggleOff = 0xD5DCE3;    // toggle track (disabled)
+    constexpr std::uint32_t kToggleOff = 0x7E868E;    // off track; white knob is 3.69:1 (was 1.38:1)
     constexpr std::uint32_t kSurfaceLight = 0xFFFFFF; // receive log (1.png pure white)
     constexpr std::uint32_t kSurfaceDefault = 0xFBFCFD; // window / toolbar (1.png pale blue-white)
     constexpr std::uint32_t kSurfaceZone = 0xFEFEFE;  // TX editor + footer bands (1.png measured near-white)
     constexpr std::uint32_t kSurfaceSidebar = 0xEEEEF0; // right sidebar (1.png plain band: 60k+ px
                                                         // dominant in the control-column region)
-    constexpr std::uint32_t kTimestamp = 0xF8AA00;    // "[HH:MM:SS.mmm] " prefixes (1.png exact: 367 px)
+    constexpr std::uint32_t kTimestamp = 0x9C6000;    // "[HH:MM:SS.mmm] " prefixes.
+                                                      // 1.png sampled 0xF8AA00 (367 px),
+                                                      // which read only 1.96:1 on the
+                                                      // white log; darkened to 5.14:1
     constexpr std::uint32_t kRule = 0xEDEDED;         // 1px hairline separator (1.png sampled at y=60)
     constexpr std::uint32_t kHairline = 0xE6E6E6;     // pure inner separators (sidebar section rules /
                                                       // footer column divider): lighter than kRule,
@@ -693,12 +739,35 @@ namespace palette {
     constexpr std::uint32_t kSidebarDivider = 0xEFEFEF; // column-gap line beside the sidebar: 1.png's
                                                       // trench band there runs #EFEFF1..#EEEEF0 (50k+
                                                       // px), i.e. lighter than the kRule header line
-    constexpr std::uint32_t kPanelBorder = 0xD5D5D5;  // combo / input / header-chip border (1.png sampled)
+    constexpr std::uint32_t kPanelBorder = 0x8A8A8A;  // 3.45:1 on white; D5D5D5 was 1.47:1
     constexpr std::uint32_t kDangerRed = 0xC00500;    // danger / Close button (1.png exact: 606 px)
     constexpr std::uint32_t kSendBlue = 0x004275;     // SEND button fill (1.png measured, send zone)
-    constexpr std::uint32_t kSendBlueHover = 0x2E7FC4;
+    constexpr std::uint32_t kSendBlueHover = 0x1868A0; // white label 5.95:1 (was 4.24:1)
     constexpr std::uint32_t kSendBluePress = 0x003157;
     constexpr std::uint32_t kTxRed = 0xD04138;        // echoed TX text (1.png sampled)
+}
+
+// The [colors] defaults live in LayoutConfig (declared before the palette, so
+// they cannot reference it).  These two guards keep the duplication honest: a
+// divergence between the sampled palette and the configurable default is a
+// compile error, not a silent restyle.
+static_assert(LayoutConfig{}.text_body == palette::kTextBody);
+static_assert(LayoutConfig{}.text_muted == palette::kTextMuted);
+static_assert(LayoutConfig{}.timestamp == palette::kTimestamp);
+static_assert(LayoutConfig{}.tx_echo == palette::kTxRed);
+static_assert(LayoutConfig{}.selection == palette::kAccentTeal);
+
+// The tunable text roles.  LayoutConfig holds the value (it is what
+// assets/layout.toml [colors] writes to) and the palette holds the sampled
+// default, so a call site names the ROLE instead of a screenshot colour: an
+// edit to [colors] text_body / text_muted reaches every label, hint and log
+// row rather than the three ImGui slots alone.  Safe to call before init --
+// the singleton's LayoutConfig is then simply the compiled-in default.
+[[nodiscard]] inline std::uint32_t body_text() {
+    return ImGuiRuntime::instance().layout_.text_body;
+}
+[[nodiscard]] inline std::uint32_t muted_text() {
+    return ImGuiRuntime::instance().layout_.text_muted;
 }
 
 namespace ui {
@@ -818,7 +887,7 @@ void Section(std::string_view title, std::string_view subtitle = {}, bool separa
 }
 
 void Field(std::string_view label) {
-    ImGui::TextColored(rgb(palette::kTextMuted), "%.*s", static_cast<int>(label.size()), label.data());
+    ImGui::TextColored(rgb(muted_text()), "%.*s", static_cast<int>(label.size()), label.data());
 }
 
 struct ComboSpec final {
@@ -843,7 +912,7 @@ struct ComboSpec final {
     const float col_width = ImGui::GetContentRegionAvail().x;
     ImGui::SetCursorPosX(ImGui::GetCursorPosX() +
                          (std::max)(0.0f, col_width - label_width - 2.0f));
-    ImGui::TextColored(rgb(palette::kTextMuted), "%s", spec.label);
+    ImGui::TextColored(rgb(muted_text()), "%s", spec.label);
     ImGui::TableNextColumn();
     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(4.0f, 3.0f));
     ImGui::SetNextItemWidth(-1.0f);
@@ -873,7 +942,7 @@ enum class UtilityIcon : std::uint8_t { Clear, Save, Path, Refresh };
     // kTextBody instead of kTextMuted: contrast ~8:1 vs 0xEDF3F7 panel bg,
     // above the 3:1 threshold for non-text UI components.  kTextMuted gave
     // a ghost-grey look on the light surface.
-    const ImU32 stroke = ImGui::GetColorU32(rgb(palette::kTextBody));
+    const ImU32 stroke = ImGui::GetColorU32(rgb(body_text()));
     if (ImGui::IsItemHovered()) {
         draw_list->AddRectFilled(minimum, maximum,
                                  ImGui::GetColorU32(rgb(0xE0E7E1)), 3.0f);
@@ -938,12 +1007,14 @@ bool WindowButton(const char* id, WindowButtonKind kind, ImDrawList* draw_list) 
         kind == WindowButtonKind::Close
             ? (active ? rgb(0xA61B1B) : (hovered ? rgb(0xC93636) : rgb(palette::kSurfaceDefault)))
             : (active ? rgb(palette::kHeaderChromeDown)
-                      : (hovered ? rgb(palette::kHeaderChrome) : rgb(palette::kSurfaceDefault))));
+                      : (hovered ? rgb(0xD6E8F5) : rgb(palette::kSurfaceDefault))));
     draw_list->AddRectFilled(min, max, background, 2.0f);
-    // Glyph strokes follow the header text color so they stay legible on the
-    // light face; on press (dark/blue chip) the glyph inverts.
+    // Min/max hover is a pale chip so the dark glyph stays above 4.5:1
+    // (the old #1D5785 chip was 2.26:1). Close hover is red, so its glyph
+    // inverts: white on #C93636 is 5.17:1.
+    const bool invert_glyph = active || (hovered && kind == WindowButtonKind::Close);
     const ImU32 icon = ImGui::GetColorU32(
-        active ? rgb(palette::kTextInverse) : rgb(palette::kTextBody));
+        invert_glyph ? rgb(palette::kTextInverse) : rgb(body_text()));
     const float center_x = (min.x + max.x) * 0.5f;
     const float center_y = (min.y + max.y) * 0.5f;
     if (kind == WindowButtonKind::Minimize) {
@@ -1020,7 +1091,7 @@ void Header(int& actions, const bool connected) {
     }
     const float title_y = brand_center_y - title_size * 0.5f + 3.0f;
     const ImVec2 title_pos(position.x + kBrandInset + 34.0f, title_y);
-    const ImU32 header_text = ImGui::GetColorU32(rgb(palette::kTextBody));
+    const ImU32 header_text = ImGui::GetColorU32(rgb(body_text()));
     draw_list->AddText(title_font, title_size, title_pos, header_text, "XCOM");
     const float divider_x = title_pos.x + cached_title_width + 12.0f;
     draw_list->AddLine(ImVec2(divider_x, brand_center_y - 8.0f),
@@ -1029,7 +1100,7 @@ void Header(int& actions, const bool connected) {
     const float subtitle_size = fontsz::kSubtitle;
     draw_list->AddText(ImGui::GetFont(), subtitle_size,
                         ImVec2(divider_x + 12.0f, brand_center_y - subtitle_size * 0.5f + 3.0f),
-                       ImGui::GetColorU32(rgb(palette::kTextMuted)),
+                       ImGui::GetColorU32(rgb(muted_text())),
                        ImGuiRuntime::instance().lang().subtitle);
     const char* const status = connected ? runtime.lang().online : runtime.lang().offline;
     const float button_group_start = ImGui::GetWindowWidth() - 108.0f;
@@ -1070,7 +1141,7 @@ void Header(int& actions, const bool connected) {
             draw_list->AddText(
                 ImVec2((min.x + max.x) * 0.5f - text_w * 0.5f, min.y + 5.0f),
                 ImGui::GetColorU32(rgb(*chip.visible ? palette::kAccentTeal
-                                                     : palette::kTextBody)),
+                                                     : body_text())),
                 chip.label);
             if (pressed) {
                 actions |= chip.action_bit;
@@ -1108,7 +1179,7 @@ void Header(int& actions, const bool connected) {
     ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 12.0f);
     // Light header: the badge dot carries the color; the label uses dark body
     // text (bright cyan would be unreadable on #FBFCFD).
-    ImGui::TextColored(rgb(palette::kTextBody), "%s", status);
+    ImGui::TextColored(rgb(body_text()), "%s", status);
     ImGui::SetCursorPos(ImVec2(button_group_start, 2.0f));
     actions |= Command<Action::ActionMinimizeWindow>::Execute(
         [draw_list] { return WindowButton("##window_minimize", WindowButtonKind::Minimize, draw_list); });
@@ -1398,7 +1469,7 @@ void ArrowScrollbar(const ImVec2 bar_min, const ImVec2 bar_max, float row_h,
         const float cy = (mn.y + mx.y) * 0.5f;
         const float r = ImMax(3.0f, arrow_h * 0.30f);
         const ImU32 glyph = active ? IM_COL32(255, 255, 255, 255)
-                                   : ImGui::GetColorU32(rgb(palette::kTextBody));
+                                   : ImGui::GetColorU32(rgb(body_text()));
         if (up) {
             draw->AddTriangleFilled(ImVec2(cx, cy - r), ImVec2(cx - r, cy + r),
                                     ImVec2(cx + r, cy + r), glyph);
@@ -1560,9 +1631,34 @@ void ArrowScrollbar(const ImVec2 bar_min, const ImVec2 bar_max, float row_h,
     // The byte offset for a mouse position is computed per submitted row
     // during the clipper pass (GetItemRectMin/Max is authoritative, no
     // manual scroll math).
+    // Click multiplicity, resolved BEFORE the drag so the gestures cannot fight:
+    //   1 click  -> start a drag (or, with Shift, extend the existing range)
+    //   2 clicks -> select the word under the cursor
+    //   3+       -> select the whole line
+    // The old code treated every press as a drag start, so a double-click first
+    // zeroed the selection and then began a zero-length drag from the second
+    // press: two of the three gestures a text widget is expected to have did
+    // nothing at all.
+    const int click_count =
+        (log_hovered && !over_scrollbar)
+            ? ImGui::GetMouseClickedCount(ImGuiMouseButton_Left)
+            : 0;
+    // Shift+Click extends the EXISTING selection from its end.  This widget has
+    // no caret and no keyboard focus model, so the selection's tail is the only
+    // anchor a user can point at: click once to mark a position, then
+    // Shift+Click above or below it to select towards either direction.
+    // With nothing selected there is nothing to extend, so Shift+Click starts a
+    // plain drag instead of doing nothing.
+    const bool has_existing_selection =
+        runtime.receive_sel_end_ > runtime.receive_sel_begin_;
     const bool sel_drag_start =
-        log_hovered && !over_scrollbar && ImGui::IsMouseClicked(ImGuiMouseButton_Left);
-    if (sel_drag_start) {
+        click_count == 1 && (!io.KeyShift || !has_existing_selection);
+    const bool sel_extend_click =
+        click_count == 1 && io.KeyShift && has_existing_selection;
+    if (sel_extend_click) {
+        runtime.receive_sel_drag_origin_ = runtime.receive_sel_end_;
+        runtime.receive_sel_drag_hit_ = true;   // the origin is already chosen
+    } else if (sel_drag_start) {
         runtime.receive_sel_anchor_ = kSelDragging;
         runtime.receive_sel_begin_ = 0;
         runtime.receive_sel_end_ = 0;
@@ -1571,6 +1667,9 @@ void ArrowScrollbar(const ImVec2 bar_min, const ImVec2 bar_max, float row_h,
     const bool sel_dragging =
         runtime.receive_sel_anchor_ == kSelDragging &&
         ImGui::IsMouseDown(ImGuiMouseButton_Left);
+    // The Shift+Click extension lives for exactly this frame: the hit test
+    // below resolves it against the row under the mouse, and nothing is latched.
+    const bool sel_extend_pending = sel_extend_click;
     const bool has_selection = runtime.receive_sel_end_ > runtime.receive_sel_begin_;
     // Keyboard shortcuts mirroring the context menu.  Ctrl+A selects the whole
     // retained tail; Ctrl+C queues the selection for the Lua-side copy (which
@@ -1602,13 +1701,17 @@ void ArrowScrollbar(const ImVec2 bar_min, const ImVec2 bar_max, float row_h,
     });
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0.0f, 0.0f));
     ImDrawList* const draw = ImGui::GetWindowDrawList();
-    const ImU32 sel_color = ImGui::GetColorU32(ImGuiCol_TextSelectedBg);
+    // The receive log owns a solid selection surface. Keep ImGuiCol_TextSelectedBg
+    // translucent for ordinary text-input and combo selections elsewhere.
+    const ImU32 sel_color = ImGui::GetColorU32(rgb(runtime.layout_.selection));
     // Timestamp prefix painted per line (see the tint pass in the clipper):
     // fixed 15-byte "[HH:MM:SS.mmm] " shape emitted by rx_timestamp_prefix
     // in xcom_core (kTimestampPrefixBytes there == kTsPrefixBytes here).
     constexpr std::size_t kTsPrefixBytes = 15;
     const bool ts_enabled = timestamp != nullptr && *timestamp != 0;
-    const ImU32 ts_color = ImGui::GetColorU32(rgb(palette::kTimestamp));
+    // Timestamp / TX colours come from the layout config ([colors]); the
+    // defaults are the pic/1.png samples.
+    const ImU32 ts_color = ImGui::GetColorU32(rgb(runtime.layout_.timestamp));
     const float line_h = ImGui::GetTextLineHeight();
     const float text_width = ImGui::GetContentRegionAvail().x;
     // The mono log face is fixed-width: measure one glyph once (64 chars
@@ -1624,6 +1727,12 @@ void ArrowScrollbar(const ImVec2 bar_min, const ImVec2 bar_max, float row_h,
     // (see receive_base_); line offsets and hit tests below are window
     // offsets, so every absolute <-> window crossing goes through `base`.
     const std::size_t base = runtime.receive_base_;
+    // Vertical span of the rows this frame actually submitted, used by the
+    // drag's edge auto-scroll: a row the clipper skipped has no rect, so the
+    // first/last submitted row IS the reachable range of the gesture.
+    float rows_first_top = 0.0f;
+    float rows_last_bottom = 0.0f;
+    bool rows_seen = false;
     // Row metrics for the next frame's forced content size (see the panel
     // setup above).  The rows start at the cursor right here: its screen Y
     // minus the window origin, plus the scroll, is the rows' top offset in
@@ -1855,6 +1964,21 @@ void ArrowScrollbar(const ImVec2 bar_min, const ImVec2 bar_max, float row_h,
                     }
                 }
             }
+            // TX echo rows carry the reference red (pic/1.png sampled; tunable
+            // through [colors] tx_echo) so sent and received lines are
+            // distinguishable at a glance.  The echo is written by Lua with a
+            // literal "TX: " prefix (window.lua _echo_tx), so the test is one
+            // 4-byte memcmp per VISIBLE row.  The pop is RAII so both render
+            // paths (plain text and the segmented highlight path) stay
+            // balanced on every early exit.
+            const bool tx_row = line_len >= 4 &&
+                std::memcmp(line_begin, "TX: ", 4) == 0;
+            if (tx_row) {
+                ImGui::PushStyleColor(ImGuiCol_Text, rgb(runtime.layout_.tx_echo));
+            }
+            const auto pop_row_text = ScopedAction([tx_row] {
+                if (tx_row) ImGui::PopStyleColor();
+            });
             if (!drawn_as_segments) {
                 ImGui::TextUnformatted(line_begin, line_end);
             } else {
@@ -1879,12 +2003,43 @@ void ArrowScrollbar(const ImVec2 bar_min, const ImVec2 bar_max, float row_h,
                 draw->AddText(nullptr, 0.0f, ts_pos, ts_color, line_begin,
                               line_begin + kTsPrefixBytes);
             }
-            // Drag hit-testing against the row we just submitted.  Only the
+            // Selected glyphs invert to white over the solid selection so
+            // timestamp orange and TX red stay readable (they were ~3:1 on
+            // the old translucent wash).
+            if (has_selection || sel_dragging) {
+                const std::size_t sel_b =
+                    runtime.receive_sel_begin_ > base ? runtime.receive_sel_begin_ - base : 0U;
+                const std::size_t sel_e =
+                    runtime.receive_sel_end_ > base ? runtime.receive_sel_end_ - base : 0U;
+                if (sel_e > sel_b && line_off < sel_e &&
+                    line_off + line_len > sel_b) {
+                    const std::size_t from = sel_b > line_off ? sel_b - line_off : 0U;
+                    const std::size_t to = sel_e < line_off + line_len
+                                               ? sel_e - line_off : line_len;
+                    if (to > from) {
+                        const ImVec2 origin = ImGui::GetItemRectMin();
+                        draw->AddText(nullptr, 0.0f,
+                                      ImVec2(origin.x + offset_px(from), origin.y),
+                                      ImGui::GetColorU32(rgb(palette::kTextInverse)),
+                                      line_begin + from, line_begin + to);
+                    }
+                }
+            }
+            // Selection gestures against the row we just submitted.  Only the
             // row under the mouse passes the y range test, so the per-row
-            // cost outside the hovered line is a single comparison.
-            if (sel_dragging) {
+            // cost outside it is a single comparison.  Rows the clipper did not
+            // submit (scrolled out of view) cannot match, which is why the drag
+            // also scrolls at the edges (see below).
+            if (sel_dragging || sel_extend_pending || click_count >= 2) {
                 const ImVec2 rmin = ImGui::GetItemRectMin();
                 const ImVec2 rmax = ImGui::GetItemRectMax();
+                if (sel_dragging) {
+                    if (!rows_seen) {
+                        rows_first_top = rmin.y;
+                        rows_seen = true;
+                    }
+                    rows_last_bottom = rmax.y;
+                }
                 std::size_t at = hit_offset_in_row(io.MousePos, rmin, rmax);
                 if (at == static_cast<std::size_t>(-1) &&
                     io.MousePos.y >= rmin.y && io.MousePos.y < rmax.y) {
@@ -1892,20 +2047,55 @@ void ArrowScrollbar(const ImVec2 bar_min, const ImVec2 bar_max, float row_h,
                     at = io.MousePos.x < rmin.x ? line_off : line_off + line_len;
                 }
                 if (at != static_cast<std::size_t>(-1)) {
-                    // Window offset -> absolute stream bytes for the state.
-                    at += base;
-                    if (!runtime.receive_sel_drag_hit_) {
-                        runtime.receive_sel_drag_origin_ = at;
-                        runtime.receive_sel_drag_hit_ = true;
+                    if (click_count >= 2) {
+                        // Word (2) or whole line (3+), resolved against THIS
+                        // row's bytes.  The range is pushed straight into the
+                        // persistent state and no drag is left running, so the
+                        // gesture is complete on the press frame.
+                        const std::size_t row_off = at - line_off;
+                        std::size_t word_begin = 0U;
+                        std::size_t word_end = line_len;
+                        if (click_count == 2) {
+                            const auto range = xcom::imgui::selection::word_bounds(
+                                line_begin, line_len, row_off);
+                            word_begin = range.begin;
+                            word_end = range.end;
+                        }
+                        runtime.receive_sel_begin_ = base + line_off + word_begin;
+                        runtime.receive_sel_end_ = base + line_off + word_end;
+                        runtime.receive_sel_anchor_ = kNoSelAnchor;
+                        runtime.receive_sel_drag_hit_ = false;
+                    } else {
+                        // Window offset -> absolute stream bytes for the state.
+                        at += base;
+                        if (!runtime.receive_sel_drag_hit_) {
+                            runtime.receive_sel_drag_origin_ = at;
+                            runtime.receive_sel_drag_hit_ = true;
+                        }
+                        const std::size_t origin = runtime.receive_sel_drag_origin_;
+                        runtime.receive_sel_begin_ = at < origin ? at : origin;
+                        runtime.receive_sel_end_ = at > origin ? at : origin;
                     }
-                    const std::size_t origin = runtime.receive_sel_drag_origin_;
-                    runtime.receive_sel_begin_ = at < origin ? at : origin;
-                    runtime.receive_sel_end_ = at > origin ? at : origin;
                 }
             }
         }
     }
     clipper.End();
+    // Edge auto-scroll: without it a drag can never reach the rows the clipper
+    // did not submit, so a selection was limited to what happened to be on
+    // screen when the gesture started (the row rects below/above the viewport
+    // do not exist for the hit test).  One text row per frame towards the
+    // mouse, purely from the row metrics the loop just produced; the follow
+    // pin at the bottom is already suppressed while the button is down, and
+    // scrolling away detaches it for good, which is what the user asked for by
+    // dragging away from the tail.
+    if (sel_dragging && rows_first_top < rows_last_bottom) {
+        if (io.MousePos.y < rows_first_top) {
+            ImGui::SetScrollY(ImGui::GetScrollY() - line_h);
+        } else if (io.MousePos.y > rows_last_bottom) {
+            ImGui::SetScrollY(ImGui::GetScrollY() + line_h);
+        }
+    }
     // Finish the drag: persist the selection (anchor back to "no drag").
     if (runtime.receive_sel_anchor_ == kSelDragging && !ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
         runtime.receive_sel_anchor_ = kNoSelAnchor;
@@ -1980,38 +2170,36 @@ void ArrowScrollbar(const ImVec2 bar_min, const ImVec2 bar_max, float row_h,
         const bool has_sel = runtime.receive_sel_end_ > runtime.receive_sel_begin_;
         const bool has_text = !runtime.receive_text_.empty();
         const Lang& lang = runtime.lang();
-        // Copy submenu.  The items do NOT touch the clipboard here: they queue
-        // the requested bytes (QueueReceiveCopy) and the Lua bridge writes the
+        // Flat menu: the receive context menu has NO second level (user ask).
+        // The copy items do NOT touch the clipboard here: they queue the
+        // requested bytes (QueueReceiveCopy) and the Lua bridge writes the
         // clipboard after applying the optional timestamp strip.  That keeps
         // the strip policy in ONE place (core/receive_copy.lua, unit-tested
         // headless) instead of duplicating the pattern in C++.  Ctrl+C mirrors
         // "Copy selection".
-        if (ImGui::BeginMenu(lang.menu_copy, has_sel || has_text)) {
-            if (ImGui::MenuItem(lang.menu_copy_sel, nullptr, false, has_sel)) {
-                QueueReceiveCopy(runtime, runtime.receive_sel_begin_,
-                                 runtime.receive_sel_end_);
-            }
-            // "All" reaches only the RETAINED tail (receive_limit_, default
-            // 64 KiB - 1): earlier bytes have been retired from the view.
-            if (ImGui::MenuItem(lang.menu_copy_all, nullptr, false, has_text)) {
-                QueueReceiveCopy(runtime, runtime.receive_base_,
-                                 runtime.receive_base_ +
-                                     runtime.receive_text_.size());
-            }
-            ImGui::Separator();
-            // Copy policy: when on, the injected "[HH:MM:SS.mmm] " prefixes
-            // are stripped before the clipboard write.  The toggle is a
-            // Lua-owned int (registered via xcom_imgui_set_copy_strip) so the
-            // Lua side both persists and applies it; the item hides when the
-            // bridge did not register the pointer (older Lua/DLL pairing).
-            if (runtime.copy_strip_ts_ != nullptr) {
-                bool strip = *runtime.copy_strip_ts_ != 0;
-                if (ImGui::MenuItem(lang.menu_copy_strip_ts, nullptr, strip)) {
-                    *runtime.copy_strip_ts_ = strip ? 0 : 1;
-                }
-            }
-            ImGui::EndMenu();
+        if (ImGui::MenuItem(lang.menu_copy_sel, nullptr, false, has_sel)) {
+            QueueReceiveCopy(runtime, runtime.receive_sel_begin_,
+                             runtime.receive_sel_end_);
         }
+        // "All" reaches only the RETAINED tail (receive_limit_, default
+        // 64 KiB - 1): earlier bytes have been retired from the view.
+        if (ImGui::MenuItem(lang.menu_copy_all, nullptr, false, has_text)) {
+            QueueReceiveCopy(runtime, runtime.receive_base_,
+                             runtime.receive_base_ +
+                                 runtime.receive_text_.size());
+        }
+        // Copy policy: when on, the injected "[HH:MM:SS.mmm] " prefixes are
+        // stripped before the clipboard write.  The toggle is a Lua-owned int
+        // (registered via xcom_imgui_set_copy_strip) so the Lua side both
+        // persists and applies it; the item hides when the bridge did not
+        // register the pointer (older Lua/DLL pairing).
+        if (runtime.copy_strip_ts_ != nullptr) {
+            bool strip = *runtime.copy_strip_ts_ != 0;
+            if (ImGui::MenuItem(lang.menu_copy_strip_ts, nullptr, strip)) {
+                *runtime.copy_strip_ts_ = strip ? 0 : 1;
+            }
+        }
+        ImGui::Separator();
         // Select every retained byte: base..base+size is exactly the window, so
         // the copy-selection clamp above maps it 1:1 (no off-by-base error).
         if (ImGui::MenuItem(lang.menu_select_all, nullptr, false, has_text)) {
@@ -2066,7 +2254,9 @@ void ArrowScrollbar(const ImVec2 bar_min, const ImVec2 bar_max, float row_h,
     // and Run.  Editors and toggles stay live so the user can still compose.
     int actions = 0;
     const Lang& lang = ImGuiRuntime::instance().lang();
-    if (ImGui::BeginTabBar("##transmit_tabs")) {
+    // DrawSelectedOverline: the selected tab is a pale fill, so the accent
+    // overline above it is what marks the selection (see kStyleColors).
+    if (ImGui::BeginTabBar("##transmit_tabs", ImGuiTabBarFlags_DrawSelectedOverline)) {
         if (ImGui::BeginTabItem(lang.tab_single)) {
             ImGui::SetCursorPosX(0.0f);
             // Option toolbar ABOVE the editor (reference layout): toggles and
@@ -2083,6 +2273,50 @@ void ArrowScrollbar(const ImVec2 bar_min, const ImVec2 bar_max, float row_h,
             if (ImGui::InputInt("##send_period", send_period, 0, 0)) actions |= Action::ActionSyncSettings;
             ImGui::SameLine();
             ImGui::TextDisabled("%s", lang.ms);
+            // Command history.  A VISIBLE list rather than Up/Down in the
+            // editor: ImGui asserts that CallbackHistory and Multiline are
+            // mutually exclusive ("they both use up/down keys"), and this
+            // editor stays multiline so a pasted block is still editable as a
+            // block.  Picking an entry writes it into send_text, which the
+            // editor reloads because opening the combo deactivates it; Lua
+            // reads the same buffer when Send is pressed, so nothing else has
+            // to be told.  The list itself is Lua's (it persists and caps it,
+            // see core/send_history.lua) and arrives newest-first.
+            auto& history = ImGuiRuntime::instance().send_history_;
+            if (!history.empty()) {
+                ImGui::SameLine(0.0f, 10.0f);
+                ImGui::SetNextItemWidth(132.0f);
+                if (ImGui::BeginCombo("##send_history", lang.history)) {
+                    for (std::size_t index = 0; index < history.size(); ++index) {
+                        const std::string& entry = history[index];
+                        // One popup row per command, so a multi-line entry is
+                        // shown as its first line plus a marker instead of
+                        // blowing the row up.
+                        const std::size_t newline = entry.find('\n');
+                        const bool multiline = newline != std::string::npos;
+                        std::string label = multiline
+                                                ? entry.substr(0, newline)
+                                                : entry;
+                        if (multiline) label += " ...";
+                        if (label.empty()) label = " ";
+                        ImGui::PushID(static_cast<int>(index));
+                        const bool picked = ImGui::Selectable(label.c_str());
+                        if (picked || ImGui::IsItemHovered()) {
+                            ImGui::SetTooltip("%s", entry.c_str());
+                        }
+                        ImGui::PopID();
+                        if (picked) {
+                            // Truncating form on purpose: the list comes from a
+                            // config file a user can hand-edit, and strcpy_s on
+                            // an over-long value invokes the invalid-parameter
+                            // handler (a hard stop) instead of clipping it.
+                            strncpy_s(send_text, send_capacity, entry.c_str(),
+                                      send_capacity - 1U);
+                        }
+                    }
+                    ImGui::EndCombo();
+                }
+            }
             // Toolbar row height (toggle ~20 + spacing) reserves the band the
             // editor must not cover.
             const float toolbar_h = ImGui::GetCursorPosY();
@@ -2267,9 +2501,18 @@ void ArrowScrollbar(const ImVec2 bar_min, const ImVec2 bar_max, float row_h,
         const auto& port_list = ImGuiRuntime::instance().ports_;
         const Slice<std::string> ports(port_list.data(), port_list.size());
         for (const std::string& candidate : ports) {
-            const bool selected = candidate == port;
-            if (ImGui::Selectable(candidate.c_str(), selected)) {
-                strcpy_s(port, port_capacity, candidate.c_str());
+            // "COMx\tlabel": the tab is not part of the open() name.
+            const auto tab = candidate.find('\t');
+            const std::string key = tab == std::string::npos
+                                        ? candidate
+                                        : candidate.substr(0, tab);
+            const std::string visible = tab == std::string::npos
+                                            ? candidate
+                                            : key + "  " + candidate.substr(tab + 1);
+            const std::string item = visible + "##" + key;
+            const bool selected = key == port;
+            if (ImGui::Selectable(item.c_str(), selected)) {
+                strcpy_s(port, port_capacity, key.c_str());
                 actions |= Action::ActionSyncSettings;
             }
             if (selected) ImGui::SetItemDefaultFocus();
@@ -2437,7 +2680,7 @@ void ArrowScrollbar(const ImVec2 bar_min, const ImVec2 bar_max, float row_h,
     ImGui::PushStyleColor(ImGuiCol_Button, rgb(0xFEFEFE));
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, rgb(0xE9ECED));
     ImGui::PushStyleColor(ImGuiCol_ButtonActive, rgb(0xDFE3E5));
-    ImGui::PushStyleColor(ImGuiCol_Text, rgb(palette::kTextBody));
+    ImGui::PushStyleColor(ImGuiCol_Text, rgb(body_text()));
     const ImVec2 resolved_size(size.x, size.y > 0.0f ? size.y : kControlHeight);
     const bool clicked = WithRounding(3.0f, [](const char* text, const ImVec2& button_size) {
         return ImGui::Button(text, button_size);
@@ -2512,7 +2755,7 @@ void Footer(const bool connected, const int rx_bytes, const int tx_bytes) {
                              ImVec2(origin.x + footer_width, origin.y + 1.0f), border);
     const std::string_view state_label = connected ? runtime.lang().online : runtime.lang().offline;
     const ImU32 state_color = ImGui::GetColorU32(
-        connected ? rgb(palette::kAccentTeal) : rgb(palette::kTextMuted));
+        connected ? rgb(palette::kAccentTeal) : rgb(muted_text()));
     const float state_width = ImGui::CalcTextSize(state_label.data(),
                                                    state_label.data() + state_label.size()).x;
     const ImVec2 state_min(origin.x + 10.0f, origin.y + 3.0f);
@@ -2551,7 +2794,7 @@ void Footer(const bool connected, const int rx_bytes, const int tx_bytes) {
     // They return the moment the message clears.
     if (runtime.status_text_.empty()) {
         draw_list->AddText(ImVec2(origin.x + counter_x, baseline),
-                           ImGui::GetColorU32(rgb(palette::kTextMuted)), counters);
+                           ImGui::GetColorU32(rgb(muted_text())), counters);
     }
     // The two hint literals are fixed; cache each width, font-keyed.
     const std::string_view hint = connected ? std::string_view{runtime.lang().ready}
@@ -2640,7 +2883,7 @@ void Footer(const bool connected, const int rx_bytes, const int tx_bytes) {
     if (runtime.status_text_.empty()) {
         draw_list->AddText(ImVec2(origin.x + (std::max)(footer_width - hint_width - 14.0f,
                                                          content_boundary + 8.0f), baseline),
-                           ImGui::GetColorU32(rgb(palette::kTextMuted)), hint.data(),
+                           ImGui::GetColorU32(rgb(muted_text())), hint.data(),
                            hint.data() + hint.size());
     }
     draw_list->AddLine(ImVec2(origin.x + content_boundary, origin.y + 4.0f),
@@ -2963,7 +3206,7 @@ int ScriptEditorResize(ImGuiInputTextCallbackData* data) {
                              ImVec4(0.92f, 0.40f, 0.10f, 0.9f), "A");
                 ImPlot::TagX(runtime.scope_cursor_b_,
                              ImVec4(0.92f, 0.40f, 0.10f, 0.9f), "B");
-                ImGui::PushStyleColor(ImGuiCol_Text, rgb(palette::kTextMuted));
+                ImGui::PushStyleColor(ImGuiCol_Text, rgb(muted_text()));
                 ImGui::Text(lang.scope_dt_fmt,
                             runtime.scope_cursor_b_ - runtime.scope_cursor_a_);
                 ImGui::PopStyleColor();
@@ -3152,33 +3395,51 @@ void RenderPluginSpec(ImGuiRuntime& runtime, ImGuiRuntime::PluginPage& page) {
     // switches so the floating-window position persists in imgui.ini.
     const std::string settings_title = std::string{lang.settings_title} + "###settings";
     if (ImGui::Begin(settings_title.c_str(), &open)) {
-        if (ImGui::BeginTabBar("##settings_tabs")) {
+        if (ImGui::BeginTabBar("##settings_tabs", ImGuiTabBarFlags_DrawSelectedOverline)) {
             if (ImGui::BeginTabItem(lang.general_tab)) {
                 Section(lang.appearance);
                 ImGui::TextUnformatted(lang.font_size);
+                // When the Lua-owned buffers are registered (see
+                // xcom_imgui_set_font_prefs) the widgets edit THOSE and the
+                // effective switch happens in xcom_imgui_new_frame: one source
+                // of truth, and the value survives a restart through
+                // config.ini [font].  Without them the legacy direct-member
+                // path stays, so an older Lua bridge keeps working.
+                const bool font_prefs_owned = runtime.font_pref_body_ != nullptr &&
+                                              runtime.font_pref_cjk_ != nullptr;
                 for (int index = 0; index < 3; ++index) {
                     char label[24]{};
                     sprintf_s(label, "%d px", static_cast<int>(fontsz::kBodySizes[index]));
-                    const bool active = runtime.body_font_index_ == index;
+                    const int current = font_prefs_owned ? *runtime.font_pref_body_
+                                                         : runtime.body_font_index_;
+                    const bool active = current == index;
                     // Swap io.FontDefault between the pre-baked body faces (the
                     // atlases exist from init, so this is a pointer flip, not a
                     // texture rebuild).
                     if (ImGui::RadioButton(label, active)) {
-                        if (ImFont* font = runtime.body_fonts_[index]) {
+                        if (font_prefs_owned) {
+                            *runtime.font_pref_body_ = index;
+                        } else if (ImFont* font = runtime.body_fonts_[index]) {
                             runtime.body_font_index_ = index;
                             ImGui::GetIO().FontDefault = font;
                         }
                     }
                 }
-                // Runtime toggle for baking the mono font's CJK glyphs (2500
-                // hanzi + kana): on = receive log shows Chinese, off = Chinese
-                // renders as '?' and the ~26 MB of extra bitmap memory is freed.
+                // Runtime toggle for the mono font's CJK merge: on = the receive
+                // log renders hanzi/kana through the bundled SimHei subset, off
+                // = CJK bytes render as '?'.  No fixed bitmap figure is quoted
+                // here on purpose: this ImGui bakes glyphs on demand (the DX11
+                // backend reports RendererHasTextures), so the resident cost
+                // follows how many distinct CJK glyphs actually reached the log.
                 // The actual atlas rebuild is deferred to the top of the next
                 // new_frame (never mid-draw) to avoid touching fonts while a
                 // window/draw-list is live.
-                bool show_chinese = runtime.font_mono_cjk_;
+                bool show_chinese = font_prefs_owned ? (*runtime.font_pref_cjk_ != 0)
+                                                     : runtime.font_mono_cjk_;
                 if (ImGui::Checkbox(lang.mono_cjk_label, &show_chinese)) {
-                    if (show_chinese != runtime.font_mono_cjk_) {
+                    if (font_prefs_owned) {
+                        *runtime.font_pref_cjk_ = show_chinese ? 1 : 0;
+                    } else if (show_chinese != runtime.font_mono_cjk_) {
                         runtime.font_mono_cjk_ = show_chinese;
                         runtime.font_rebuild_pending_ = true;
                     }
@@ -3362,8 +3623,12 @@ constexpr std::array kLayoutEntries{
     LayoutEntry{"receive_height",     0.0f, 600.0f, &LayoutConfig::receive_height},
     LayoutEntry{"send_height",      100.0f, 360.0f, &LayoutConfig::send_height},
     LayoutEntry{"header_height",     24.0f,  72.0f, &LayoutConfig::header_height},
-    LayoutEntry{"panel_gap",          2.0f,  24.0f, &LayoutConfig::panel_gap},
-    LayoutEntry{"window_padding",     4.0f,  24.0f, &LayoutConfig::window_padding},
+    // panel_gap / window_padding accept the file's own shipped values (0 and
+    // 1): the old 2.0/4.0 floors silently rejected them, so those two lines of
+    // layout.toml only ever "worked" because the struct defaults happen to
+    // match.  A user who wrote 1 there got it ignored.
+    LayoutEntry{"panel_gap",          0.0f,  24.0f, &LayoutConfig::panel_gap},
+    LayoutEntry{"window_padding",     0.0f,  24.0f, &LayoutConfig::window_padding},
     LayoutEntry{"item_spacing",       2.0f,  16.0f, &LayoutConfig::item_spacing},
     LayoutEntry{"frame_padding_y",    2.0f,  10.0f, &LayoutConfig::frame_padding_y},
     LayoutEntry{"section_gap",        2.0f,  12.0f, &LayoutConfig::section_gap},
@@ -3379,6 +3644,28 @@ std::string_view trim_view(std::string_view value) noexcept {
     const size_t last = value.find_last_not_of(" \t\r\n");
     return value.substr(first, last - first + 1);
 }
+
+// Parse a [colors] value: "#RRGGBB", "RRGGBB" or "0xRRGGBB".  Anything else —
+// a typo, a short hex, a named colour — returns kColourInvalid so the sampled
+// default stays in force; a malformed line must never paint the log black.
+constexpr std::uint32_t kColourInvalid = 0xFFFFFFFFU;
+[[nodiscard]] std::uint32_t parse_colour(std::string_view raw) noexcept {
+    if (!raw.empty() && raw.front() == '#') {
+        raw.remove_prefix(1);
+    } else if (raw.size() > 2 && raw[0] == '0' && (raw[1] == 'x' || raw[1] == 'X')) {
+        raw.remove_prefix(2);
+    }
+    if (raw.size() != 6) return kColourInvalid;
+    std::uint32_t value = 0;
+    for (const char digit : raw) {
+        value <<= 4;
+        if (digit >= '0' && digit <= '9') value |= static_cast<std::uint32_t>(digit - '0');
+        else if (digit >= 'a' && digit <= 'f') value |= static_cast<std::uint32_t>(digit - 'a' + 10);
+        else if (digit >= 'A' && digit <= 'F') value |= static_cast<std::uint32_t>(digit - 'A' + 10);
+        else return kColourInvalid;
+    }
+    return value;
+}
 }  // namespace
 
 void load_layout_config() {
@@ -3390,7 +3677,7 @@ void load_layout_config() {
     std::string line;
     // [layout] numeric knobs + [font] boolean switches + [ui] language share
     // one scanner; the section tag routes each key to its consumer.
-    int section = 0;  // 0 = none, 1 = [layout], 2 = [font], 3 = [ui]
+    int section = 0;  // 0 = none, 1 = [layout], 2 = [font], 3 = [ui], 4 = [colors]
     while (std::getline(input, line)) {
         const size_t comment = line.find('#');
         if (comment != std::string::npos) line.resize(comment);
@@ -3399,7 +3686,32 @@ void load_layout_config() {
         if (trimmed.front() == '[') {
             section = trimmed == "[layout]" ? 1
                         : trimmed == "[font]" ? 2
-                        : trimmed == "[ui]" ? 3 : 0;
+                        : trimmed == "[ui]" ? 3
+                        : trimmed == "[colors]" ? 4 : 0;
+            continue;
+        }
+        if (section == 4) {
+            // [colors] overrides the handful of TEXT colours the log is read
+            // through; every other slot stays in the sampled style table.  The
+            // keys are named after what they colour, not after the ImGui slot,
+            // so the file reads as configuration rather than as a style dump.
+            // Note: the '#' comment strip above runs first, so a value can only
+            // ever be "RRGGBB" or "0xRRGGBB" in practice (documented in the
+            // toml); parse_colour still accepts a leading '#' for robustness.
+            const size_t equals = trimmed.find('=');
+            if (equals == std::string_view::npos) continue;
+            const std::string_view key = trim_view(trimmed.substr(0, equals));
+            std::string_view raw = trim_view(trimmed.substr(equals + 1));
+            if (raw.size() >= 2 && (raw.front() == '"' || raw.front() == '\'')) {
+                raw = raw.substr(1, raw.size() - 2);   // strip quotes
+            }
+            const std::uint32_t parsed = parse_colour(raw);
+            if (parsed == kColourInvalid) continue;
+            if (key == "text_body") layout.text_body = parsed;
+            else if (key == "text_muted") layout.text_muted = parsed;
+            else if (key == "timestamp") layout.timestamp = parsed;
+            else if (key == "tx_echo") layout.tx_echo = parsed;
+            else if (key == "selection") layout.selection = parsed;
             continue;
         }
         if (section == 3) {
@@ -3518,14 +3830,15 @@ struct StyleColorEntry final {
     float alpha;
 };
 constexpr std::array kStyleColors{
-    StyleColorEntry{ImGuiCol_Text, 0x1B1B1B, 1.0f},
-    StyleColorEntry{ImGuiCol_TextDisabled, 0x8C8C8C, 1.0f},
+    // ImGuiCol_Text / TextDisabled / TextSelectedBg are NOT here: they are the
+    // configurable text colours ([colors] in assets/layout.toml) and are
+    // applied from the layout config at the end of apply_style.
     StyleColorEntry{ImGuiCol_WindowBg, 0xFBFCFD, 1.0f},
     StyleColorEntry{ImGuiCol_ChildBg, 0xFBFCFD, 1.0f},                  // 1.png: no gray default children
     StyleColorEntry{ImGuiCol_PopupBg, 0xFFFFFF, 1.0f},
-    StyleColorEntry{ImGuiCol_Border, 0xB8BFC7, 0.9f},                   // 1px edges: inputs + floating-panel borders
+    // B8BFC7 at its alpha 0.9 painted #BFC5CD on white, i.e. 1.74:1.
+    StyleColorEntry{ImGuiCol_Border, 0x8A8A8A, 1.0f},                   // 3.45:1 on white
     StyleColorEntry{ImGuiCol_BorderShadow, 0xFFFFFF, 0.0f},
-    StyleColorEntry{ImGuiCol_TextSelectedBg, 0x005A98, 0.35f},           // 1.png primary blue selection
     StyleColorEntry{ImGuiCol_Separator, 0xDEDEDE, 1.0f},               // 1.png sidebar section lines
     StyleColorEntry{ImGuiCol_FrameBg, 0xFFFFFF, 1.0f},
     StyleColorEntry{ImGuiCol_FrameBgHovered, 0xE8F3F8, 1.0f},
@@ -3541,9 +3854,19 @@ constexpr std::array kStyleColors{
     StyleColorEntry{ImGuiCol_SliderGrabActive, 0x004270, 1.0f},
     StyleColorEntry{ImGuiCol_Tab, 0xFBFCFD, 1.0f},                     // 1.png tab band is white, no gray strip
     StyleColorEntry{ImGuiCol_TabHovered, 0xE3F0FB, 1.0f},
-    StyleColorEntry{ImGuiCol_TabActive, 0x005A98, 1.0f},
+    // A selected tab used to be a solid 0x005A98 fill.  ImGui 1.93 has no
+    // tab-label colour slot (labels go through ImGuiCol_Text), so the dark
+    // fill put #1B1B1B text at 2.39:1 — the worst pair in the whole palette,
+    // and under every threshold.  The pale fill below reads 12.86:1 and the
+    // accent moves to the 1px overline, which the two BeginTabBar calls opt
+    // into with ImGuiTabBarFlags_DrawSelectedOverline.  Both overline slots
+    // are set explicitly because ImGui's light theme leaves the dimmed one at
+    // alpha 0, so an unfocused bar would otherwise lose the marker entirely.
+    StyleColorEntry{ImGuiCol_TabActive, 0xC9E2F5, 1.0f},
     StyleColorEntry{ImGuiCol_TabUnfocused, 0xFBFCFD, 1.0f},
-    StyleColorEntry{ImGuiCol_TabUnfocusedActive, 0x005A98, 1.0f},
+    StyleColorEntry{ImGuiCol_TabUnfocusedActive, 0xC9E2F5, 1.0f},
+    StyleColorEntry{ImGuiCol_TabSelectedOverline, 0x005A98, 1.0f},
+    StyleColorEntry{ImGuiCol_TabDimmedSelectedOverline, 0x005A98, 1.0f},
     StyleColorEntry{ImGuiCol_ScrollbarBg, 0xE8EAEC, 1.0f},
     StyleColorEntry{ImGuiCol_ScrollbarGrab, 0xC4C8CC, 1.0f},
     StyleColorEntry{ImGuiCol_ScrollbarGrabHovered, 0xAEB4BA, 1.0f},
@@ -3555,9 +3878,11 @@ constexpr float kClearColor[4] = {0xFB / 255.0f, 0xFC / 255.0f, 0xFD / 255.0f, 1
 
 // Shared CJK font data (memory).  AddFontFromFileTTF copies the WHOLE file
 // into the atlas per call, so merging a font at several sizes would duplicate
-// the bytes per merge.  Load the ONE CJK face (the bundled SimHeiCJK.ttf,
-// ~0.7 MB) into a static buffer and hand every merge (body 13/15/17 + heading
-// + mono) the same pointer with FontDataOwnedByAtlas=false.  File-scope static
+// the bytes per merge.  Load the ONE CJK face — the bundled SimHeiCJK.ttf,
+// ~1.1 MB, holding the GB2312 symbol rows, the level-1 hanzi and the CJK /
+// fullwidth punctuation; regenerate it with tools/build_cjk_subset.py — into a
+// static buffer and hand every merge (body 13/15/17 + heading + mono) the same
+// pointer with FontDataOwnedByAtlas=false.  File-scope static
 // keeps the buffer alive for the whole process (including after a runtime
 // rebuild via ClearFonts() + re-AddFont) so a rebuild never re-reads the disk.
 // The bold msyhbd.ttc (~17 MB) is deliberately not loaded: the heading's LATIN
@@ -3587,7 +3912,7 @@ static const std::vector<char> cjk_data = [] {
 //
 // Ownership/lifetime contracts (see the init-site comments — they still hold):
 //   * cjk_data is a file-scope `static const std::vector<char>` (bundled
-//     SimHeiCJK.ttf, ~0.7 MB) owned by the process, passed with
+//     SimHeiCJK.ttf, ~1.1 MB) owned by the process, passed with
 //     FontDataOwnedByAtlas=false; after ClearFonts() the buffer is untouched,
 //     so the rebuild reuses it without a second disk read.
 //   * ui_glyph_ranges_ / cjk_ranges_ are Runtime ImVector<ImWchar> members the
@@ -3790,6 +4115,14 @@ void apply_style(const LayoutConfig& layout) {
     for (const StyleColorEntry& entry : kStyleColors) {
         style.Colors[entry.slot] = rgb(entry.value, entry.alpha);
     }
+    // The three text slots come from the layout config so the log's font
+    // colours are tunable through assets/layout.toml [colors] (defaults are the
+    // pic/1.png samples, pinned by static_assert above).
+    style.Colors[ImGuiCol_Text] = rgb(layout.text_body);
+    style.Colors[ImGuiCol_TextDisabled] = rgb(layout.text_muted);
+    // Ordinary ImGui selections keep the lighter wash. The receive log uses
+    // its own solid selection surface and redraws selected glyphs in white.
+    style.Colors[ImGuiCol_TextSelectedBg] = rgb(layout.selection, 0.35f);
 }
 }  // namespace
 
@@ -4336,6 +4669,26 @@ extern "C" __declspec(dllexport) int xcom_imgui_new_frame() {
     auto& runtime = ImGuiRuntime::instance();
     if (!runtime.initialized_ || runtime.frame_active_ || GetCurrentThreadId() != runtime.owner_thread_ ||
         !IsWindow(runtime.hwnd_) || !runtime.device_ || !runtime.context_) return 0;
+    // Apply the Lua-owned font preferences (settings page -> config.ini
+    // [font]).  Doing this at the frame top rather than inside the widget
+    // keeps every atlas-touching change in one place: the deferred rebuild
+    // below then runs in the same frame the change lands, with no window or
+    // draw-list live.
+    if (runtime.font_pref_body_ != nullptr) {
+        const int want_font = *runtime.font_pref_body_;
+        if (want_font >= 0 && want_font < 3 && want_font != runtime.body_font_index_ &&
+            runtime.body_fonts_[want_font] != nullptr) {
+            runtime.body_font_index_ = want_font;
+            ImGui::GetIO().FontDefault = runtime.body_fonts_[want_font];
+        }
+    }
+    if (runtime.font_pref_cjk_ != nullptr) {
+        const bool want_cjk = *runtime.font_pref_cjk_ != 0;
+        if (want_cjk != runtime.font_mono_cjk_) {
+            runtime.font_mono_cjk_ = want_cjk;
+            runtime.font_rebuild_pending_ = true;
+        }
+    }
     // Deferred font rebuild (mono-CJK toggle).  Must run here, before
     // DX11_NewFrame schedules the lazy atlas bake: the previous frame is
     // presented (frame_active_ == false), no window is mid-Begin, and no
@@ -4455,6 +4808,63 @@ extern "C" __declspec(dllexport) void xcom_imgui_set_copy_strip(int* enabled) {
     auto& runtime = ImGuiRuntime::instance();
     if (!extension_ready(runtime)) return;
     runtime.copy_strip_ts_ = enabled;
+}
+
+// Font preferences (settings page).  Registration mirrors the switches above:
+// Lua owns both ints, so config.ini [font] is the single persistence point and
+// the DLL applies whatever the ints hold at the top of each frame.  Range is
+// not policed here — xcom_imgui_new_frame clamps the index against the baked
+// faces it actually has.
+extern "C" __declspec(dllexport) void xcom_imgui_set_font_prefs(
+    int* body_index, int* mono_cjk) {
+    auto& runtime = ImGuiRuntime::instance();
+    if (!extension_ready(runtime)) return;
+    runtime.font_pref_body_ = body_index;
+    runtime.font_pref_cjk_ = mono_cjk;
+}
+
+// Seed a freshly built Lua bridge with the values the DLL resolved at init
+// (fontsz default index + [font] show_chinese_in_receive from layout.toml).
+// Called BEFORE set_font_prefs, so a config-less first run inherits the
+// shipped defaults instead of a hardcoded copy of them.
+extern "C" __declspec(dllexport) void xcom_imgui_get_font_prefs(
+    int* body_index_out, int* mono_cjk_out) {
+    auto& runtime = ImGuiRuntime::instance();
+    if (!extension_ready(runtime)) return;
+    if (body_index_out != nullptr) *body_index_out = runtime.body_font_index_;
+    if (mono_cjk_out != nullptr) *mono_cjk_out = runtime.font_mono_cjk_ ? 1 : 0;
+}
+
+// 1 while the left button is held and a selection drag is in flight.  Lua
+// consults this before an AUTOMATIC view clear (自动清空): the empty push
+// destroys the selection by design, which is right for an explicit clear but
+// wrong in the middle of the gesture the user is still making -- the drag
+// invariant this bridge already enforces for its own tail trim.  An older DLL
+// without the export simply keeps today's behaviour (Lua probes it optionally).
+extern "C" __declspec(dllexport) int xcom_imgui_selection_dragging(void) {
+    auto& runtime = ImGuiRuntime::instance();
+    if (!extension_ready(runtime)) return 0;
+    return runtime.receive_sel_anchor_ == kSelDragging ? 1 : 0;
+}
+
+// Send-box command history, pushed by Lua newest-first (it owns the list:
+// persistence, dedupe and the cap live in core/send_history.lua).  `packed` is
+// NUL-separated entries, the same marshalling the highlight rules and script
+// names use.  Re-pushing resets the navigation cursor, which is what makes the
+// command the user just sent the first entry the list offers.
+extern "C" __declspec(dllexport) void xcom_imgui_set_send_history(
+    const char* packed, int count) {
+    auto& runtime = ImGuiRuntime::instance();
+    if (!extension_ready(runtime)) return;
+    runtime.send_history_.clear();
+    runtime.send_history_pos_ = -1;
+    if (packed == nullptr || count <= 0) return;
+    const char* cursor = packed;
+    for (int index = 0; index < count; ++index) {
+        const std::size_t length = std::strlen(cursor);
+        runtime.send_history_.emplace_back(cursor, length);
+        cursor += length + 1U;
+    }
 }
 
 // Hand the pending receive-copy request to Lua and clear it.  Ctrl+C / the
