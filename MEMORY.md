@@ -310,3 +310,63 @@
 - **门禁**：MSVC 重编 `xcom_imgui.dll`（894976 B）已入库，`dumpbin` 核对新导出全部存在；Lua 26 套件 **23 OK**（失败的 3 项 = 本机环境项：
   `test_shipped_scripts` 类 Unix 目录列举、`test_rx_charset_batch` 本机有真 DLL、`test_wave_ring` `os.clock` 粒度，与本轮无关）；
   宿主 C++ ctest **11/11**；`lint_fields` clean（18 files）；ABI layout pins OK。
+
+### 本轮（第 13 轮）：把上轮判为"环境噪声"的三项逐一归因 × CJK 路径边界，2026-10-05
+> 用户要求：在 Windows 上编译验证本轮（性能+功能）改动，并修掉发现的问题。
+- **结论：上轮记的三项"本机环境项失败"里有两项是真 bug，不是噪声**，本轮全部修掉：Lua **30 套件 0 失败**、
+  宿主 ctest **11/11**、`lint_fields` clean（19 files）、真实窗口 E2E `e2e_drag_freeze` **10/10 PASS**。
+- **头号发现（功能，影响出货）**：Windows 的 `io.open`/`loadfile` 走 ANSI（`GetACP()`=936），而程序内部路径全是 UTF-8
+  （luv 扫描出的文件名、ImGui 回传的路径）。本机实测 `io.open("scripts/绘制曲线.lua")=nil` 而
+  `uv.fs_stat(同串)=file`——**8 个中文名插件全部"静默加载失败"**，连 `@name/@desc` 也读不到（控制台只能退回显示文件名），
+  配置/BMP 落在中文目录时同样失效。C++ 侧一直显式转 UTF-16（`serial_backend_win.cpp`/`log_writer.cpp`），
+  缺口在 Lua 侧没有统一的路径编码策略。
+- **修法（AOP 单点）**：新增 `core/fs_path.lua` —— 全程序唯一的 UTF-8 → CRT 路径边界。ASCII 快路径只做一次字节区间扫描、
+  不碰 FFI；非 ASCII 才经 kernel32 `MultiByteToWideChar/WideCharToMultiByte(CP_ACP)` 两张 grow-only scratch 转换
+  （非 UTF-8 入参原样返回，绝不二次转换）。`script_engine`（含 `read_script_meta` 的头部读）、`window.lua`（编辑器读/存、新建脚本）、
+  `config.lua`（load/save 的 open+rename+remove）、`bmp_writer` 的 io 全部改走它。`fs_path.load` 读源后用
+  `loadstring(src, "@"..path)` 编译，**chunk 名保留 UTF-8**，所以运行期报错仍打印 `绘制曲线.lua:12` 而不是乱码；
+  打不开时退回 `loadfile` 取 CRT 的 errno 文案再配回 UTF-8 名字。
+  `tests/test_shipped_scripts.lua` 的目录探测/编译改用它，并新增两条反向断言：`fs_path.encodes()` 为真时
+  **裸 `io.open` 必须为 nil**（证明是转换在起作用，而不是碰巧在 UTF-8 机器上通过）。
+- **第二处真 bug（功能）是一整条「GDI 弹窗」链，四处错彼此遮挡**（修好一处才暴露下一处，说明这条路径很久没人真正跑通过）：
+  1. `LoadCursorA` 第二参在 `ui/win32.lua` 声明为 `LPCSTR`，调用点按 MAKEINTRESOURCE 传统传整数 atom
+     （`IDC_ARROW`=32512），LuaJIT FFI 直接拒绝（`cannot convert 'number' to 'const char *'`）→ `wave.show()` 抛异常，
+     `wave_demo/scope_demo/smoke_ui` 三个随包脚本**加载即失败**。修：`ffi.cast("const char*", w.gdi.IDC_ARROW)`。
+  2. 修好①后 `show()` 返回 **false**：`WM_NCCREATE` 在 `CreateWindowExA` 内部到达，那时 `s.hwnd` 还是 nil，
+     dispatch 落到 `DefWindowProcA(NULL, …)` 返回 FALSE → 创建被取消。修：dispatch 里 `WM_NCCREATE` 直接 return 1
+     （`ui/win32.lua` 的 `wm` 表补上 `WM_NCCREATE = 0x0081`）。修好后真窗口创建成功（本机实测 `show()->true`）。
+  3. 再修好②后 paint 抛 `cannot resolve symbol 'FillRect'`：`FillRect` 是 **USER32** 导出（Win16 遗留，虽吃 HDC），
+     而调用点写成 `g.FillRect`（gdi32 命名空间）。修：改走 `w.user32.FillRect`。
+  4. 再修好③后 `WM_SIZE` 把 `bit.band(lparam, 0xFFFF)` 的结果（**int64 cdata**，实测 `9029LL`）存进 `s.width`，
+     paint 里 `math.floor` 报 `number expected, got cdata`。修：按 `ui/window.lua:on_size` 的既有写法
+     `tonumber(lparam)` + 整数除法拆 LOWORD/HIWORD。
+  **视觉验证**：修完后 `wave.snapshot()` 产出的 900×480 BMP（文件长 1296054 = 54 + 2700×480）经 PIL 转 PNG
+  目视确认网格、Y 轴标签(−1…1)、X 轴标签(10.0 s / 结束时刻)全部正常——本会话 DXGI 截屏始终全黑，这是唯一可信的画面证据。
+  `tests/test_wave_ring.lua` 增加 Windows-only 端到端断言（show() 建窗 + snapshot 写盘 + 文件长度自洽）并入了 CI 套件列表。
+- **第三处真 bug（功能）**：BMP 写出自身就是坏的，而且坏了两次——`core/bmp_writer.lua` 的 `M.save` 用
+  `if jit and ffi` 判可用，但 `local ffi = require("ffi")` 写在它**下面**，那两个名字编译成 GGET 读全局（LuaJIT 的 ffi 不是全局）
+  → 每次调用都返回 `nil, "ffi unavailable"`，snapshot 从来写不出文件；把 require 提到文件顶部后，又发现每行只写
+  `row_bytes` 而不是 `stride`，于是 `width*3` 非 4 对齐时产出的文件比自己头部声明的大小还短（2×2 实测 66 vs 70 字节，
+  默认 900px 宽恰好对齐所以一直没暴露）。两处都修，并把 `core/bmp_writer.lua` 加进 `lint_fields` 的 FILES（这类 GGET
+  正是 Check 1/1b 要拦的，之前它不在这份名单里）。
+- **纠正上轮结论**：`test_wave_ring` 不是"`os.clock` 粒度"问题，而是测试等错了时钟——`waveform.now_ms()` 是 `uv.now()`，
+  即 **loop 缓存时间**：实测忙等 51 ms 后 `uv.now()` delta = **0**。应用每帧 `uv.run("nowait")`（`window.lua:5401`）
+  才会刷新，所以测试改为忙等时同步 pump（无 luv 的主机退回 `os.clock`，断言依旧成立）。`test_shipped_scripts` 更不是
+  "类 Unix 目录列举"，就是上面那个 CJK 路径 bug。
+- **第三处（测试契约，非产品 bug）**：`test_send_file_caps` 的 H6 会计差 1，来源是 C 段 Stop **故意保留 fd** 给 Resume
+  （脚本 stop 分支有明确注释），本轮把它变成显式断言（C6 差 1 + C7 `shutdown()` 扫尾）而不是留成"账不平"。
+- **顺带修掉的既有缺陷**：`process_rx` 开头把 `pending_output` 置 nil，等于吃掉 `pump() → flush_pending()` 刚发布的
+  强制刷出行（framed 调用下不可达，unframed 路径上真的丢行）。改为进门先接管 flushed，hooks 丢掉整批时也把已判定的行吐出；
+  `test_script_engine` 新增 4 条断言（含"被 drop 的批不能吞掉已刷出的行"）。另：`test_script_engine` 原本不幂等——
+  上次中途崩溃留下的 `_test_scripts` 会让计数断言 `scan adds new script` 假红（本轮为此白查一轮），改为开跑先 `rm_rf`；
+  `script_engine` 里已成死字段的 `_labels_dirty` 删除（`_list_gen` 已接管）。
+- **门禁与工具差异**：`tools/check_dll_exports.sh` 在 Windows 无 objdump，改用 `dumpbin /exports` 等价核对——
+  `xcom_imgui.dll` 46/46 声明导出齐全（上轮补的 4 个已在），`xcom_core.dll` 无缺项（`XCOM_LINE_LEAVE_ALONE` 是常量宏，
+  bash 门禁正则只匹配小写 `xcom_`，不误报）。`lint_fields` 的 GGET 扫描在本机 SKIP（`luvjit.exe`/`luajit.exe` 都没编 `jit.bcs`），
+  靠新增的 Check 1b 静态兜底——已用临时文件验证它**真的会 FAIL**（自造 `forgotten_helper = function()` 即刻红），
+  即静态门禁有牙齿，不是装饰。`test_send_file_caps`/`test_serial_sim` 要在 `xcom_lua/tests` 下跑（`package.path="../core/?.lua"`）。
+- **环境坑（务必记住）**：`runtime/luajit.exe` 与 `luv.dll` **ABI 不同**——`require("luv")` 能过，但一碰 timer 就
+  0xC0000005 崩溃，所以一切涉及 luv 的套件/门禁只能用 `runtime/luvjit.exe`（`run_xcom_lua.cmd` 早有同义注释）。
+- **未做视觉结论**：`xcom-ui-audit` 的 audit.py 两次都返回全黑（DXGI 跨进程截屏在本会话失效，见 skill 已知陷阱 #1），
+  本轮只报功能与门禁，不对观感下判断；真实窗口的渲染/交互由 `e2e_drag_freeze` 的帧内读数证明（按住 55/55 采样
+  chased +0px、同期尾部 +2820px、松手 parked 0px、轮回到尾后 follow 24/24 在尾）。
