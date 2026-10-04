@@ -161,11 +161,11 @@ local w4 = new_fake_window()
 w4:_process_rx_batch("\214")           -- lone lead held pending
 eq("4a pending held: view empty", view_text(w4), "")
 local xcom = require("xcom_ffi")
-local saved_drain = xcom.drain_display
-xcom.drain_display = function() return xcom.ok, nil end   -- core empty
+local saved_drain = xcom.drain_display_ts
+xcom.drain_display_ts = function() return xcom.ok, nil end   -- core empty
 w4.core = { fake = true }
 w4:_final_drain()
-xcom.drain_display = saved_drain
+xcom.drain_display_ts = saved_drain
 eq("4b flush emits the held byte", view_text(w4), "\214")
 ok("4c flush re-armed (nothing stays pending)",
    (charset.flush()) == nil)
@@ -185,9 +185,9 @@ do
     w5._pause_display = true
     local queue = { { xcom.ok, "hello\n" }, { xcom.ok, "world\n" } }
     local di = 0
-    local saved_drain, saved_append = xcom.drain_display, xcom.log_append
+    local saved_drain, saved_append = xcom.drain_display_ts, xcom.log_append
     local logged = {}
-    xcom.drain_display = function()
+    xcom.drain_display_ts = function()
         di = di + 1
         local d = queue[di]
         if d then return d[1], d[2] end
@@ -195,7 +195,7 @@ do
     end
     xcom.log_append = function(_, text) logged[#logged + 1] = text; return xcom.ok end
     w5:poll_display()
-    xcom.drain_display, xcom.log_append = saved_drain, saved_append
+    xcom.drain_display_ts, xcom.log_append = saved_drain, saved_append
     eq("5a RX is never log_append'd by Lua", #logged, 0)
     eq("5b paused: viewport untouched", view_text(w5), "")
     eq("5c paused: skipped bytes counted", w5._paused_display_bytes, 12)

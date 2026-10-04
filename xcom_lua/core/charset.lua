@@ -157,8 +157,12 @@ end
 local function utf16_to_utf8(text)
     -- Hold back an odd trailing byte; hold back a lone high surrogate so it
     -- can pair with the next batch's low surrogate.
-    local data = pending .. text
-    pending = ""
+    -- RMW: a held tail is 1 byte.  Do not copy the batch when nothing is held.
+    local data = text
+    if pending ~= "" then
+        data = pending .. text
+        pending = ""
+    end
     local n = #data
     if n % 2 == 1 then
         pending = data:sub(-1)
@@ -214,8 +218,12 @@ M._ends_with_dangling_lead = ends_with_dangling_lead  -- test hook
 
 local function dbcs_to_utf8(text)
     local cp = current_cp
-    local data = pending .. text
-    pending = ""
+    -- RMW: the held tail is one lead byte.  Copy only when it is present.
+    local data = text
+    if pending ~= "" then
+        data = pending .. text
+        pending = ""
+    end
     -- Hold a trailing DBCS lead byte whose trail byte has not arrived yet
     -- (position-aware; see ends_with_dangling_lead).  A single-byte batch
     -- that is itself a lead byte counts as dangling too.

@@ -14,6 +14,7 @@
 
 package.path = "./core/?.lua;./libs/protocol/?.lua;" .. package.path
 require("script_engine")          -- installs string.toHex/fromHex/split/utf8Len
+local fs_path = require("fs_path")
 local ok_struct, struct = pcall(require, "struct")
 
 local passed, failed = 0, 0
@@ -33,13 +34,31 @@ end
 -- ---- scripts dir resolution (repo-root or xcom_lua/ cwd) -------------------
 local script_dir = nil
 for _, dir in ipairs({ "scripts", "xcom_lua/scripts" }) do
-    local probe = io.open(dir .. "/绘制曲线.lua", "rb")
+    local probe = fs_path.open(dir .. "/绘制曲线.lua", "rb")
     if probe then probe:close() script_dir = dir break end
 end
 ok("scripts dir found", script_dir ~= nil)
 if not script_dir then
     print(string.format("shipped_scripts: %d passed, %d failed", passed, failed))
     os.exit(1)
+end
+
+-- ---- UTF-8 -> CRT path boundary ---------------------------------------------
+-- The names below are CJK, and the narrow CRT path APIs decode in the process
+-- ANSI code page.  On this Windows host (GetACP=936) the raw io.open cannot
+-- see 绘制曲线.lua at all, so asserting both halves pins the conversion as the
+-- reason the suite passes: delete core/fs_path.lua's bridge and this fails.
+if fs_path.encodes() then
+    ok("raw io.open cannot resolve a CJK name (boundary is load-bearing)",
+        io.open(script_dir .. "/绘制曲线.lua", "rb") == nil)
+end
+ok("fs_path.open resolves a CJK name",
+    fs_path.open(script_dir .. "/绘制曲线.lua", "rb") ~= nil)
+do
+    local chunk = fs_path.load(script_dir .. "/绘制曲线.lua")
+    ok("fs_path.load preserves the UTF-8 chunk name (no mojibake in errors)",
+        chunk ~= nil and debug.getinfo(chunk, "S").short_src ==
+            script_dir .. "/绘制曲线.lua")
 end
 
 -- ---- stub environment mirroring core/script_engine.lua ----------------------
@@ -101,7 +120,7 @@ end
 -- compile + run one script; returns true|nil, err
 local function run_script(name, h)
     local path = script_dir .. "/" .. name
-    local chunk, err = loadfile(path)
+    local chunk, err = fs_path.load(path)
     if not chunk then return nil, "compile: " .. tostring(err) end
     local env = make_env(h)
     setfenv(chunk, env)
@@ -111,7 +130,7 @@ local function run_script(name, h)
 end
 
 -- ===========================================================================
--- 1) every shipped script must compile (loadfile), new ones included
+-- 1) every shipped script must compile (loadfile-equivalent), new ones included
 -- ===========================================================================
 local SHIPPED = {
     -- originals
@@ -126,7 +145,7 @@ local SHIPPED = {
     "时间戳前缀.lua", "大小写转换.lua", "数据截断.lua",
 }
 for _, name in ipairs(SHIPPED) do
-    local chunk, err = loadfile(script_dir .. "/" .. name)
+    local chunk, err = fs_path.load(script_dir .. "/" .. name)
     ok("compiles: " .. name, chunk ~= nil, err)
 end
 

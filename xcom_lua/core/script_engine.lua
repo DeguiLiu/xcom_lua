@@ -51,9 +51,12 @@ Line filter semantics (applied per COMPLETE line, before _append_imgui_receive):
                 (line matches no drop-rule)
 Plain substring match (string.find plain=true) — regex stays out of v1.
 
-Partial-line contract: the filter only decides on lines terminated by '\n'.
-The unterminated tail of a batch is held in `filter_pending` and decided with
-the next batch.  Force-flush conditions (an unterminated line must never
+Partial-line contract: unless the caller passes framed=true, the filter only
+decides lines terminated by '\n'.  The unterminated tail is held in
+`filter_pending` and decided with the next batch.  framed=true means the
+caller already closed the frame (the display line bridge), so that tail is
+decided in this call instead of being copied into a second hold.
+Force-flush conditions (an unterminated line must never
 starve the view):
   * #pending > 8 KiB   (pathological no-newline stream)
   * drain idle > 200ms (a silent gap ends the frame, like SSCOM 断帧)
@@ -75,6 +78,11 @@ local M = {}
 -- no-ops instead of failing at require-time.
 local has_uv, uv = pcall(require, "luv")
 if not has_uv then uv = nil end
+
+-- Script file names are UTF-8 (luv's scanner returns UTF-8) and the shipped
+-- plugins have CJK names, so every file operation on a script path goes
+-- through this boundary rather than the narrow CRT call; see core/fs_path.lua.
+local fs_path = require("fs_path")
 
 -- Cap a single script's log line so a runaway tostring can't blow the ring.
 local LOG_LINE_MAX = 2000
@@ -420,9 +428,21 @@ function M.new(opts)
         _watcher = nil,
         _watch_debounce = nil,
         _watch_changed = nil,  -- name -> true, coalesced until pump drains it
-        _labels_dirty = true,
+        -- Window pumps rebuild the script list and settings pages only when
+        -- this changes.  Starts at 1 so the first frame is not equal to a
+        -- consumer that has never seen a generation.
+        _list_gen = 1,
     }
     return setmetatable(engine, { __index = M })
+end
+
+-- Reload / enable / rescan changed the list, the labels, or the RX aspects.
+-- Filter-only edits do not come through here: they nil _line_filter_on and
+-- leave the list generation alone.
+function M:_touch_scripts()
+    self._list_gen = (self._list_gen or 0) + 1
+    self._line_filter_on = nil
+    self._recv_hook_on = nil
 end
 
 -- ---------------------------------------------------------------------------
@@ -539,6 +559,7 @@ local function build_env(engine, record)
             if type(fn) ~= "function" then return end
             record.recv_hook = fn
             record.strikes_recv = 0
+            engine._recv_hook_on = nil
         end,
         send = function(fn)
             if type(fn) ~= "function" then return end
@@ -555,6 +576,7 @@ local function build_env(engine, record)
                     record.keeps[#record.keeps + 1] = p
                 end
             end
+            engine._line_filter_on = nil
         end,
         drop = function(...)
             for i = 1, select("#", ...) do
@@ -563,10 +585,12 @@ local function build_env(engine, record)
                     record.drops[#record.drops + 1] = p
                 end
             end
+            engine._line_filter_on = nil
         end,
         clear = function()
             record.keeps = {}
             record.drops = {}
+            engine._line_filter_on = nil
         end,
     }
 
@@ -602,6 +626,7 @@ local function build_env(engine, record)
             else
                 record.ui_pages[qid] = { title = title or id, spec = spec }
             end
+            engine._list_gen = (engine._list_gen or 0) + 1
         end,
         event = function() end,   -- user overrides: function(page, kind, widget, value)
     }
@@ -909,7 +934,7 @@ end
 -- that can only live in the header anyway.  Returns the meta.parse table.
 local META_READ_LINES = 64
 local function read_script_meta(path)
-    local f = io.open(path, "rb")
+    local f = fs_path.open(path, "rb")
     if not f then return meta.parse(nil) end
     local head = {}
     for _ = 1, META_READ_LINES do
@@ -936,9 +961,10 @@ function M:load_script(name)
             self:log(4, "engine", "on_reload error: " .. tostring(cb_err))
         end
     end
-    local chunk, err = loadfile(record.path)
+    local chunk, err = fs_path.load(record.path)
     if not chunk then
         record.enabled = false
+        self:_touch_scripts()
         self:log(5, name, "load error: " .. tostring(err))
         return false, err
     end
@@ -971,10 +997,12 @@ function M:load_script(name)
     if not ok then
         record.enabled = false
         record.env = nil
+        self:_touch_scripts()
         self:log(5, name, "run error: " .. tostring(run_err))
         return false, run_err
     end
     self.rules_dirty = true
+    self:_touch_scripts()
     self:log(3, name, "loaded")
     return true
 end
@@ -1014,7 +1042,7 @@ function M:load_all()
         record.label = meta.display_name(name, record.meta)
     end
     self.order = names
-    self._labels_dirty = true
+    self:_touch_scripts()
 end
 
 function M:script_names()
@@ -1083,6 +1111,7 @@ function M:enable(name, enabled)
         record.strikes_send = 0
     end
     self:log(3, name, enabled and "enabled" or "disabled")
+    self:_touch_scripts()
 end
 
 function M:enabled_list()
@@ -1302,7 +1331,29 @@ end
 -- LLCOM compat: after the explicit on.receive hooks, a script that defined
 -- the legacy GLOBAL `uartReceive` function also gets the batch (its return
 -- value is ignored per LLCOM semantics — the hook is observe-only).
+-- The flag is filled once.  on.receive, a reload, an enable, and the strike
+-- disable below clear it.  uartReceive is seen at that fill, so a script that
+-- assigns it after load is picked up on the next reload.
+function M:has_receive_hook()
+    local cached = self._recv_hook_on
+    if cached ~= nil then return cached end
+    local on = false
+    for _, name in ipairs(self.order) do
+        local record = self.scripts[name]
+        if record and record.enabled and (record.recv_hook or
+            (record.env and type(record.env.uartReceive) == "function")) then
+            on = true
+            break
+        end
+    end
+    self._recv_hook_on = on
+    return on
+end
+
 function M:dispatch_receive(text)
+    if not self:has_receive_hook() then
+        return text
+    end
     for _, name in ipairs(self.order) do
         local record = self.scripts[name]
         if record and record.enabled then
@@ -1324,6 +1375,7 @@ function M:dispatch_receive(text)
                     if record.strikes_recv >= HOOK_STRIKES then
                         record.recv_hook = nil
                         record.strikes_recv = 0
+                        self._recv_hook_on = nil
                         self:log(4, name, "on.receive disabled after " ..
                             HOOK_STRIKES .. " consecutive errors")
                     end
@@ -1341,6 +1393,7 @@ function M:dispatch_receive(text)
                     if record.strikes_recv >= HOOK_STRIKES then
                         record.env.uartReceive = nil
                         record.strikes_recv = 0
+                        self._recv_hook_on = nil
                         self:log(4, name, "uartReceive disabled after " ..
                             HOOK_STRIKES .. " consecutive errors")
                     end
@@ -1415,58 +1468,94 @@ function M:line_visible(line)
 end
 
 function M:has_line_filter()
+    local cached = self._line_filter_on
+    if cached ~= nil then return cached end
+    local on = false
     for _, name in ipairs(self.order) do
         local record = self.scripts[name]
-        if record and record.enabled then
-            if #record.keeps > 0 or #record.drops > 0 then
-                return true
-            end
+        if record and record.enabled and
+            (#record.keeps > 0 or #record.drops > 0) then
+            on = true
+            break
         end
     end
-    return false
+    self._line_filter_on = on
+    return on
 end
 
 -- Apply the line filter to one batch.  Returns filtered text ("" when every
 -- line is dropped — the caller treats "" as "nothing to display").
--- Fast path: no active filter returns text unchanged (single table scan).
-function M:apply_line_filter(text)
+-- Fast path: no active filter returns the same string (cached flag, no scan).
+function M:apply_line_filter(text, framed)
     if not self:has_line_filter() then
         return text
     end
-    local combined = self.filter_pending .. text
+    -- RMW: concat only the held tail.  An empty hold keeps `text` itself.
+    local held = self.filter_pending or ""
+    local combined = held == "" and text or (held .. text)
     self.filter_pending = ""
-    -- Decide only up to the last complete line; hold the tail.
-    local last_nl = 0
-    local pos = 1
+    local last_nl
+    local from = 1
     while true do
-        local hit = string.find(combined, "\n", pos, true)
+        local hit = string.find(combined, "\n", from, true)
         if not hit then break end
         last_nl = hit
-        pos = hit + 1
+        from = hit + 1
     end
-    local complete = last_nl > 0 and combined:sub(1, last_nl) or ""
-    -- No newline in the batch: the WHOLE combined text is the pending tail.
-    local tail = last_nl > 0 and combined:sub(last_nl + 1) or combined
-    local out = {}
+    -- framed: the caller already closed this frame (the display line bridge).
+    -- Decide the unterminated tail now; do not hold a second copy of it.
+    local decide_to
+    local tail = ""
+    if not last_nl then
+        if framed or #combined > PENDING_MAX then
+            decide_to = #combined
+        else
+            self.filter_pending = combined
+            self.last_rx_ms = uv.now()
+            return ""
+        end
+    else
+        local rest_len = #combined - last_nl
+        if rest_len > PENDING_MAX or (framed and rest_len > 0) then
+            decide_to = #combined
+        else
+            decide_to = last_nl
+            if rest_len > 0 then
+                tail = combined:sub(last_nl + 1)
+            end
+        end
+    end
     local start = 1
-    while start <= #complete do
-        local hit = string.find(complete, "\n", start, true)
-        local line_end = hit or #complete
-        local line = complete:sub(start, line_end)
-        if self:line_visible(line) then
-            out[#out + 1] = line
+    local kept_all = true
+    while start <= decide_to do
+        local hit = string.find(combined, "\n", start, true)
+        local line_end = (hit and hit <= decide_to) and hit or decide_to
+        if not self:line_visible(combined:sub(start, line_end)) then
+            kept_all = false
+            break
         end
         start = line_end + 1
     end
     self.filter_pending = tail
     self.last_rx_ms = uv.now()
-    -- Oversize unterminated lines must never starve the view: decide the
-    -- pending tail immediately instead of waiting for the idle poll.
-    if #tail > PENDING_MAX then
-        self.filter_pending = ""
-        if self:line_visible(tail) then
-            out[#out + 1] = tail
+    if kept_all then
+        if decide_to == #combined then
+            if held == "" then return text end
+            return combined
         end
+        if decide_to == 0 then return "" end
+        return combined:sub(1, decide_to)
+    end
+    local out = {}
+    start = 1
+    while start <= decide_to do
+        local hit = string.find(combined, "\n", start, true)
+        local line_end = (hit and hit <= decide_to) and hit or decide_to
+        local line = combined:sub(start, line_end)
+        if self:line_visible(line) then
+            out[#out + 1] = line
+        end
+        start = line_end + 1
     end
     return table.concat(out)
 end
@@ -1557,20 +1646,27 @@ end
 
 -- Full display-side receive funnel (called with the RAW drained batch):
 --   hooks -> line filter.  Returns text to append (nil/"" = drop).
-function M:process_rx(text, now_ms)
+function M:process_rx(text, now_ms, framed)
     if not text or #text == 0 then
         return nil
     end
+    -- A line the idle/oversize flush already decided (pump -> flush_pending
+    -- published it for THIS call).  Take it up front: the previous code
+    -- cleared the field here and only re-read it after the hooks, so a batch
+    -- the hooks dropped swallowed a line the filter had already accepted.
+    local flushed = self.pending_output
     self.pending_output = nil
+    -- No receive aspect is active: the batch is already the display text.
+    if not self:has_receive_hook() and not self:has_line_filter() then
+        return flushed and (flushed .. text) or text
+    end
     -- 1) recv-convert hooks (batch level)
     local hooked = self:dispatch_receive(text)
-    if hooked == nil then return nil end
+    if hooked == nil then return flushed end
     -- 2) line filter
-    local filtered = self:apply_line_filter(hooked)
-    -- A force-flushed pending line rides along (poll() set pending_output).
-    if self.pending_output then
-        filtered = self.pending_output .. filtered
-        self.pending_output = nil
+    local filtered = self:apply_line_filter(hooked, framed)
+    if flushed then
+        filtered = flushed .. filtered
     end
     if filtered == "" then return nil end
     return filtered

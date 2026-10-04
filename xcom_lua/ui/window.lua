@@ -33,6 +33,7 @@ local device_profiles = require("device_profiles")
 local reset_sequencer = require("reset_sequencer")
 local imgui_bridge = require("imgui_bridge")
 local script_engine = require("script_engine")
+local fs_path = require("fs_path")
 local waveform = require("waveform")
 local charset = require("charset")
 local serial_sim = require("serial_sim")
@@ -69,8 +70,13 @@ local function flow_index(t) return FLOW_MAP[t] or 0 end
 -- the device-change/refresh code further down).  Lua binds a local by lexical
 -- position, so the slot must exist before the first reference -- the
 -- device-change backstop above uses port_list_signature.
+-- unique_port_by_hwid belongs to this same list: its body is assigned further
+-- down like the others, so a read before that assignment compiles to a GGET
+-- and yields nil -- the "this port may be your device" hint would vanish
+-- silently while the helper leaked a module global into _G.  Check 1 of
+-- tests/lint_fields.lua flags exactly that GGET.
 local port_key, port_combo_entries, find_key_index, port_list_signature,
-      unique_port_by_desc
+      unique_port_by_desc, unique_port_by_hwid
 
 -- Receive-display pipeline constants (docs/design-rx-display-pipeline.md).
 -- The C++ side owns collection (①), frame/gap detection (②) and line
@@ -124,6 +130,11 @@ local function split_complete_lines(text)
     end
     if not last_nl then
         return "", text
+    end
+    -- The batch is already one closed frame.  sub() would copy every byte
+    -- just to drop an empty tail.
+    if last_nl == #text then
+        return text, ""
     end
     return text:sub(1, last_nl), text:sub(last_nl + 1)
 end
@@ -2228,7 +2239,10 @@ function Window:_run_rx_scripts(text)
     if not self.scripts then
         return text
     end
-    local ok, processed = pcall(self.scripts.process_rx, self.scripts, text)
+    -- framed=true: this bridge is the only owner of a partial line.  The
+    -- filter aspect decides this emit now instead of holding a second copy.
+    local ok, processed = pcall(self.scripts.process_rx, self.scripts, text,
+        nil, true)
     if not ok then
         self._rx_funnel_errors = (self._rx_funnel_errors or 0) + 1
         io.stderr:write("[scripts] rx funnel: " .. tostring(processed) .. "\n")
@@ -2342,8 +2356,31 @@ function Window:_process_rx_batch(text, ingress_ms, ts_supported)
     -- The hand-fixed mid-line double-stamp bug in 时间戳前缀.lua this session
     -- was a symptom of scripts seeing half lines — this stage removes the
     -- root cause, so a plugin never needs its own continuation bookkeeping.
-    self._rx_line_pending = self._rx_line_pending .. text
-    local complete, tail = split_complete_lines(self._rx_line_pending)
+    -- RMW: the held tail never contains an LF, so the new batch is not copied
+    -- through the accumulator unless it actually closes a line.  An empty hold
+    -- returns the batch itself when that batch is already LF-terminated.
+    local pending = self._rx_line_pending
+    local complete, tail
+    if pending == "" then
+        complete, tail = split_complete_lines(text)
+    else
+        local last_nl
+        local from = 1
+        while true do
+            local found = text:find("\n", from, true)
+            if not found then break end
+            last_nl = found
+            from = found + 1
+        end
+        if not last_nl then
+            complete, tail = "", pending .. text
+        elseif last_nl == #text then
+            complete, tail = pending .. text, ""
+        else
+            complete = pending .. text:sub(1, last_nl)
+            tail = text:sub(last_nl + 1)
+        end
+    end
     self._rx_line_pending = tail
     if #tail > RX_LINE_CAP then
         -- Cap flush: a binary/never-terminated stream must not be held
@@ -3122,21 +3159,26 @@ end
 function Window:_pump_plugin_pages()
     if not self.scripts or not self.imgui then return end
     if not self.imgui.set_plugin_page then return end   -- pre-settings DLL
-    self._plugin_pushed = self._plugin_pushed or {}
-    local pages = self.scripts:collect_ui_pages()
-    local seen = {}
-    for _, page in ipairs(pages) do
-        seen[page.id] = true
-        local signature = page.title .. "\1" .. page.spec
-        if self._plugin_pushed[page.id] ~= signature then
-            self._plugin_pushed[page.id] = signature
-            self.imgui:set_plugin_page(page.id, page.title, page.spec)
+    -- Pages change only when a script loads, enables, or calls ui.page.
+    local gen = self.scripts._list_gen or 0
+    if gen ~= self._plugin_list_gen then
+        self._plugin_list_gen = gen
+        self._plugin_pushed = self._plugin_pushed or {}
+        local pages = self.scripts:collect_ui_pages()
+        local seen = {}
+        for _, page in ipairs(pages) do
+            seen[page.id] = true
+            local signature = page.title .. "\1" .. page.spec
+            if self._plugin_pushed[page.id] ~= signature then
+                self._plugin_pushed[page.id] = signature
+                self.imgui:set_plugin_page(page.id, page.title, page.spec)
+            end
         end
-    end
-    for id in pairs(self._plugin_pushed) do
-        if not seen[id] then
-            self._plugin_pushed[id] = nil
-            self.imgui:set_plugin_page(id, id, nil)   -- remove stale tab
+        for id in pairs(self._plugin_pushed) do
+            if not seen[id] then
+                self._plugin_pushed[id] = nil
+                self.imgui:set_plugin_page(id, id, nil)   -- remove stale tab
+            end
         end
     end
     local events = self.imgui:take_plugin_events()
@@ -3155,29 +3197,32 @@ end
 -- All no-ops on a pre-Phase-4 DLL (symbol probes return nil).
 function Window:_pump_script_console()
     if not self.scripts or not self.imgui then return end
-    -- 1) Keep the list + enable buffer in sync (cheap: only when the set of
-    --    scripts changed OR enable states diverge — compare the packed list
-    --    signature).
+    -- 1) Push the list when _list_gen changes.  Enable checkboxes are copied
+    --    only while the console is open; they are not part of the list gen.
     if self.imgui.set_scripts then
-        local names = self.scripts:script_names()
-        -- Signature covers names AND labels: an external editor can change a
-        -- script's @name/@desc (after a hot reload) without the filename set
-        -- changing, and the console list must follow that too.
-        local labels = self.scripts:script_labels()
-        -- Hover tooltips, index-aligned with names/labels exactly as the
-        -- engine builds both from the same self.order ("" == no tooltip).
-        local descs = self.scripts:script_tooltips()
-        local signature = table.concat(names, ",") .. "\1" ..
-            table.concat(labels, ",") .. "\1" ..
-            table.concat(descs, ",")
-        if signature ~= self._script_list_signature then
-            self._script_list_signature = signature
-            self.imgui:set_scripts(names, labels, descs)
+        local names
+        -- Names, labels and tooltips are rebuilt only when the engine bumps
+        -- _list_gen (load, enable, rescan, ui.page).  A receive frame must
+        -- not allocate three lists just to learn nothing changed.
+        local gen = self.scripts._list_gen or 0
+        if gen ~= self._script_list_gen then
+            names = self.scripts:script_names()
+            local labels = self.scripts:script_labels()
+            local descs = self.scripts:script_tooltips()
+            local signature = table.concat(names, ",") .. "\1" ..
+                table.concat(labels, ",") .. "\1" ..
+                table.concat(descs, ",")
+            if signature ~= self._script_list_signature then
+                self._script_list_signature = signature
+                self.imgui:set_scripts(names, labels, descs)
+            end
+            self._script_list_gen = gen
         end
         -- Copy enable state engine -> C++ checkbox buffer once per frame
         -- only when the console is open (the checkboxes write back through
         -- the same buffer the engine reads below).
         if self._scripts_console_open and self.imgui._script_enabled_buf then
+            names = names or self.scripts:script_names()
             local buf = self.imgui._script_enabled_buf
             for i, name in ipairs(names) do
                 buf[i - 1] = self.scripts:is_enabled(name) and 1 or 0
@@ -3188,7 +3233,7 @@ function Window:_pump_script_console()
     if self.imgui.take_editor_save then
         local path, text = self.imgui:take_editor_save()
         if path then
-            local f = io.open(path, "wb")
+            local f = fs_path.open(path, "wb")
             if f then
                 f:write(text)
                 f:close()
@@ -3221,7 +3266,7 @@ function Window:_pump_script_console()
                         self.imgui:script_select(event.index)
                         local record = self.scripts.scripts[name]
                         if record then
-                            local f = io.open(record.path, "rb")
+                            local f = fs_path.open(record.path, "rb")
                             if f then
                                 local text = f:read("*a")
                                 f:close()
@@ -3273,12 +3318,12 @@ function Window:_script_create_new()
         self.config_path:match("^(.*)[/\\]") or ".") .. "/scripts"
     local n = 1
     while self.scripts.scripts[string.format("new_%d.lua", n)] or
-          io.open(dir .. string.format("/new_%d.lua", n), "rb") do
+          fs_path.open(dir .. string.format("/new_%d.lua", n), "rb") do
         n = n + 1
     end
     local name = string.format("new_%d.lua", n)
     local path = dir .. "/" .. name
-    local f = io.open(path, "wb")
+    local f = fs_path.open(path, "wb")
     if not f then
         io.stderr:write("[scripts] cannot create " .. path .. "\n")
         return

@@ -13,6 +13,12 @@ trip but ignored by the typed getters.
 
 local M = {}
 
+-- config.ini is named in ASCII but the directory holding it is whatever the
+-- user installed into (a CJK path is the common case here), so the open and
+-- the rename go through the UTF-8 boundary.  fs_path stays pure Lua: the
+-- conversion is an optional FFI/kernel32 bridge and a passthrough elsewhere.
+local fs_path = require("fs_path")
+
 local function trim(s)
     return (s:gsub("^%s+", ""):gsub("%s+$", ""))
 end
@@ -249,7 +255,7 @@ File helpers wrapping parse/serialize.  load returns an empty config
 raises.  save returns false and does not raise on I/O error.
 ------------------------------------------------------------------------]]--
 function M.load(path)
-    local f, err = io.open(path, "rb")
+    local f, err = fs_path.open(path, "rb")
     if not f then
         return { [""] = {} }
     end
@@ -268,7 +274,7 @@ function M.save(path, data)
     -- rename is attempted FIRST because it is the atomic path everywhere but
     -- Windows (where it refuses an existing destination).
     local tmp = path .. ".tmp"
-    local f = io.open(tmp, "wb")
+    local f = fs_path.open(tmp, "wb")
     if not f then
         return false
     end
@@ -276,14 +282,14 @@ function M.save(path, data)
     f:close()
     if not wrote then
         -- A partial temp file must not be mistaken for a config later.
-        os.remove(tmp)
+        fs_path.remove(tmp)
         return false
     end
-    if os.rename(tmp, path) then
+    if fs_path.rename(tmp, path) then
         return true
     end
-    os.remove(path)
-    if os.rename(tmp, path) then
+    fs_path.remove(path)
+    if fs_path.rename(tmp, path) then
         return true
     end
     -- Both renames failed: the target is gone but the full text is still in
