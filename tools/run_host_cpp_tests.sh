@@ -86,6 +86,11 @@ run_suite() {
 run_suite rx_block_lane xcom_core/tests/rx_block_lane_test.cpp
 run_suite rx_kick_gate xcom_core/tests/rx_kick_gate_test.cpp
 run_suite rx_reject_count xcom_core/tests/rx_reject_count_test.cpp
+# Pure receive-log selection geometry (xcom_lua's ImGui bridge keeps these
+# rules in a header for exactly this reason: the gesture itself cannot be
+# driven headlessly, the boundaries can).
+run_suite receive_selection xcom_core/tests/receive_selection_test.cpp \
+    -I"$ROOT/xcom_lua/native/xcom_imgui"
 
 # --- suites that drive the real Win32 backend against the stub -------------
 run_suite line_apply \

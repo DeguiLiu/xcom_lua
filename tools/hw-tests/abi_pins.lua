@@ -35,14 +35,16 @@ print(string.format("sizeof(XcomSnapshot)                = %d", ffi.sizeof("Xcom
 print(string.format("sizeof(XcomPortInfo)                = %d", ffi.sizeof("XcomPortInfo")))
 print(string.format("offsetof(XcomSnapshot,flow_hold_events) = %d",
                     ffi.offsetof("XcomSnapshot", "flow_hold_events")))
+print(string.format("offsetof(XcomSnapshot,modem_lines)     = %d",
+                    ffi.offsetof("XcomSnapshot", "modem_lines")))
 print(string.format("sizeof(XcomPortConfig)              = %d", ffi.sizeof("XcomPortConfig")))
 print(string.format("sizeof(XcomError)                   = %d", ffi.sizeof("XcomError")))
 
 print("module SIZEOF pins: snapshot=" .. tostring(x.SIZEOF.snapshot) ..
       " port_info=" .. tostring(x.SIZEOF.port_info))
 
-local expect_version = 0x010600
-local expect_snapshot = 84
+local expect_version = 0x010700
+local expect_snapshot = 88
 local expect_portinfo = 420
 local expect_flowoff = 80
 
@@ -58,5 +60,6 @@ check("xcom_version()", version_fn(), expect_version)
 check("sizeof(XcomSnapshot)", ffi.sizeof("XcomSnapshot"), expect_snapshot)
 check("sizeof(XcomPortInfo)", ffi.sizeof("XcomPortInfo"), expect_portinfo)
 check("offsetof(flow_hold_events)", ffi.offsetof("XcomSnapshot", "flow_hold_events"), expect_flowoff)
+check("offsetof(modem_lines)", ffi.offsetof("XcomSnapshot", "modem_lines"), 84)
 
 os.exit(ok and 0 or 1)

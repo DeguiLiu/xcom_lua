@@ -573,7 +573,11 @@ local function build_env(engine, record)
     env.highlight = {
         rule = function(pattern, color, style)
             if type(pattern) ~= "string" or #pattern == 0 then return end
-            color = tonumber(color) or 0xE53935
+            -- Fallback for a rule with no colour: the old 0xE53935 read only
+            -- 4.23:1 on the white log, so the default is the darker red that
+            -- clears WCAG AA (5.62:1).  Kept in step with imgui_bridge.lua,
+            -- which carries the same fallback for the packed push.
+            color = tonumber(color) or 0xC62828
             style = (style == "bg") and "bg" or "text"
             record.rules[#record.rules + 1] =
                 { pattern = pattern, color = color, style = style }
@@ -1122,11 +1126,30 @@ end
 -- Timers (engine-owned so shutdown() stops everything)
 -- ---------------------------------------------------------------------------
 
+-- Close a uv handle without letting a second close (or a close on a handle
+-- libuv is already tearing down) escape as an error: scripts legitimately call
+-- sys.timer_stop on a timer that has already fired.
+local function close_handle(handle)
+    if not handle then return end
+    pcall(function() handle:close() end)
+end
+
 function M:timer_create(ms, fn, repeating)
     if type(fn) ~= "function" then return nil end
     local timer = uv.new_timer()
     local engine = self
     local callback = function()
+        -- A one-shot timer is finished the moment it fires, but libuv keeps
+        -- the handle alive until close().  Without this, a script that arms a
+        -- timer per received line (scripts/auto_reply.lua does exactly that)
+        -- leaks one uv handle per line for the whole session, and the linear
+        -- scan in timer_destroy degrades with the list.  Retire before running
+        -- fn so a callback that re-arms or stops itself sees one consistent
+        -- table, and never a half-closed handle.
+        if not repeating then
+            engine:_retire_timer(timer)
+            close_handle(timer)
+        end
         local ok, err = pcall(fn)
         if not ok then
             engine:log(5, "timer", "callback error: " .. tostring(err))
@@ -1144,10 +1167,25 @@ function M:timer_create(ms, fn, repeating)
     return timer
 end
 
+-- Drop a handle from the ownership list.  Safe for an unknown handle, so a
+-- one-shot timer that retires itself can be stopped again by the script.
+function M:_retire_timer(handle)
+    for index = #self.timers, 1, -1 do
+        if self.timers[index] == handle then
+            table.remove(self.timers, index)
+            return
+        end
+    end
+end
+
 function M:timer_destroy(handle)
     for i, timer in ipairs(self.timers) do
         if timer == handle then
             timer:stop()
+            -- stop() only disarms the timer; the uv handle stays alive until
+            -- close(), so stopping without closing keeps the handle (and every
+            -- later scan of this list) alive for the rest of the session.
+            close_handle(timer)
             table.remove(self.timers, i)
             return
         end

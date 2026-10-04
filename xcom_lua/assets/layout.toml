@@ -28,8 +28,43 @@ language = "zh"
 # [font] switches.
 # show_chinese_in_receive (default false): merge the CJK glyph set into the
 # mono receive-log font so converted UTF-8 (GB2312/BIG5/SJIS) renders as hanzi.
-# When false the receive log shows '?' for CJK bytes and the ~26 MB CJK bitmap
-# is not baked (memory-first default).  This maps to the settings-page
-# "Show Chinese in receive" checkbox and the bridge's font_mono_cjk_ flag.
+# When false the receive log shows '?' for CJK bytes and no CJK face is merged
+# into the mono atlas at all.  No fixed bitmap figure applies here: this ImGui
+# bakes glyphs on demand (the DX11 backend reports RendererHasTextures), so the
+# resident cost follows how many distinct CJK glyphs actually reach the log.
+# Maps to the settings-page "Show Chinese in receive" checkbox; once the user
+# touches it, config.ini [font] carries the choice and overrides this default.
 [font]
 show_chinese_in_receive = false
+
+# [colors] — the TEXT colours the log is read through, so the font colours can
+# be retuned by editing this file instead of rebuilding the bridge (the values
+# are read at startup, so a change needs a restart, not a rebuild).  Values are
+# six hex digits (a
+# leading "0x" is accepted); note that '#' starts a comment in this file, so
+# "#1B1B1B" would be silently cut off — write 1B1B1B.  A malformed value keeps
+# the default, which is the pic/1.png sample the rest of the palette came from.
+#
+#   text_body    every log row, labels, body copy          default 1B1B1B
+#   text_muted   section subtitles, hints, disabled text   default 6A6A6A
+#   timestamp    the "[HH:MM:SS.mmm] " prefix              default 9C6000
+#   tx_echo      rows echoed from the send box ("TX: ...") default D04138
+#   selection    solid selection background; selected glyphs invert to white
+#                keep this dark (white on 005A98 is 7.20:1)   default 005A98
+#
+# text_muted and timestamp are deliberately darker than their pic/1.png samples
+# (8C8C8C and F8AA00).  The log surface is pure white, and measured with the
+# sRGB relative-luminance formula those two samples read 3.36:1 and 1.96:1 —
+# both under the WCAG AA 4.5:1 floor, the orange by a wide margin even though
+# "[HH:MM:SS.mmm] " prefixes every row.  The defaults above read 5.41:1 and
+# 5.14:1 in the same hue families; the sampled originals are one edit away if
+# matching the reference screenshot ever outweighs reading the log.
+#
+# Selected glyphs are redrawn white on this solid background. A light selection
+# colour would fail that pairing; the default stays the dark primary blue.
+[colors]
+text_body = 1B1B1B
+text_muted = 6A6A6A
+timestamp = 9C6000
+tx_echo = D04138
+selection = 005A98

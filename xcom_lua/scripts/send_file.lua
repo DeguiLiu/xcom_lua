@@ -27,7 +27,11 @@ local state = {
 }
 
 -- combo 索引 -> 字节数（与 spec 的 items 顺序一致）
-local CHUNK_ITEMS = { 128, 512, 1024, 4096, 16384 }
+-- 上限是 xcom_send 的硬约束：core 的 kTxBlockBytes = 4096
+-- (xcom_core/src/runtime/xcom_config.hpp)，超过它一律返回 -5 err_full。
+-- 旧的 16384 preset 因此永远发不出去——每块都要烧掉整轮 stall 重试才放弃。
+local CHUNK_ITEMS = { 128, 512, 1024, 4096 }
+local MAX_CHUNK = CHUNK_ITEMS[#CHUNK_ITEMS]
 local CHUNK_DEFAULT_IDX = 2   -- 1024
 
 -- uart.send's errcode is the xcom ABI status; the sandbox exposes no FFI, so
@@ -71,9 +75,9 @@ local function refresh()
     local lines = {
         "title:" .. head,
         "button:browse:Choose file",
-        "slider:chunk:Chunk bytes:128:16384:" .. state.chunk,
+        "slider:chunk:Chunk bytes:128:" .. MAX_CHUNK .. ":" .. state.chunk,
         "combo:chunkidx:Chunk preset:" .. state.chunk_idx ..
-            ":128|512|1024|4096|16384",
+            ":128|512|1024|4096",
         "slider:interval:Gap ms:10:1000:" .. state.interval,
     }
     if state.running then
@@ -219,7 +223,11 @@ ui.event = function(page, kind, widget, value)
         log.info("send_file", "loaded " .. basename(path) .. " (" ..
                  fmt_size(size) .. ")")
     elseif kind == "slider" and widget == "chunk" then
-        state.chunk = math.max(1, tonumber(value) or state.chunk)
+        -- Clamp as well as raise the floor: a chunk above MAX_CHUNK can never
+        -- be accepted, so a stale spec value must not reintroduce the dead
+        -- range the preset list just dropped.
+        state.chunk = math.min(MAX_CHUNK,
+            math.max(1, tonumber(value) or state.chunk))
     elseif kind == "combo" and widget == "chunkidx" then
         local idx = (tonumber(value) or CHUNK_DEFAULT_IDX) + 1
         if CHUNK_ITEMS[idx] then

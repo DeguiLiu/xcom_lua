@@ -150,6 +150,13 @@ BOOL WINAPI ClearCommError(HANDLE, DWORD* errors, COMSTAT* stat)
     }
     return TRUE;
 }
+BOOL WINAPI GetCommModemStatus(HANDLE, DWORD* status)
+{
+    if (status != nullptr) {
+        *status = 0U;
+    }
+    return FALSE;
+}
 
 DWORD WINAPI GetLastError(void) { return g_last_error; }
 void WINAPI SetLastError(DWORD error) { g_last_error = error; }

@@ -157,6 +157,17 @@ do
     eq("B2 target is re-enumerated name", t, "COM7")
     eq("B2 matched", m, true)
 
+    -- B2.1 hardware_id wins when the friendly description changed during
+    -- re-enumeration. The name is newly appeared, so it is safe to adopt.
+    local hwid = "USB\\VID_1A86&PID_7523"
+    win = new_win({ { name = "COM7", description = "Other", hardware_id = hwid } },
+                  "CH340", "COM3")
+    win._reconnect_port_hwid = hwid
+    win._reconnect_known_ports = { COM3 = true }
+    t, m = win:_resolve_reconnect_port("COM3", "CH340")
+    eq("B2.1 hardware_id follows changed description", t, "COM7")
+    eq("B2.1 hardware_id match", m, true)
+
     -- B3 original gone, no description match -> no reliable target.
     win = new_win({ { name = "COM7", description = "Other" } }, "CH340", "COM3")
     t, m = win:_resolve_reconnect_port("COM3", "CH340")
@@ -183,6 +194,26 @@ do
     win = new_win({ { name = "COM7", description = "CH340" } }, "CH340", "")
     t, m = win:_resolve_reconnect_port("", "CH340")
     eq("B7 empty original not matched", m, false)
+end
+
+-- ===========================================================================
+-- B.5) modem-line falling edge: report a possible MCU power loss and recover
+-- ===========================================================================
+do
+    local win = new_win({}, nil, "COM3")
+    win.imgui.dtr = { 0 }
+    local valid = 0x80000000
+    win:_note_modem_lines({ port_state = xcom.port_open,
+                             modem_lines = valid + 0x9 }) -- CTS + RLSD
+    eq("B5.1 initial modem sample is quiet", win._status_dirty, nil)
+    win:_note_modem_lines({ port_state = xcom.port_open,
+                             modem_lines = valid + 0x1 }) -- RLSD fell
+    ok("B5.2 RLSD drop names possible MCU power loss",
+       type(win._status_dirty) == "string" and
+       win._status_dirty:find("MCU", 1, true) ~= nil)
+    win:_note_modem_lines({ port_state = xcom.port_open,
+                             modem_lines = valid + 0x9 })
+    eq("B5.3 modem line recovery is reported", win._status_dirty, "对端线路恢复")
 end
 
 -- ===========================================================================

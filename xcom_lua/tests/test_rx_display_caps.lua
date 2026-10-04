@@ -252,5 +252,39 @@ eq("G1 combined tail", view_text(w6), "aaaa\nbbbb")
 eq("G2 accumulator counts break byte", w6._imgui_receive_total, 9)
 eq("G3 far from threshold: no clear", w6._imgui_receive, "aaaa\nbbbb")
 
+-- ===========================================================================
+-- H) auto-clear must not fire while a selection drag is in flight.  The native
+--    empty push drops the selection by design, so clearing under a held cursor
+--    destroys the gesture the user is still making -- the reason the bridge
+--    defers its own tail trim for the same condition.  The clear is DEFERRED,
+--    not dropped: the accumulator keeps growing, so the next append after the
+--    release clears as usual.
+-- ===========================================================================
+local w7 = new_fake_window({ auto_clear_bytes = 8 })
+w7.dragging = false
+w7.imgui.selection_dragging = function() return w7.dragging end
+feed(w7,"1234567")                        -- 7 < 8: keep
+eq("H1 below threshold: kept", view_text(w7), "1234567")
+w7.dragging = true
+feed(w7,"8")                              -- 8 == 8, but a drag is live
+eq("H2 mid-drag: accumulator NOT reset", w7._imgui_receive_total, 8)
+eq("H3 mid-drag: view retained", view_text(w7), "12345678")
+eq("H4 mid-drag: nothing pushed to the view", #w7.imgui.pushes, 0)
+feed(w7,"9")                              -- still dragging, still deferred
+eq("H5 mid-drag: still deferred", w7._imgui_receive_total, 9)
+w7.dragging = false
+feed(w7,"0")                              -- released: the next append clears
+eq("H6 after release: clear fires", w7._imgui_receive_total, 0)
+eq("H7 after release: view cleared", w7._imgui_receive, "")
+local hpush = w7.imgui.pushes[1]
+ok("H8 after release: the empty push reached the view",
+   hpush and hpush.text == "" and #w7.imgui.pushes == 1)
+
+-- A bridge without the probe (older DLL, fake in the other suites) behaves as
+-- before: no guard, clear on threshold.
+local w8 = new_fake_window({ auto_clear_bytes = 4 })
+feed(w8,"abcd")
+eq("H9 older DLL: unguarded clear still fires", w8._imgui_receive_total, 0)
+
 print(string.format("rx_display_caps: %d passed, %d failed", pass_n, fail_n))
 os.exit(fail_n > 0 and 1 or 0)

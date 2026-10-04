@@ -15,6 +15,7 @@
 //     (or a prefix when the caller buffer is smaller).
 //
 // SPDX-License-Identifier: MIT
+#include <cstddef>
 #include <cstdint>
 #include <array>
 #include <algorithm>
@@ -737,16 +738,33 @@ XCOM_API XcomStatus xcom_get_snapshot(XcomHandle hh, XcomSnapshot* output)
         if (h == nullptr || output == nullptr) {
             return XCOM_ERR_PARAM;
         }
-        if (output->struct_size < sizeof(XcomSnapshot)) {
+        // Smallest struct_size this call answers: the byte offset of the LAST
+        // appended field, i.e. the size of the previous version's snapshot.
+        // modem_lines is optional for a caller that has not been rebuilt;
+        // writing it into an 84-byte buffer would overflow. A buffer smaller
+        // than the previous version is still rejected.
+        constexpr uint32_t kSnapshotFloorBytes = offsetof(XcomSnapshot, modem_lines);
+        // Tripwire: appending another field moves the floor, and this assert
+        // then fails on the build rather than letting the new field be written
+        // into a shorter caller buffer. Point it at the new last field.
+        static_assert(sizeof(XcomSnapshot) > kSnapshotFloorBytes,
+                      "every appended field must leave the floor behind it");
+        static_assert(kSnapshotFloorBytes == 84U,
+                      "v1.7 floor: offsetof(XcomSnapshot, modem_lines) moved - "
+                      "update this pin and the v1.6 prefix comment in xcom.h");
+        if (output->struct_size < kSnapshotFloorBytes) {
             return XCOM_ERR_PARAM;
         }
+        const bool want_modem = output->struct_size >= sizeof(XcomSnapshot);
         xcom::CoreCtx* core = xcom::xcom_handle_core(h);
         // This ABI is the existing 250 ms UI status poll (design §4.2 item 3):
         // sample the three monitored threads here rather than adding a timer.
         // It only pushes ErrorRing entries on an episode edge; the returned
         // snapshot below is unchanged.
         xcom::check_thread_health(core);
-        output->struct_size = sizeof(XcomSnapshot);
+        output->struct_size = want_modem
+                                  ? static_cast<uint32_t>(sizeof(XcomSnapshot))
+                                  : kSnapshotFloorBytes;
         output->rx_bytes = core->metrics.rx_bytes.load(std::memory_order_relaxed);
         output->tx_bytes = core->metrics.tx_bytes.load(std::memory_order_relaxed);
         output->rx_pool_exhausted_bytes =
@@ -788,6 +806,10 @@ XCOM_API XcomStatus xcom_get_snapshot(XcomHandle hh, XcomSnapshot* output)
         // v1.6 flow-control stall counter (appended field; see XcomSnapshot).
         output->flow_hold_events =
             core->metrics.flow_hold_events.load(std::memory_order_relaxed);
+        if (want_modem) {
+            output->modem_lines =
+                core->metrics.modem_lines.load(std::memory_order_relaxed);
+        }
         return XCOM_OK;
     }
     catch (...) {

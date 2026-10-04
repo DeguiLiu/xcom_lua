@@ -230,6 +230,7 @@ bool WinSerialBackend::open(const SerialPortOptions& options,
         on_fault_ = std::move(on_fault);
         on_line_status_ = std::move(on_line_status);
         last_holds_ = 0U;
+        last_modem_ = 0U;
         stop_requested_.store(false, std::memory_order_release);
         open_.store(true, std::memory_order_release);
         read_thread_ = std::thread(&WinSerialBackend::read_loop, this);
@@ -832,7 +833,30 @@ void WinSerialBackend::poll_line_status() noexcept
     // observability gap rather than a counter nobody reads.
     const bool hold_edge = holds != last_holds_;
     last_holds_ = holds;
-    if (errors == 0U && (!hold_edge || holds == 0U)) {
+    // Modem inputs are a level, not an error. Sample them on every tick,
+    // including a quiet line: an MCU behind a USB-UART bridge drops CTS/DSR/
+    // RLSD without a CE_* bit and without leaving the COM port. Report only
+    // on change so a steady line still skips the owner callback.
+    std::uint32_t modem = 0U;
+    DWORD modem_raw = 0U;
+    if (GetCommModemStatus(port_.get(), &modem_raw) != FALSE) {
+        modem = kModemValid;
+        if ((modem_raw & MS_CTS_ON) != 0U) {
+            modem |= kModemCts;
+        }
+        if ((modem_raw & MS_DSR_ON) != 0U) {
+            modem |= kModemDsr;
+        }
+        if ((modem_raw & MS_RING_ON) != 0U) {
+            modem |= kModemRing;
+        }
+        if ((modem_raw & MS_RLSD_ON) != 0U) {
+            modem |= kModemRlsd;
+        }
+    }
+    const bool modem_edge = modem != last_modem_;
+    last_modem_ = modem;
+    if (errors == 0U && (!hold_edge || holds == 0U) && !modem_edge) {
         return;   // quiet line, or a hold release: nothing worth reporting
     }
     SerialLineStatus status{};
@@ -850,6 +874,7 @@ void WinSerialBackend::poll_line_status() noexcept
         status.break_events = 1U;
     }
     status.hold_events = (hold_edge && holds != 0U) ? 1U : 0U;
+    status.modem_lines = modem;
     status.cb_in_que = static_cast<std::uint32_t>(stat.cbInQue);
     status.cb_out_que = static_cast<std::uint32_t>(stat.cbOutQue);
     on_line_status_(status);

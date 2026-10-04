@@ -17,12 +17,12 @@
 //      DTR itself was driven)
 //   5. xcom_set_lines after close            -> XCOM_ERR_NOT_OPEN
 //
-// It also pins the v1.6 ABI layout (appended fields only; old offsets fixed)
+// It also pins the v1.7 ABI layout (appended fields only; old offsets fixed)
 // so a struct change that forgot xcom_ffi.lua's SIZEOF pins or the version bump
 // is caught here at compile/runtime on the Windows host:
 //   * XcomPortInfo: 324 -> 420, hardware_id at offset 324 (busy/pad unchanged)
-//   * XcomSnapshot: 80 -> 84, flow_hold_events at offset 80
-//   * xcom_version() reports 1.6.0
+//   * XcomSnapshot: 80 -> 84 -> 88, flow_hold_events at 80, modem_lines at 84
+//   * xcom_version() reports 1.7.0
 //
 // SPDX-License-Identifier: MIT
 #include <windows.h>
@@ -47,10 +47,12 @@ static_assert(offsetof(XcomPortInfo, name) == 0U, "name offset moved");
 static_assert(offsetof(XcomPortInfo, description) == 64U,
               "description offset moved");
 static_assert(offsetof(XcomPortInfo, busy) == 320U, "busy offset moved");
-static_assert(sizeof(XcomSnapshot) == 84U,
-              "XcomSnapshot must be 84 bytes in v1.6 (append flow_hold_events)");
+static_assert(sizeof(XcomSnapshot) == 88U,
+              "XcomSnapshot must be 88 bytes (append modem_lines)");
 static_assert(offsetof(XcomSnapshot, flow_hold_events) == 80U,
               "flow_hold_events must be appended at offset 80");
+static_assert(offsetof(XcomSnapshot, modem_lines) == 84U,
+              "modem_lines must be appended at offset 84");
 static_assert(offsetof(XcomSnapshot, rx_backpressure_events) == 76U,
               "v1.5 counter offsets moved");
 
@@ -89,9 +91,9 @@ static XcomPortConfig virtual_config(uint8_t flow_control)
 
 int main()
 {
-    // v1.6 ABI identity. A forgotten version bump or a stale DLL is a hard fail.
-    CHECK(xcom_version() == ((1U << 16U) | (6U << 8U) | 0U),
-          "xcom_version reports 1.6.0");
+    // v1.7 ABI identity. A forgotten version bump or a stale DLL is a hard fail.
+    CHECK(xcom_version() == ((1U << 16U) | (7U << 8U) | 0U),
+          "xcom_version reports 1.7.0");
 
     // v1.6 hardware_id parse: SPDRP_HARDWAREID is a REG_MULTI_SZ and the FIRST
     // string is the stable id. copy_first_multi_sz is pure, so this is hardware-
@@ -134,16 +136,29 @@ int main()
         return 1;
     }
 
-    // v1.6 snapshot: flow_hold_events exists, is exported, and starts at 0.
+    // v1.7 snapshot: flow_hold_events and modem_lines are exported.
     {
         XcomSnapshot snapshot{};
         snapshot.struct_size = sizeof(snapshot);
         CHECK(xcom_get_snapshot(handle, &snapshot) == XCOM_OK,
               "get_snapshot before open is OK");
         CHECK(snapshot.struct_size == sizeof(XcomSnapshot),
-              "snapshot struct_size reports v1.6 size");
+              "snapshot struct_size reports v1.7 size");
         CHECK(snapshot.flow_hold_events == 0U,
               "flow_hold_events starts at 0");
+        CHECK(snapshot.modem_lines == 0U,
+              "modem_lines starts at 0 (no sample)");
+    }
+    {
+        XcomSnapshot legacy{};
+        legacy.struct_size = 84U;
+        legacy.modem_lines = 0xA5A5A5A5U;
+        CHECK(xcom_get_snapshot(handle, &legacy) == XCOM_OK,
+              "v1.6 snapshot prefix remains accepted");
+        CHECK(legacy.struct_size == 84U,
+              "legacy snapshot keeps its advertised size");
+        CHECK(legacy.modem_lines == 0xA5A5A5A5U,
+              "legacy snapshot does not overwrite modem_lines");
     }
 
     // (1) closed session rejects line changes.

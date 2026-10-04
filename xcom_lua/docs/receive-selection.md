@@ -16,6 +16,19 @@
    置 false——"按下即清空旧选区、进入拖拽态"。
 3. 按住拖动：每帧在行渲染循环做命中测试，把鼠标 x 换算成字节偏移 `at`；首帧记
    `receive_sel_drag_origin_`，之后 `begin=min(origin,at)`、`end=max(origin,at)`，跨行时中间整行纳入。
+   **拖到可视区上/下边缘会每帧滚动一行**，否则视图外的行没有被 clipper 提交、没有矩形可命中，
+   一次手势永远选不到屏幕之外的文本（`rows_first_top/rows_last_bottom` 是本帧实际提交的行范围）。
+3b. 其余三种手势（按点击次数分流，`GetMouseClickedCount`）：
+   - **双击**：选中光标下的词。ASCII 词字符 = `A-Za-z0-9_`（连续段整体选中），
+     分隔符只选它自己，**非 ASCII 字节整段 UTF-8 序列一起选中**（CJK 一字 3 字节，
+     选单字节会复制出非法片段）；尾行被截断的半个序列按 1 字节处理。
+     边界规则是纯函数 `receive_selection.hpp`，由 `xcom_core/tests/receive_selection_test.cpp` 在
+     Linux 主机上直接跑（手势本身无头跑不了，边界可以）。
+   - **三击**：整行。
+   - **Shift+单击**：**从现有选区末端延伸**（本控件没有光标与键盘焦点模型，选区尾端就是唯一
+     可指的"光标"）：先单击标记一点，再 Shift+单击其上方或下方即向前/向后选中；没有选区时
+     退化为一次普通拖拽。这三种手势旧实现都落在"每次按下都当拖拽开始"上——双击会先把选区清零、
+     再从第二下起一个零长度拖拽，看起来什么都没发生。
 4. 高亮实时出现：与该行相交时，在文字**底下**（先画色块再提交 `TextUnformatted`）画
    `ImGuiCol_TextSelectedBg` 色矩形；选到行尾色块铺满整行宽度。
 5. 松开左键：锚点回 `kNoSelAnchor`；命中过则选区持久保留，纯点击空白则清零。
@@ -38,9 +51,13 @@
 ```mermaid
 stateDiagram-v2
     [*] --> Idle
-    Idle --> Dragging: log_hovered 且按下左键（清空旧选区）
+    Idle --> Dragging: log_hovered 且单击（清空旧选区）
     Dragging --> Dragging: 逐行命中，begin/end = min/max(origin, at)
+    Dragging --> Dragging: 鼠标越过可视区边缘 → 每帧滚动一行并继续延伸
     Dragging --> Idle: 松开左键（命中过则保留选区，否则清零）
+    Idle --> Word: 双击（词边界 = 上述规则）
+    Idle --> Line: 三击（整行）
+    Idle --> Extended: Shift+单击（以旧选区尾端为锚，一次性延伸）
 ```
 
 - 按下条件 `log_hovered && IsMouseClicked(Left)`；`log_hovered` 用
@@ -133,8 +150,16 @@ O(1) 零猜测。
 - 在线 E2E：`XCOM_SMOKE_OPEN=1 XCOM_SMOKE_SIM_PROFILE=text` 启动，日志区渲染模拟数据，无报错。
 - **拖选交互本身需人工验证一次**（合成鼠标点击无法到达 ImGui Win32 后端）：
   滚动流中拖选 → 松开 → 高亮应随文本上滚直至不可见；按住拖动期间视图应停住。
+- 已补（本轮）：**边缘自动滚动**（拖到可视区上/下边缘每帧滚一行，选区可越过屏幕）、
+  **双击选词 / 三击选行**（`receive_selection.hpp` + 主机测试）、**Shift+单击延伸**。
+- **自动清空不得吃掉拖拽**：阈值触发时 Lua 会推空串清视图，而空推**按设计**会清掉原生选区
+  （显式清空时是对的，捏着鼠标时是错的——bridge 自己的尾部裁剪早就为同一个条件让路）。
+  现在 `ui/window.lua` 的清空锚点先问 `xcom_imgui_selection_dragging()`，拖拽中只**推迟**不清：
+  累计字节继续增长，松手后的下一次 append 照常越过阈值清空。旧 DLL 无该导出时探测为 nil，
+  行为与从前一致。
 - 遗留：被截断出窗口的选中内容无法复制（需 Lua 保留退役 chunk 副本，当前按 64KiB 窗口契约不做）；
-  边缘自动滚动、双击选词未实现。
+  没有键盘选区（无光标模型，`Shift+方向键` 需引入焦点/光标状态，尚未做）；长行超出窗口宽度时
+  右侧被裁，只能选到行尾（字节偏移换算到行尾是取满的，只是看不到）。
 - 快捷键与复制策略：Ctrl+A 全选、Ctrl+C 复制选中已实现（`ReceiveContent` 内经 `ImGui::Shortcut`，
   路由按焦点域判定，输入框持有焦点时不抢占）。复制不再由 C++ 直接写剪贴板，而是把请求入队
   （`QueueReceiveCopy`），由 Lua 侧 `service_receive_copy` 用 `core/receive_copy.lua` 的纯函数

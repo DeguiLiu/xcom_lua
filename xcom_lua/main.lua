@@ -132,6 +132,11 @@ local cfg = {
     timestamp = config.get(cfg_data, "display", "timestamp", false),
     pause_display = config.get(cfg_data, "display", "pause_display", false),
     auto_clear_bytes = config.get(cfg_data, "display", "auto_clear_bytes", 0),
+    -- 自动清空 is a tick PLUS a byte count: the count alone cannot tell "ticked
+    -- with a remembered value" from "unticked", so both keys round-trip.  A
+    -- config written before the tick was persisted has only the count, so the
+    -- missing key falls back to "count > 0" (the old derived behaviour).
+    auto_clear = config.get(cfg_data, "display", "auto_clear", nil),
     max_display_bytes = config.get(cfg_data, "display", "max_display_bytes", 2 * 1024 * 1024),
     auto_save = config.get(cfg_data, "display", "auto_save", false),
     save_path = config.get(cfg_data, "display", "save_path", ""),
@@ -139,7 +144,24 @@ local cfg = {
     receive_window_bytes = config.get(cfg_data, "display", "receive_window_bytes", 65536),
     send_hex = config.get(cfg_data, "send", "hex", false),
     send_crlf = config.get(cfg_data, "send", "crlf", false),
-    autosend_period_ms = config.get(cfg_data, "send", "autosend_period_ms", 0),
+    autosend_period_ms = config.get(cfg_data, "send", "autosend_period_ms", 1000),
+    -- Send-box command history ([send] history.<N>, newest first).  Persisted
+    -- so the commands a user typed are still pickable after a restart; the
+    -- count bounds the read so the stale higher-numbered keys a longer previous
+    -- session left in the file can never resurrect themselves.  Capped here as
+    -- well as in core/send_history.lua: a hand-edited file must not be able to
+    -- hand the widget an unbounded list.
+    send_history = (function()
+        local list = {}
+        local stored = tonumber(config.get(cfg_data, "send", "history_count", 0)) or 0
+        for index = 0, math.min(math.max(stored, 0), 200) - 1 do
+            local text = config.get(cfg_data, "send", "history." .. index, nil)
+            if type(text) == "string" and text ~= "" then
+                list[#list + 1] = text
+            end
+        end
+        return list
+    end)(),
     -- Script engine settings ([script] section).
     script_enabled = (function()
         local raw = config.get(cfg_data, "script", "enabled", "")
@@ -154,14 +176,33 @@ local cfg = {
     -- Feature-extension settings (consumed once the Phase 4/5 widgets ship;
     -- kept in cfg from day one so config round-trips preserve them).
     baud_custom = config.get(cfg_data, "serial", "baud_custom", 0),
-    multi_gap_ms = config.get(cfg_data, "send", "multi_gap_ms", 100),
+    -- Multi tab ([multipage]): the two option ticks, the auto-cycle loop and
+    -- the sequential-send gap are tool-wide settings rather than per-page data,
+    -- but they share the section the page entries live in.
+    multi_hex = config.get(cfg_data, "multipage", "hex", false),
+    multi_crlf = config.get(cfg_data, "multipage", "crlf", false),
+    multi_period_ms = config.get(cfg_data, "multipage", "period_ms", 1000),
+    multi_gap_ms = config.get(cfg_data, "multipage", "gap_ms", 100),
+    multi_page = config.get(cfg_data, "multipage", "page", 0),
     charset = config.get(cfg_data, "display", "charset", "ASCII"),
     frame_gap_ms = config.get(cfg_data, "display", "frame_gap_ms", 0),
     tx_echo = config.get(cfg_data, "display", "tx_echo", true),
+    -- Font preferences ([font] in config.ini; the settings page owns both
+    -- widgets).  nil means "never chosen": the bridge then keeps whatever the
+    -- DLL resolved from assets/layout.toml (the fontsz default index and
+    -- [font] show_chinese_in_receive), so the shipped defaults live in one
+    -- place instead of being duplicated here.
+    font_size_index = config.get(cfg_data, "font", "size_index", nil),
+    font_show_chinese = config.get(cfg_data, "font", "show_chinese_in_receive", nil),
     -- Receive-area copy policy: when true, Ctrl+C / context-menu copy omits the
     -- injected "[HH:MM:SS.mmm] " display timestamps (core/receive_copy.lua).
-    strip_timestamp_on_copy = config.get(cfg_data, "display", "strip_timestamp_on_copy", false),
+    -- The INI key is the documented `[display] strip_timestamp_on_copy`; the
+    -- field carries the name the bridge's owned buffer uses.
+    copy_strip_timestamp = config.get(cfg_data, "display", "strip_timestamp_on_copy", false),
 }
+if cfg.auto_clear == nil then
+    cfg.auto_clear = (tonumber(cfg.auto_clear_bytes) or 0) > 0
+end
 local page_count = math.max(1, math.min(config.get(cfg_data, "multipage", "page_count", 1), 50))
 cfg.quick_pages = {}
 for page = 0, page_count - 1 do

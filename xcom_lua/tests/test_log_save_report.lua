@@ -302,10 +302,59 @@ do
         pending = nil
         return r
     end
+    xcom.list_ports = function()
+        return { { name = "COM3", description = "USB-SERIAL CH340", busy = false } }
+    end
+    win._pending_port = "COM3"
     win:_poll_errors()
     contains("C1 raw code preserved", win._status_dirty, "E5")
     contains("C2 cause translated",
              win._status_dirty, "端口被其他程序占用或权限不足")
+    eq("C3 passive occupied mark remembers port", win._port_busy_name, "COM3")
+end
+
+-- ===========================================================================
+-- C4-C6) The same two Win32 codes also reach the ring from a READ fault
+--        (xcom_core pushes "Win32 serial read fault" with source 2).  Only an
+--        open request this window issued and never saw reach OPEN may be
+--        marked, so a live-session fault cannot relabel the open target.
+-- ===========================================================================
+do
+    local win = new_win()
+    local pending = { code = 5, source = 2, message = "Win32 serial read fault" }
+    xcom.take_error = function()
+        local r = pending
+        pending = nil
+        return r
+    end
+    win._pending_port = nil          -- session already reached OPEN
+    win._port_busy_name = nil
+    win:_poll_errors()
+    eq("C4 a live-session fault marks nothing", win._port_busy_name, nil)
+
+    -- Same code, but the core reported it from its own layer (source 0), i.e.
+    -- not a Win32 open failure either.
+    local pending2 = { code = 5, source = 0, message = "serial write failed" }
+    xcom.take_error = function()
+        local r = pending2
+        pending2 = nil
+        return r
+    end
+    win._pending_port = "COM3"
+    win:_poll_errors()
+    eq("C5 a core-layer code is not an open failure", win._port_busy_name, nil)
+
+    -- And the mark is still raised for the case it exists for.
+    local pending3 = { code = 32, source = 2, message = "Win32 serial open failed" }
+    xcom.take_error = function()
+        local r = pending3
+        pending3 = nil
+        return r
+    end
+    xcom.list_ports = function() return {} end
+    win._pending_port = "COM3"
+    win:_poll_errors()
+    eq("C6 a Win32 open failure still marks the port", win._port_busy_name, "COM3")
 end
 
 print(string.format("log_save_report: %d passed, %d failed", pass_n, fail_n))

@@ -1242,5 +1242,316 @@ do
        win.imgui.last_status:find("autosend payload invalid", 1, true) ~= nil)
 end
 
+-- ===========================================================================
+-- AH) Option-tick persistence ("多选页的勾选没记住"): _save_config must write
+--     the Multi tab's HEX / newline ticks, its auto-cycle period and the page
+--     the user sat on, plus the sidebar-owned display ticks (自动清空 tick +
+--     count, 自动断帧 gap, 复制时去除时间戳).  The WRITE is driven through the
+--     REAL Window:_save_config over a fake bridge whose buffers have the
+--     production shape, then read back with core/config.lua so the round trip
+--     is pinned rather than just the setter.
+--     The READ side (main.lua -> cfg -> ImGuiBridge) cannot be exercised here:
+--     ImGuiBridge.new requires xcom_imgui.dll, which is absent on this host.
+--     AH10+ therefore guards the key NAMES on both sides instead: a rename on
+--     one side without the other fails this suite.
+-- ===========================================================================
+do
+    local config = require("config")
+    local ib = require("imgui_bridge")
+    local win = new_fake_window()
+    -- Slot 3 of page 2 carries text + the enable tick, so the pre-existing
+    -- per-slot round trip is pinned alongside the new option ticks.
+    local b = setmetatable({
+        multi_text = ffi.new("char[?]", MULTI_SLOTS * MULTI_SLOT_CAPACITY),
+        multi_enabled = ffi.new("int[?]", MULTI_SLOTS),
+        multi_hex = ffi.new("int[1]", 1),
+        multi_crlf = ffi.new("int[1]", 1),
+        multi_gap = ffi.new("int[1]", 40),
+        multi_period = ffi.new("int[1]", 250),
+        multi_page = ffi.new("int[1]", 1),
+        multi_page_count = ffi.new("int[1]", 2),
+        auto_clear = ffi.new("int[1]", 1),
+        auto_clear_bytes = ffi.new("int[1]", 4096),
+        frame_gap_enabled = ffi.new("int[1]", 1),
+        frame_gap_ms = ffi.new("int[1]", 120),
+        copy_strip_timestamp = ffi.new("int[1]", 1),
+        auto_save = ffi.new("int[1]", 0),
+        send_hex = ffi.new("int[1]", 0),
+        send_crlf = ffi.new("int[1]", 1),
+        send_period = ffi.new("int[1]", 500),
+        pages = { { text = {}, enabled = {} }, { text = {}, enabled = {} } },
+    }, { __index = ib })
+    ffi.copy(b.multi_text + 3 * MULTI_SLOT_CAPACITY, "P2S4", 4)
+    b.multi_enabled[3] = 1
+    win.imgui = b
+    win.cfg_data = {}
+    win.config_path = os.tmpname()
+
+    win:_save_config()
+    local data = config.load(win.config_path)
+    eq("AH1 multi HEX tick persisted", config.get(data, "multipage", "hex", false), true)
+    eq("AH2 multi newline tick persisted", config.get(data, "multipage", "crlf", false), true)
+    eq("AH3 multi auto-cycle period persisted", config.get(data, "multipage", "period_ms", 0), 250)
+    eq("AH4 sequential gap persisted", config.get(data, "multipage", "gap_ms", 0), 40)
+    eq("AH5 current page persisted", config.get(data, "multipage", "page", -1), 1)
+    eq("AH6 slot text persisted", config.get_multi_entry(data, 1, 3, "text", ""), "P2S4")
+    eq("AH7 slot enable tick persisted", config.get_multi_entry(data, 1, 3, "enabled", false), true)
+    eq("AH8 auto-clear tick persisted", config.get(data, "display", "auto_clear", false), true)
+    eq("AH9 auto-clear byte count persisted", config.get(data, "display", "auto_clear_bytes", 0), 4096)
+    eq("AH10 frame-gap ms persisted", config.get(data, "display", "frame_gap_ms", -1), 120)
+    eq("AH11 copy-strip tick persisted",
+       config.get(data, "display", "strip_timestamp_on_copy", false), true)
+    os.remove(win.config_path)
+
+    -- AH12+ key-name drift guard, both sides of the INI contract.
+    local src_file = io.open("main.lua", "rb")
+    local main_src = src_file and src_file:read("*a")
+    if src_file then src_file:close() end
+    ok("AH12 main.lua readable for the drift guard", main_src ~= nil)
+    if main_src then
+        for _, reader in ipairs({
+            [[config.get(cfg_data, "multipage", "hex"]],
+            [[config.get(cfg_data, "multipage", "crlf"]],
+            [[config.get(cfg_data, "multipage", "period_ms"]],
+            [[config.get(cfg_data, "multipage", "gap_ms"]],
+            [[config.get(cfg_data, "multipage", "page"]],
+            [[config.get(cfg_data, "display", "auto_clear"]],
+            [[config.get(cfg_data, "display", "strip_timestamp_on_copy"]],
+        }) do
+            ok("AH12 reads back " .. reader,
+               main_src:find(reader, 1, true) ~= nil)
+        end
+    end
+end
+
+-- ===========================================================================
+-- AI) Click latency: a frame that RETURNS action bits has already been drawn,
+--     so the handler's screen change lands one frame later.  _dispatch must
+--     pull exactly one interactive frame in that case — and none when no bit
+--     came back, or the demand latch would self-perpetuate a 16 ms idle loop.
+-- ===========================================================================
+do
+    local win = new_fake_window()
+    win:_dispatch_imgui_actions(0)
+    eq("AI1 an action-free frame requests nothing", win._frame_demand or 0, 0)
+    -- minimize (65536) is the one handler that touches neither the bridge nor
+    -- the status channel, so the demand counted here is the dispatch-level
+    -- request alone.
+    win:_dispatch_imgui_actions(65536)
+    eq("AI2 a dispatched action pulls one interactive frame",
+       win._frame_demand or 0, 1)
+    ok("AI3 the requested deadline is the interactive interval",
+       win._imgui_next_frame == 1000000 + 16)
+end
+
+-- ===========================================================================
+-- AJ) Remembered page ("多选页没有记住"): set_pages restores the page the user
+--     sat on, and clamps an index that the (possibly shrunken) page list can
+--     no longer hold.  Without the clamp a 5-page config opened against a
+--     2-page list indexed past the end in _load_page.
+-- ===========================================================================
+do
+    local ib = require("imgui_bridge")
+    local pages = {
+        { text = { "A" }, enabled = { true } },
+        { text = { "B" }, enabled = { false } },
+        { text = { "C" }, enabled = { false } },
+    }
+    local b = setmetatable({
+        multi_text = ffi.new("char[?]", MULTI_SLOTS * MULTI_SLOT_CAPACITY),
+        multi_enabled = ffi.new("int[?]", MULTI_SLOTS),
+        multi_page = ffi.new("int[1]", 0),
+        multi_page_count = ffi.new("int[1]", 1),
+    }, { __index = ib })
+    ib.set_pages(b, pages, 2)
+    eq("AJ1 remembered page restored", b.multi_page[0], 2)
+    eq("AJ2 page count follows the list", b.multi_page_count[0], 3)
+    eq("AJ3 restored page's slot text is loaded", ffi.string(b.multi_text), "C")
+    ib.set_pages(b, pages, 9)
+    eq("AJ4 out-of-range page clamps to the last", b.multi_page[0], 2)
+    ib.set_pages(b, pages, -4)
+    eq("AJ5 negative page clamps to the first", b.multi_page[0], 0)
+    eq("AJ6 clamped page reloads its text", ffi.string(b.multi_text), "A")
+    ib.set_pages(b, pages)
+    eq("AJ7 an absent page argument keeps page 0", b.multi_page[0], 0)
+    eq("AJ8 the option buffers are untouched by set_pages",
+       b.multi_page_count[0], 3)
+end
+
+-- ===========================================================================
+-- AK) Config durability ("勾选项没记住" 的极端情形): a real widget interaction
+--     marks the config dirty and a debounced write lands once, instead of the
+--     settings waiting for the shutdown save (a killed process lost them).
+--     The debounce is what keeps this from rewriting the INI per keystroke,
+--     which is why the write-through extreme (LLCOM) is not copied.
+-- ===========================================================================
+do
+    local win = new_fake_window()
+    local saves = 0
+    win._save_config = function() saves = saves + 1 end
+    -- No timer yet (the startup block builds it): a widget action must not
+    -- write synchronously, and must not latch a flag nothing will flush.
+    win:_dispatch_imgui_actions(0)
+    eq("AK1 an action-free frame marks nothing", win._config_dirty, false)
+    win:_dispatch_imgui_actions(65536)
+    eq("AK2 without the timer there is no write and no flag",
+       tostring(win._config_dirty) .. "/" .. tostring(saves), "false/0")
+
+    win._config_save_timer = new_fake_timer()
+    win._config_save_callback = function() win:_flush_config_save() end
+    win:_dispatch_imgui_actions(65536)      -- minimize: a real interaction
+    eq("AK3 a real interaction marks the config dirty", win._config_dirty, true)
+    eq("AK4 the debounce is armed at the coalescing interval",
+       win._config_save_timer.initial, 5000)
+    eq("AK5 it is a one-shot (repeat 0)",
+       win._config_save_timer.repeat_ms, 0)
+
+    -- A second interaction inside the window restarts it: still exactly one
+    -- pending write, not two.
+    win:_dispatch_imgui_actions(65536)
+    eq("AK6 a further interaction keeps one pending write", saves, 0)
+
+    win._config_save_timer:fire()
+    eq("AK7 the quiet period writes once", saves, 1)
+    eq("AK8 the flush clears the dirty flag", win._config_dirty, false)
+    win._config_save_timer:fire()
+    eq("AK9 nothing dirty means no second write", saves, 1)
+
+    -- Shutdown must disarm the timer: its callback would otherwise run against
+    -- a half-torn-down window (bridge destroyed, core closed).
+    win:_dispatch_imgui_actions(65536)
+    eq("AK10 dirty again before shutdown", win._config_dirty, true)
+    win._config_save_timer:stop()
+    win._config_dirty = false
+    eq("AK11 the shutdown path clears the flag the timer would have flushed",
+       win._config_dirty, false)
+end
+
+-- ===========================================================================
+-- AL) Selection-drag probe degradation.  The auto-clear guard in
+--     window.lua asks the bridge whether a drag is in flight; on a host with
+--     no DLL (this suite) the export probe resolved to nil at load, so the
+--     wrapper must answer false rather than raising -- the guard then behaves
+--     exactly as before ("clears on threshold"), and an older DLL does too.
+-- ===========================================================================
+do
+    local ib = require("imgui_bridge")
+    ok("AL1 the wrapper exists for window.lua's guard",
+       type(ib.selection_dragging) == "function")
+    eq("AL2 no export (or no DLL): reports not dragging",
+       ib.selection_dragging({}), false)
+end
+
+-- ===========================================================================
+-- AM) 翻页留不住命令 / 重启后找不到 (user report): the Multi tab's per-page
+--     commands must survive BOTH a page switch inside one session and a
+--     restart.  The in-session half is the store/load pair on the REAL module
+--     (_store_page reads the DLL buffer, _load_page writes it back); the
+--     restart half goes through the real INI writer and a rebuild of the page
+--     list exactly as main.lua does it.  A slot the user typed into is only in
+--     the DLL buffer, so a missing store on either path shows up here as text
+--     that never reaches the next page or the file.
+-- ===========================================================================
+do
+    local ib = require("imgui_bridge")
+    local config = require("config")
+
+    local function make_bridge(pages, page)
+        local b = setmetatable({
+            pages = pages,
+            multi_text = ffi.new("char[?]", MULTI_SLOTS * MULTI_SLOT_CAPACITY),
+            multi_enabled = ffi.new("int[?]", MULTI_SLOTS),
+            multi_page = ffi.new("int[1]", page),
+            multi_page_count = ffi.new("int[1]", #pages),
+        }, { __index = ib })
+        ib._load_page(b)
+        return b
+    end
+    local function type_slot(b, index, text)
+        ffi.copy(b.multi_text + index * MULTI_SLOT_CAPACITY, text, #text)
+    end
+    local function slot(b, index)
+        return ffi.string(b.multi_text + index * MULTI_SLOT_CAPACITY)
+    end
+
+    local pages = {
+        { text = { "P1S1", "P1S2" }, enabled = { true, false } },
+        { text = { "P2S1" }, enabled = { false } },
+        { text = { "P3S1" }, enabled = { true } },
+    }
+    local b = make_bridge(pages, 0)
+    eq("AM1 first page loads its first slot", slot(b, 0), "P1S1")
+
+    -- Type into page 1, go forward: the edit must be stored, and page 2 shown.
+    type_slot(b, 3, "P1S4-edited")
+    ib.change_page(b, 1)
+    eq("AM2 the outgoing page's edit was stored", pages[1].text[4], "P1S4-edited")
+    eq("AM3 the new page is displayed", slot(b, 0), "P2S1")
+    eq("AM4 slots the new page does not use are blank", slot(b, 1), "")
+
+    -- Type on page 2, go forward again, then walk back: every page found again.
+    type_slot(b, 1, "P2S2-typed")
+    ib.change_page(b, 1)
+    eq("AM5 third page displayed", slot(b, 0), "P3S1")
+    ib.change_page(b, -1)
+    eq("AM6 walking back finds page 2's typed slot", slot(b, 1), "P2S2-typed")
+    ib.change_page(b, -1)
+    eq("AM7 walking back finds page 1's edited slot", slot(b, 3), "P1S4-edited")
+    eq("AM8 page 1's original slots are intact", slot(b, 0), "P1S1")
+    eq("AM9 page 1's enable ticks are intact", b.multi_enabled[0], 1)
+    eq("AM10 page 1's cleared tick is intact", b.multi_enabled[1], 0)
+
+    -- Clamping: the arrows must not wrap past the ends into a blank page.
+    ib.change_page(b, -1)
+    eq("AM11 the first page cannot be left backwards", b.multi_page[0], 0)
+    eq("AM12 and it still shows its own text", slot(b, 0), "P1S1")
+    ib.change_page(b, 5)
+    eq("AM13 the last page cannot be left forwards", b.multi_page[0], 2)
+    eq("AM14 and it still shows its own text", slot(b, 0), "P3S1")
+
+    -- Restart half: write the INI from the LIVE bridge, rebuild the page list
+    -- the way main.lua does, and load it into a fresh bridge.
+    -- _save_config reads the whole send/display surface, so the page bridge
+    -- needs those buffers too (the AH block builds its own for the same
+    -- reason); only the page buffers matter to the assertions below.
+    b.send_hex = ffi.new("int[1]", 0)
+    b.send_crlf = ffi.new("int[1]", 0)
+    b.send_period = ffi.new("int[1]", 1000)
+    b.auto_save = ffi.new("int[1]", 0)
+    b.multi_hex = ffi.new("int[1]", 0)
+    b.multi_crlf = ffi.new("int[1]", 0)
+    b.multi_period = ffi.new("int[1]", 1000)
+    b.multi_gap = ffi.new("int[1]", 100)
+    b.auto_clear = ffi.new("int[1]", 0)
+    b.auto_clear_bytes = ffi.new("int[1]", 0)
+    local win = new_fake_window()
+    win.imgui = b
+    win.config_path = os.tmpname()
+    win:_save_config()
+    local data = config.load(win.config_path)
+    eq("AM15 page count persisted", config.get(data, "multipage", "page_count", 0), 3)
+    eq("AM16 current page persisted", config.get(data, "multipage", "page", -1), 2)
+    local rebuilt = {}
+    for page = 0, 2 do
+        local entries = { text = {}, enabled = {} }
+        for index = 0, 7 do
+            entries.text[index + 1] =
+                config.get_multi_entry(data, page, index, "text", "")
+            entries.enabled[index + 1] =
+                config.get_multi_entry(data, page, index, "enabled", false)
+        end
+        rebuilt[#rebuilt + 1] = entries
+    end
+    local b2 = make_bridge(rebuilt, config.get(data, "multipage", "page", 0))
+    eq("AM17 restart: the remembered page is shown", b2.multi_page[0], 2)
+    eq("AM18 restart: its slot text came back", slot(b2, 0), "P3S1")
+    ib.change_page(b2, -1)
+    eq("AM19 restart: page 2's typed slot came back", slot(b2, 1), "P2S2-typed")
+    ib.change_page(b2, -1)
+    eq("AM20 restart: page 1's edited slot came back", slot(b2, 3), "P1S4-edited")
+    eq("AM21 restart: page 1's different tick came back", b2.multi_enabled[1], 0)
+    os.remove(win.config_path)
+end
+
 print(string.format("\n%d passed, %d failed", pass_n, fail_n))
 os.exit(fail_n == 0 and 0 or 1)

@@ -38,7 +38,13 @@ if(MSVC)
     # misparse a trailing byte as a line-continuation backslash.
     target_compile_options(xcom_imgui PRIVATE /W4 /EHsc /utf-8)
 endif()
-target_link_libraries(xcom_imgui PRIVATE d3d11 dxgi gdi32 user32 imm32)
+# dwmapi is not optional: imgui_impl_win32.cpp calls DwmIsCompositionEnabled /
+# DwmGetColorizationColor / DwmEnableBlurBehindWindow and only pulls the import
+# library in through `#pragma comment(lib, "dwmapi")`, which MSVC honours and
+# GCC/Clang ignore. Without it here the target links on MSVC and fails on any
+# other toolchain (mingw cross-check and analysis builds) with four undefined
+# references.
+target_link_libraries(xcom_imgui PRIVATE d3d11 dxgi gdi32 user32 imm32 dwmapi)
 set_target_properties(xcom_imgui PROPERTIES PREFIX "")
 
 foreach(font_file IN ITEMS SiemensSlabRoman.ttf SiemensSlabBold.TTF)
@@ -61,4 +67,25 @@ add_custom_command(TARGET xcom_imgui POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${CMAKE_CURRENT_SOURCE_DIR}/layout.toml"
             "${XCOM_LUA_RUNTIME_DIR}/assets/layout.toml"
+    # The DLL resolves its assets RELATIVE TO ITSELF, i.e. the file it actually
+    # reads at run time is runtime/assets/layout.toml.  Without this second copy
+    # a rebuild refreshed only the staging tree and the live file silently kept
+    # the previous contents (the release script packages runtime/assets).
+    COMMAND ${CMAKE_COMMAND} -E make_directory
+            "${XCOM_LUA_RUNTIME_DIR}/runtime/assets"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/layout.toml"
+            "${XCOM_LUA_RUNTIME_DIR}/runtime/assets/layout.toml"
+    VERBATIM)
+
+# Bundled CJK subset (regenerate with tools/build_cjk_subset.py, never by hand).
+# It previously had NO copy rule at all, so the runtime copy shipped whatever
+# it was last edited to; keep assets/fonts as the source of truth and refresh
+# the live runtime file from it.
+add_custom_command(TARGET xcom_imgui POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory
+            "${XCOM_LUA_RUNTIME_DIR}/runtime/assets/fonts"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${XCOM_LUA_RUNTIME_DIR}/assets/fonts/SimHeiCJK.ttf"
+            "${XCOM_LUA_RUNTIME_DIR}/runtime/assets/fonts/SimHeiCJK.ttf"
     VERBATIM)

@@ -9,7 +9,8 @@
 CoolTerm / COMTool / LLCOM / XCOM）**同样没有**一键进 ROM/DFU 的复位时序，因此这项是
 **绝对缺口（无人做到）**，不是「我们落后于同行」的竞争劣势——只有 Arduino IDE / esptool 这类
 芯片专用工具才有。重枚举稳定身份亦仅在 tio / Serial Studio 有先例（见 `design-device-presence.md`），
-本对照集内无人做到。两项是否实现应由本产品目标决定，不作为追赶对手的理由（结论见 §九）。
+本对照集内无人做到——**该项已落地**（v1.6 起按 `hardware_id` 优先匹配身份，§九 / §二表）；
+一键进 ROM/DFU 与 1200 bps touch 两项仍未采纳，应由本产品目标决定，不作为追赶对手的理由（结论见 §九）。
 
 **领先项（有源码级对照证据）**
 
@@ -47,6 +48,11 @@ CoolTerm / COMTool / LLCOM / XCOM）**同样没有**一键进 ROM/DFU 的复位�
 
 **闭源工具（RealTerm/CoolTerm/SSCOM/XCOM/UartAssist）无源码可得**。其条目标 `[D]`/`[I]`，
 且**「未记载」不等于「不存在」**——搜索范围已在各项中披露。
+
+第二轮（2026-10-04，见 §十）把三个开源对照的版本钉死，并加入 pyserial 作为「能力基线」：
+COMTool `4b1e39e`（2026-04-24，与第一轮同 commit，故第一轮的行号引用可直接复核）、
+LLCOM `734d716`（2026-09-07，第一轮只记「快照」）、Serial Studio `70aeb50`（2026-10-02）、
+pyserial `master` 的 `serial/serialwin32.py`（一次枚举，只作能力对照，不作 UI 对照）。
 
 ---
 
@@ -204,20 +210,138 @@ break/frame 噪声正是 `window.lua` 静默线路告警所依赖的「对端断
 | --- | --- | --- | --- | --- |
 | 一键进 ROM/DFU 时序 | 对照集**均无**（仅宏可拼） | 无；`design-device-profiles.md` 有草案 | **需用户决策** | 须实机标定毫秒边沿；需 ABI 暴露 VID/PID + `window.lua` 接线 |
 | 1200 bps touch | 对照集**均无**（Arduino IDE / esptool 独有） | 1200 已在波特率表内，可手动 open/close | **需用户决策** | 效果依赖具体板子，须实机验证；且会主动扰动板子 |
-| 重枚举稳定 ID | 仅 tio / Serial Studio（systemLocation） | 按 `description` 找回，歧义即放弃 | **需用户决策** | 需 SetupAPI 读 hardware_id → 扩 ABI；现描述匹配在本对照集内已属最好 |
+| 重枚举稳定 ID | 仅 tio / Serial Studio（systemLocation） | v1.6 起读 `hardware_id`（SPDRP_HARDWAREID 首串）优先匹配，仍要求是新出现的名字，歧义即放弃 | 已采纳（用户决策） | SetupAPI 只读注册表、不开端口；同型号共享 VID/PID 故歧义规则保留。见 `design-device-presence.md` §三 |
 | 发送节流（逐字符/逐行） | Tera Term / RealTerm | 多机发送与文件发送有固定 gap，单发无 | **不采纳** | 盲延时拖慢所有发送且掩盖真实流控问题；慢设备应靠流控/分块 gap |
 | 线错误「可配忽略」 | CoolTerm | 四类分别计数并常驻 banner | **不采纳** | 会掩盖故障；break/frame 噪声正是「对端断电」信号（静默线路告警依赖它） |
 | 循环缓冲「可配 size」 | CoolTerm | `[display] receive_window_bytes` 可配（16 KiB..1 MiB，默认 64 KiB）+ 4 KiB 行上限 | **无需采纳（已具备）** | 尺寸本就可配且两侧同源裁剪 |
 | §四 第 1/2/4/5/6/7 条 | — | **均已实现** | **无需采纳** | 见 §四 复核段 |
 | §五「不要抄」表 | — | 逐条复核成立 | **维持** | 仅 RealTerm #62 一行证据等级下调为 `[D-未证实]` |
 
-**附注（本次复核新发现）**：`XcomDisplayOptions.max_display_bytes`（头文件注为默认 2 MiB）**在核内未被
-读取、Lua 侧也未使用**，真实显示上限是 `[display] receive_window_bytes` 与 `auto_clear_bytes`。
-该字段目前是 ABI 上的惰性字段；若日后要做「显示内存硬上限」，必须先在核内实现，不能依赖它已有约束力。
+**附注（本次复核新发现，2026-10-03 收口）**：`XcomDisplayOptions.max_display_bytes`（头文件注为默认 2 MiB）
+**在核内确实未被读取**，真实显示上限是 `[display] receive_window_bytes` 与 `auto_clear_bytes`。原先
+Lua 侧也**没有**用它——`window.lua` 把 2 MiB 写死在 `self._max_display_bytes`，于是 `main.lua` 读的这个
+配置键改了也无效；该处现已改为读配置转发（非正数回落到 2 MiB）。字段本身仍是 ABI 上的惰性字段：
+若日后要做「显示内存硬上限」，必须先在核内实现，不能依赖它已有约束力。
 
-**一处代码级残余风险（本轮未改，须 `window.lua` 所有者处理）**：`Window:_resolve_reconnect_port`
-只按「当前枚举里同描述端口恰好 1 个」判定，**未排除该端口在故障之前就已存在**的情形。
-若机器上本就插着两个同型号适配器（注册表描述相同），拔掉原来那个后，剩下的那个会成为唯一描述
-匹配并被静默打开——正是 `design-device-presence.md` 要避免的「打开错误设备」。修法：进入宽限窗时
-快照当时的端口名集合，`_resolve_reconnect_port` 只接受**故障后新出现**的同描述端口；若匹配到的是
-故障前已存在的端口，按「无法可靠匹配」返回 `matched=false` 并提示用户重选（不要打开它）。
+**已关闭的代码级残余风险（2026-10-03 复核）**：本条原要求 `_resolve_reconnect_port` 排除「故障前就
+已存在」的同描述端口。现已落地：宽限窗开启时快照 `_present_port_names()` 到 `_reconnect_known_ports`，
+`_resolve_reconnect_port` 只接受**故障后新出现**的候选（`not (known and known[p.name])`），并按
+`hardware_id` 优先、`description` 次级匹配；两个无序列号同型号适配器仍返回 `matched=false` 且不打开。
+回归见 `xcom_lua/tests/test_reconnect_known_peers.lua` 与 `test_reconnect_port.lua`。
+
+---
+
+## 十、第二轮取证（2026-10-04）：重连、断帧、勾选项、线路电平、字号
+
+本轮只回答第一轮没覆盖或没钉死的五件事。取证方式：浅克隆三个开源对照到本地、按
+§一 的同一套 `[S]/[D]/[I]` 纪律逐条读源码（COMTool 与第一轮同 commit `4b1e39e`，
+故第一轮的行号引用可**直接复核**，见 §十.7）；另取 pyserial 的 Windows 后端作**能力基线**
+（它证明「这个信号在主流库里有现成 API」，而不是「某工具这么做」）。
+
+**结论先行**
+
+| 判定 | 项 | 依据 |
+| --- | --- | --- |
+| **领先** | 调制解调器输入（CTS/DSR/RLSD）可观测并提示对端掉电 | §十.4：集合内 4 个有源码的工具，能力一行可得，**无人使用** |
+| **领先** | 占用归因（E5/E32 →「端口被其他程序占用」+ 列表标记）与不猜测 | COMTool 只弹 `str(e)`（`conn_serial.py:331-340`） |
+| **领先** | 枚举节流：500 ms 去抖 + 1 s 兜底 | COMTool 断线期间 **10 ms 一次全量枚举**（`conn_serial.py:429-431`） |
+| **领先** | 字号可配且对比度过 WCAG AA | LLCOM 固定 Consolas 10pt；COMTool 有 1..100 pt 但无对比度约束 |
+| **落后（同轮已补）** | 勾选项仅在退出时落盘 → 进程被杀即丢失 | §十.3：三种极端写点；已补原子写 + 5 s 去抖 |
+| **落后** | 字号只有 3 档 | COMTool `fontSize` 为 1..100 的自由值（`dbg.py:264-265,384`） |
+| **建议采纳** | 身份改用**设备实例 ID**（含 USB 序列号） | §十.6：Serial Studio 把 serial 计入打分，Windows 的实例 ID 末段就是序列号 |
+| **待定** | RX 延迟可调（读 tick 50 ms → 5 ms） | §十.6：Serial Studio 走「即时完成 + 大 FIFO」换低延迟 |
+
+### 10.1 断线检测与自动重连
+
+| 维度 | 本仓库 | COMTool `4b1e39e` | Serial Studio `70aeb50` |
+| --- | --- | --- | --- |
+| 触发条件 | 仅 `FAULT`（设备消失）→ 宽限窗 | 任何读异常 → `LOSE` | 仅 `ResourceError`，且用户开启 autoReconnect |
+| 证据 | `design-device-presence.md` §四 | `conn_serial.py:447-461` | `UartPolicy.h:shouldAutoReconnect`（注释：drop 不报给用户的**唯一**情形） |
+| 发现频率 | 500 ms 去抖 + ~1 s 兜底 | **10 ms** + 全量 `list_ports.comports()` | `m_reconnectTimer.setInterval(1000)`（`UART.cpp:135`） |
+| 身份判据 | `hardware_id` → `description` → **歧义即放弃** | 仅 `p.device == com.port`（同名） | 五字段打分取最高（`SerialPortIdentity.cpp:190`），**无唯一性要求** |
+| 掉线可见性 | 状态栏 + 宽限窗 + 恢复边界 | 一行 `Connection lose!` 后**自行静默重连** | 报给用户，除非自动重连接管 |
+
+**核对结论**：我们与 Serial Studio 在「谁有权自动重连」上**独立同构**（只在设备消失 + 用户显式开启时静默恢复），
+且我们的**歧义规则更严**——Serial Studio 取最高分即可打开，两台同型号适配器在场时它可能选错板子，
+正是 `design-device-presence.md` §五 要避免的「打开错误设备」。
+`UartPolicy::isFatalPortError` 额外为 by-id 节点/socat pty 豁免 `UnsupportedOperationError`：我们只从
+端口列表取值、不接受任意路径，**N/A**。
+
+### 10.2 「自动断帧」的三种实现
+
+| 工具 | 机制 | 证据 | 是否持久化 |
+| --- | --- | --- | --- |
+| 本仓库 | `frame_gap_ms`（10..60000 ms，0=关） | `xcom_lua/assets/layout.toml` / 显示页 | 是（`[display] frame_gap_ms`） |
+| COMTool | 空闲超时插换行：`receiveAutoLinefeed` + `receiveAutoLindefeedTime` | `dbg.py:896-911` | 是（`dbg.py:348`） |
+| COMTool（批处理） | **波特率派生**：`oneByteTime = 1/(baud/(bytesize+2+stopbits))`，按 `2×oneByteTime` 收包 | `conn_serial.py:272,450` | 否（每次打开按参数算） |
+| LLCOM | **无**自动断帧；靠「读到 `BytesToRead == 0`」+ 用户 `timeout`/`bitDelay` | `Uart.cs:254-286`；`DataShowPage.xaml` 勾选项只有 RTS/DTR/HEX/AddExtraEnter/ShowSymbol/DisableLog | 是（`timeout`/`bitDelay`） |
+
+**可借鉴点**：COMTool 的批处理间隔由波特率算出，不需用户填 ms，且随参数变化自动适配。
+我们的 `frame_gap_ms` 是人工值——一个「自动」档（同样公式）比再调一次默认值更有用（§十.6）。
+
+### 10.3 「勾选项要记住」的三种极端
+
+**同轮追加（2026-10-04 晚）**：用户要求「历史命令要能记住」+「翻页后之前的命令要能找到」。
+对照 COMTool 的发送历史（`plugins/dbg.py`，同一 commit）：`sendHistory` 是**可见的 ComboBox**
+（`dbg.py:123,136`，`activated` → 塞回发送框 `:451`），列表**持久化**在 `sendHistoryList`
+（默认 `[]` `:101`，启动回填 `:370-372`，每次发送 `:693` `insert(0,...)`），去重是
+`sendHistoryFindDelete`（`:685-690`）——**任意重复移到最前**，另有清空动作 `:454-455`。
+我们采用同一形态（可见列表、最新在前、move-to-front 去重、写进 `[send] history.N`），
+理由有二：① ImGui 明确断言 `CallbackHistory` 与 `Multiline` 互斥（`imgui_widgets.cpp:4739`
+「它们都用上/下键」），而发送框是多行编辑器；② 可见列表比隐藏手势更符合「能找到」。
+**差异（更优）**：COMTool 的历史随 `config.json` 一起在**版本不匹配时整份丢弃**（§10.3），
+我们的 `history.N` 是普通 INI 键，升级不丢。
+
+| 工具 | 存哪 | 何时写 | 代价 / 风险 |
+| --- | --- | --- | --- |
+| 本仓库（本轮前） | `config.ini`（`[display]`/`[multipage]`/`[font]`…） | **仅退出时** | 进程被杀/崩溃 → 本轮所有勾选丢失 |
+| 本仓库（本轮后） | 同上 | 交互标脏 + **5 s 去抖** + 退出；写入为**临时文件 + 改名** | 崩溃最多丢 5 s；写盘不再是截断式 |
+| COMTool | `%APPDATA%/COMTool/config.json`（`version: 3`） | 启动/退出 | **版本不匹配即整份丢弃**并另存 `.bak.<时间>.json`（`parameters.py:88-101`）→ 升级清空用户设置 |
+| LLCOM | `settings.json` | **每个属性 setter 都整份重写**（含窗口几何，每次拖动一次） | 全量 `File.WriteAllText`（`Settings.cs:60-63`）；拖窗口即写盘 |
+| Serial Studio | `QSettings` | 配置变更 | 持久化 baud/parity/dataBits/stopBits/flowControl/dtr/autoReconnect（`UART.cpp:106-116`） |
+
+**结论**：写点是「退出 / 每属性 / 版本化整份」三种极端，我们取中间；COMTool 的**版本不匹配丢弃**
+是我们明确不要的（`[multipage]` 等新键以默认值增量读取，旧配置不失效）。
+
+### 10.4 线路电平：「端口还在、对端掉电」是否有人做
+
+| 工具 | 能力是否可得 | 是否使用 | 证据 |
+| --- | --- | --- | --- |
+| pyserial（基线） | **可得**：`cts/dsr/ri/cd` = `GetCommModemStatus` + `MS_CTS_ON/MS_DSR_ON/MS_RING_ON/MS_RLSD_ON` | — | `serialwin32.py:389-414` |
+| COMTool | 同上（pyserial） | **否**：按 `cts`/`dsr`/`cd`/`ri` 属性名全仓 grep 0 命中；`dsrdtr` 只作流控设置 | `conn_serial.py:235-238` |
+| LLCOM | 可得（.NET `CDHolding/CtsHolding/DsrHolding`） | **否**：grep 0 命中（只有 `BytesToRead`） | `Uart.cs:257` |
+| Serial Studio | 可得（`QSerialPort` pinout） | **否**：grep 0 命中；`UartPolicy` 只处理消失类错误 | `UartPolicy.h` |
+| PuTTY / Tera Term | 参照 §二 第 1 行（Tera Term 只清 `CE_*` 标志） | 否 | 第一轮 `[S]` |
+
+**结论**：第一轮的「无先例」从「我们没找到别人做」升级为**「集合内 4 个有源码的工具，该信号一行 API
+即可得，无人读取」**。v1.7 的 `modem_lines` 仍是集合内唯一；同时必须继续如实标注覆盖边界
+（3 线接法静默、DSR 单落且我方 DTR 未拉高时抑制，见 `design-device-presence.md` §三）。
+
+### 10.5 本轮据此落地的修改（同轮完成）
+
+1. **配置落盘改为「原子写 + 5 s 去抖」**（`core/config.lua` 的 `M.save`、`ui/window.lua` 的
+   `_mark_config_dirty`/`_flush_config_save`）。动机直接来自 §十.3：原实现只在退出时写，
+   进程被杀即丢；而写点若简单加密就必须先解决 `io.open(path,"wb")` **先截断**、
+   半途崩就毁配置的问题。回归：`test_config` 12)（无 `.tmp` 残留、陈旧 `.tmp` 不遮蔽、失败不改既有文件）
+   与 `test_multi_send` AK（真实交互才标脏、去抖只写一次、空闲帧不触发、退出前解除）。
+2. 上一轮已落地、此处仅登记依据的：`[colors]` 全量生效（可读性）、占用识别三重门控（§十.1 对照）。
+
+### 10.6 建议（按成本排序）
+
+| # | 建议 | 依据 | 成本 | 状态 |
+| --- | --- | --- | --- | --- |
+| 1 | 断帧增加「自动」档 = `2 × (bytesize+2+stopbits) / baud` | COMTool `conn_serial.py:272,450` | 低（Lua 已知 baud/bits，不动 ABI） | 建议采纳 |
+| 2 | 字号放开为自由值（现为 13/15/17 三档） | COMTool `fontSize` QSpinBox 1..100（`dbg.py:264-265`） | 中：自由字号要按需重建 atlas（本引擎支持懒烘焙，但需 `[font]` 键语义扩展） | 待定 |
+| 3 | 重连身份改用**设备实例 ID**（`USB\VID_x&PID_y\<序列号>`） | Serial Studio 给 serial 单独权重 50（`SerialPortIdentity.cpp:34-36,200-205`）；Windows 实例 ID 末段即序列号，现只读 `SPDRP_HARDWAREID`（不含序列号） | **高**：`XcomPortInfo` **无 `struct_size` 字段**（`xcom.h` 的 LIST_BOUNDARY 警告），加字段＝断点 + 全部 Lua pin + 实机验证 | 需用户决策 |
+| 4 | RX 延迟可调（`kReadTickTimeoutMs` 50 → 5） | Serial Studio 用 `MAXDWORD/0/0` 即时完成 + `SetupComm(baud*0.02)` 大 FIFO 换低延迟（`UART.cpp:60-79`），我们换 CPU | 低（一个常量） | 需用户决策 |
+
+### 10.7 对第一轮结论的核对
+
+1. **加强**：§七「无先例」按 §十.4 升级为源码级「集合内无人使用」。
+2. **更正半句**：§五 的 COMTool「定时发送掉线后空转不停」——**空转成立**（`dbg.py:636-651` 的
+   while 只看 `sendScheduled`，与连接状态解耦），但**「状态栏刷屏」不成立**：`sendData`
+   （`dbg.py:651-656`）在 `isConnected()` 为假时整段跳过且无 else 分支，是**静默**空转。
+3. **确认两条**：§五「发文件失败不恢复按钮」在 `dbg.py:466-477` 精确成立（只有 ok 分支
+   `setText` + `setDisabled(false)`）；§五「接收显示无界增长」对 LLCOM 成立——其 `maxLength`
+   （默认 10240）是**每包字节上限**（`Uart.cs:268` 的 `break`），不是显示保留上限，
+   显示端 `MainTextBox.AppendText`（`DataShowPage.xaml.cs:108`）无任何裁剪。

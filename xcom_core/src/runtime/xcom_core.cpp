@@ -869,6 +869,9 @@ struct CoreState {
             core->last_open_result.store(XCOM_OK, std::memory_order_release);
         }
         else {
+            // Drop the previous session's line level before the read thread
+            // publishes a fresh sample. Zero means "no sample".
+            core->metrics.modem_lines.store(0U, std::memory_order_relaxed);
             const SerialPortOptions options{
                 core->port_name.data(), core->cfg_baud, core->cfg_data_bits,
                 core->cfg_stop_bits, core->cfg_parity, core->cfg_flow_control,
@@ -898,11 +901,20 @@ struct CoreState {
                         serial_fault_callback(core, fault);
                     },
                     [core](const SerialLineStatus& status) noexcept {
-                        line_status_ingress(core, status.framing_errors,
-                                            status.parity_errors,
-                                            status.overrun_errors,
-                                            status.break_events,
-                                            status.hold_events);
+                        // Always store the level, including a failed sample
+                        // (0). Error counters stay edge-triggered so a modem
+                        // change on a quiet line does not re-emit diagnostics.
+                        core->metrics.modem_lines.store(
+                            status.modem_lines, std::memory_order_relaxed);
+                        if ((status.framing_errors | status.parity_errors |
+                             status.overrun_errors | status.break_events |
+                             status.hold_events) != 0U) {
+                            line_status_ingress(core, status.framing_errors,
+                                                status.parity_errors,
+                                                status.overrun_errors,
+                                                status.break_events,
+                                                status.hold_events);
+                        }
                     }, error)) {
                 core->errors.push(error != kSerialSuccess ? error : XCOM_ERR_IO,
                                   2U, "Win32 serial open failed");
@@ -959,6 +971,7 @@ struct CoreState {
 
     static void sink_owner_close(CoreCtx* core) noexcept
     {
+        core->metrics.modem_lines.store(0U, std::memory_order_relaxed);
         CoreState* st = static_cast<CoreState*>(core->sink.impl);
         if (st != nullptr) {
             // Cancel synchronously before either virtual or physical close.

@@ -16,6 +16,15 @@ local function eq(label, got, want)
     end
 end
 
+local function check(label, condition)
+    if condition then
+        passed = passed + 1
+    else
+        failed = failed + 1
+        print("FAIL  " .. label)
+    end
+end
+
 -- 1) basic sections + typed parsing
 local s = [[
 window_x = 100
@@ -113,6 +122,109 @@ local tri_rt = config.load(tmp_tri)
 eq("rt dtr_open 0", tri_rt["serial"].dtr_open, 0)
 eq("rt rts_open 2", tri_rt["serial"].rts_open, 2)
 os.remove(tmp_tri)
+
+-- 12) atomic save.  save() writes a sibling .tmp and renames it over the
+--     target, so a process killed mid-write cannot leave a truncated config
+--     (io.open(path,"wb") truncates first, which is why a periodic save is
+--     only safe with this indirection).  The properties worth pinning: no
+--     .tmp survives a successful save, the target holds exactly the new text,
+--     a stale .tmp from an earlier failure is not read back as config, and a
+--     save that cannot create its temp file leaves the existing config intact.
+do
+    local path = os.tmpname()
+    -- A first generation, then an overwrite: the rename path on POSIX replaces
+    -- the target in one step, on Windows the remove+rename fallback runs.
+    eq("atomic: first save ok", config.save(path, { [""] = {}, a = { w = 1 } }), true)
+    eq("atomic: overwrite ok", config.save(path, { [""] = {}, a = { w = 2 } }), true)
+    eq("atomic: target holds the new value", config.load(path)["a"].w, 2)
+    local tmp_left = io.open(path .. ".tmp", "rb")
+    if tmp_left then tmp_left:close() end
+    eq("atomic: no .tmp left behind", tmp_left == nil, true)
+
+    -- A stale temp file (e.g. from a killed run) must not shadow the config:
+    -- load() reads the target only.
+    local stale = io.open(path .. ".tmp", "wb")
+    stale:write("[a]\nw = 999\n")
+    stale:close()
+    eq("atomic: stale .tmp is ignored by load", config.load(path)["a"].w, 2)
+    os.remove(path .. ".tmp")
+
+    -- Unwritable target: the temp file cannot be created, so save reports
+    -- false and the existing config is untouched (the old truncate-in-place
+    -- behaviour would have destroyed it).
+    local blocked = "/nonexistent-dir-xcom/config.ini"
+    eq("atomic: unwritable path reports false", config.save(blocked, { [""] = {} }), false)
+    eq("atomic: existing config survives a failed save", config.load(path)["a"].w, 2)
+    os.remove(path)
+end
+
+-- 13) quoted literals.  A command is arbitrary text: it can carry a newline
+--     (a multi-line block), a trailing space the device needs, or digits that
+--     would otherwise read back as a NUMBER.  Bare values keep the historical
+--     format (and stay readable in the file); anything that would not survive
+--     that treatment is written as a quoted, escaped literal instead.
+do
+    local path = os.tmpname()
+    local volatile = {
+        [""] = {},
+        cmd = {
+            multi = "AT+CGDCONT=1\nAT+CGACT=1",   -- newline: would break the file
+            spaced = "AT ",                       -- trailing space: trimmed away
+            indented = "  AT",                    -- leading space: trimmed away
+            numeric = "1234",                     -- would come back as a number
+            booleanish = "true",                  -- would come back as a boolean
+            quoted = 'say "hi"',                  -- embedded quote
+            mirrored = "D:\\logs\\a.log",         -- embedded backslash
+            cjk = "温度=25",                       -- non-ASCII payload
+            hash = "cmd#1",                       -- '#' is only a comment at line start
+            empty = "",                           -- empty string is not "missing"
+        },
+    }
+    eq("quoted: save ok", config.save(path, volatile), true)
+    local text = io.open(path, "rb"):read("*a")
+    check("quoted: the newline was written escaped, not literal",
+       text:find("\\n", 1, true) ~= nil and text:find("\nAT+CGACT", 1, true) == nil)
+    local rt = config.load(path)
+    for _, key in ipairs({ "multi", "spaced", "indented", "numeric",
+                           "booleanish", "quoted", "mirrored", "cjk", "hash" }) do
+        eq("quoted round-trip: " .. key, rt["cmd"][key], volatile.cmd[key])
+    end
+    eq("quoted round-trip: empty stays empty (not nil)", rt["cmd"].empty, "")
+    -- A continuation line that leaked out of its value would show up as a key
+    -- in the default section: the corruption this escaping exists to prevent.
+    local stray = 0
+    for key in pairs(rt[""] or {}) do
+        if key:find("AT+", 1, true) then stray = stray + 1 end
+    end
+    eq("quoted: no continuation leaked into another section", stray, 0)
+    os.remove(path)
+end
+
+-- 14) Backward compatibility: a file written in the historical bare format
+--     (hand-edited, or produced before quoted literals existed) must load
+--     exactly as it did -- a Windows path keeps its backslashes because the
+--     unescaper only runs on values that were quoted.
+do
+    local path = os.tmpname()
+    local f = io.open(path, "wb")
+    f:write("[display]\nsave_path = D:\\logs\\a.log\ncharset = ASCII\n",
+            "flag = true\nnum = 42\nblank =\n")
+    f:close()
+    local rt = config.load(path)
+    eq("legacy bare path keeps its backslashes", rt["display"].save_path,
+       "D:\\logs\\a.log")
+    eq("legacy bare string", rt["display"].charset, "ASCII")
+    eq("legacy bare boolean", rt["display"].flag, true)
+    eq("legacy bare number", rt["display"].num, 42)
+    eq("legacy bare empty value is nil", rt["display"].blank, nil)
+    -- An unterminated quote must not swallow the value.
+    local f2 = io.open(path, "wb")
+    f2:write('[cmd]\nbroken = "unterminated\n')
+    f2:close()
+    eq("unterminated quote still yields the text",
+       config.load(path)["cmd"].broken, '"unterminated')
+    os.remove(path)
+end
 
 print(string.format("\nconfig tests: %d passed, %d failed", passed, failed))
 os.exit(failed == 0 and 0 or 1)

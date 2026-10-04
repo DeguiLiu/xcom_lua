@@ -17,13 +17,61 @@ local function trim(s)
     return (s:gsub("^%s+", ""):gsub("%s+$", ""))
 end
 
+-- Unescape a quoted literal: the reverse of escape_string below, applied to
+-- the text between the quotes.  An unknown escape keeps the backslash (so a
+-- hand-edited Windows path is not mangled).
+local function unescape_string(s)
+    return (s:gsub("\\(.)", function(c)
+        if c == "n" then return "\n" end
+        if c == "r" then return "\r" end
+        if c == "t" then return "\t" end
+        if c == "\\" then return "\\" end
+        if c == '"' then return '"' end
+        return "\\" .. c
+    end))
+end
+
+-- Index of the closing quote of a quoted literal starting at s[1] == '"', or
+-- nil when the literal is unterminated.  The scan SKIPS the character after a
+-- backslash: an escaped quote inside the value ("say \"hi\"") is data, not the
+-- terminator, and a plain find() would cut the value at the first escaped one.
+local function closing_quote_index(s)
+    local index = 2
+    while index <= #s do
+        local c = s:sub(index, index)
+        if c == "\\" then
+            index = index + 2
+        elseif c == '"' then
+            return index
+        else
+            index = index + 1
+        end
+    end
+    return nil
+end
+
 -- Parse one scalar literal: true/false/yes/no/on/off -> boolean, integer or
 -- float -> number (with sign), otherwise keep as string.  Numbers use Lua's
 -- tonumber so we accept plain decimal integers and simple floats.
+--
+-- A value wrapped in double quotes is a STRING LITERAL and is taken verbatim
+-- (escapes resolved, no trimming, no numeric/boolean coercion).  That form is
+-- what makes a command survive a round trip when it carries a newline, a
+-- leading/trailing space, or text that would otherwise read back as a number.
+-- Bare values keep the historical meaning, so files written before quoted
+-- literals existed still load exactly as they did.
 local function parse_value(raw)
     local v = trim(raw)
     if v == "" then
         return nil
+    end
+    if v:sub(1, 1) == '"' then
+        local closing = closing_quote_index(v)
+        if closing then
+            return unescape_string(v:sub(2, closing - 1))
+        end
+        -- Unterminated quote: fall through to the bare rules rather than
+        -- dropping the value, so a hand-edited file still yields something.
     end
     local low = v:lower()
     if low == "true" or low == "yes" or low == "on" then
@@ -43,9 +91,57 @@ local function parse_value(raw)
     return v
 end
 
--- Serialize a value back to a string.  Strings are written raw (no quotes) in
--- this minimal format; meaning is preserved because parse_value only converts
--- numeric/boolean tokens.
+-- Does this string need the quoted form to read back as itself?
+--
+-- Bare is the historical format and stays the default, so an ordinary value
+-- ("COM3", "115200", a path) keeps the file readable and the diff quiet.  The
+-- quoted form is required when the bare form would be re-read as something
+-- else:
+--   * an embedded newline ends the line early -- the rest of the command would
+--     be parsed as new keys, corrupting the file (the send history stores whole
+--     multi-line commands, so this is the case that matters);
+--   * leading/trailing whitespace is trimmed away by parse_value, and a
+--     command that needs a trailing space (or a multi-line block's indent)
+--     would come back changed;
+--   * a value that looks like a number or a boolean comes back as that type.
+local function needs_quotes(s)
+    if s == "" then
+        return true
+    end
+    if s ~= trim(s) then
+        return true
+    end
+    if s:find("\n", 1, true) or s:find("\r", 1, true) then
+        return true
+    end
+    if s:find('"', 1, true) or s:find("\\", 1, true) then
+        return true
+    end
+    local low = s:lower()
+    if low == "true" or low == "false" or low == "yes" or low == "no" or
+       low == "on" or low == "off" then
+        return true
+    end
+    if s:match("^[+-]?%d+$") or s:match("^[+-]?%d*%.?%d+$") then
+        return true
+    end
+    return false
+end
+
+local function escape_string(s)
+    return (s:gsub("[\\\n\r\t\"]", function(c)
+        if c == "\\" then return "\\\\" end
+        if c == "\n" then return "\\n" end
+        if c == "\r" then return "\\r" end
+        if c == "\t" then return "\\t" end
+        return '\\"'
+    end))
+end
+
+-- Serialize a value back to a string.  Ordinary strings stay raw (no quotes)
+-- in this minimal format; meaning is preserved because parse_value only
+-- converts numeric/boolean tokens.  Strings that would not survive that
+-- treatment are written as quoted literals -- see needs_quotes.
 local function dump_value(v)
     if type(v) == "boolean" then
         return v and "true" or "false"
@@ -53,7 +149,11 @@ local function dump_value(v)
     if type(v) == "number" then
         return tostring(v)
     end
-    return tostring(v)
+    local s = tostring(v)
+    if not needs_quotes(s) then
+        return s
+    end
+    return '"' .. escape_string(s) .. '"'
 end
 
 local function is_ignored(line)
@@ -160,13 +260,36 @@ end
 
 function M.save(path, data)
     local text = M.serialize(data)
-    local f, err = io.open(path, "wb")
+    -- Write a sibling file and rename it over the target, never the target
+    -- itself: io.open(path, "wb") truncates first, so a process killed (or a
+    -- disk that fills) between the truncate and the close leaves the user with
+    -- a DESTROYED config -- strictly worse than the change not being saved.
+    -- The temp file is a sibling so the rename cannot cross a volume, and the
+    -- rename is attempted FIRST because it is the atomic path everywhere but
+    -- Windows (where it refuses an existing destination).
+    local tmp = path .. ".tmp"
+    local f = io.open(tmp, "wb")
     if not f then
         return false
     end
-    f:write(text)
+    local wrote = f:write(text)
     f:close()
-    return true
+    if not wrote then
+        -- A partial temp file must not be mistaken for a config later.
+        os.remove(tmp)
+        return false
+    end
+    if os.rename(tmp, path) then
+        return true
+    end
+    os.remove(path)
+    if os.rename(tmp, path) then
+        return true
+    end
+    -- Both renames failed: the target is gone but the full text is still in
+    -- the temp file.  Leave it there (do NOT clean up) so the settings are
+    -- recoverable by hand, and report the failure.
+    return false
 end
 
 --[[-------------------------------------------------------------------------

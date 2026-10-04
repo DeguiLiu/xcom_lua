@@ -32,16 +32,16 @@ end
 -- 1) The module loads on Linux (cdef + layout self-check run at require time).
 --    require() already succeeded above; assert the size pins are present.
 ok("SIZEOF table present", type(x.SIZEOF) == "table")
-eq("sizeof snapshot pinned", x.SIZEOF.snapshot, 84)
+eq("sizeof snapshot pinned", x.SIZEOF.snapshot, 88)
 eq("sizeof portconfig pinned", x.SIZEOF.port_config, 32)
 eq("sizeof error pinned", x.SIZEOF.error, 268)
 eq("sizeof portinfo pinned", x.SIZEOF.port_info, 420)
 
--- 2) version packing (v1.6.0 -> 0x010600).  This must track xcom.h's
+-- 2) version packing (v1.7.0 -> 0x010700).  This must track xcom.h's
 -- XCOM_VERSION_MAJOR/MINOR/PATCH: the cdef and the size pins above already
 -- describe the v1.6 layout, so a stale constant here would make a capability
 -- gate compare against the wrong DLL version.
-eq("packed version 010600", string.format("%06x", x.packed_version()), "010600")
+eq("packed version 010700", string.format("%06x", x.packed_version()), "010700")
 eq("constant ok", x.ok, 0)
 eq("constant full", x.err_full, -5)
 eq("port open", x.port_open, 2)
