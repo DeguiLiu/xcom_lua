@@ -158,6 +158,9 @@ M.cbs = {
 M.wm = {
     WM_CREATE = 0x0001,
     WM_DESTROY = 0x0002,
+    -- Sent before the handle exists; CreateWindowExA aborts the creation when
+    -- the class WndProc answers FALSE to it (see waveform.lua's dispatch).
+    WM_NCCREATE = 0x0081,
     WM_SETTEXT = 0x000C,
     WM_SETFONT = 0x0030,
     WM_GETTEXT = 0x000D,

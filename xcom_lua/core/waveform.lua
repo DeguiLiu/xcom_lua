@@ -188,6 +188,15 @@ local function dispatch(msg, wparam, lparam)
     if not s then return 0 end
     local w = require("win32")
     local wm = w.wm
+    -- WM_NCCREATE is delivered while CreateWindowExA is still running, i.e.
+    -- before s.hwnd holds anything.  Falling through to DefWindowProcA below
+    -- would call it with a NULL handle, answer FALSE, and cancel the whole
+    -- creation -- show() returned false and the popup never appeared (masked
+    -- until now by the LoadCursorA raise above it).  Creation must be told to
+    -- continue.
+    if msg == wm.WM_NCCREATE then
+        return 1
+    end
     if msg == wm.WM_PAINT then
         local ps = ffi.new("PAINTSTRUCT")
         local hdc = w.gdi32.BeginPaint(s.hwnd, ps)
@@ -200,8 +209,14 @@ local function dispatch(msg, wparam, lparam)
     elseif msg == wm.WM_ERASEBKGND then
         return 1  -- _paint fills everything; skipping avoids flicker
     elseif msg == wm.WM_SIZE then
-        s.width = bit.band(lparam, 0xFFFF)
-        s.height = bit.rshift(lparam, 16)
+        -- lparam arrives as an intptr_t cdata, and bit.band/rshift on cdata
+        -- return 64-bit cdata rather than a Lua number -- s.width then fed
+        -- math.floor() in the paint path ("number expected, got cdata").
+        -- Unpack LOWORD/HIWORD with integer arithmetic, the same way
+        -- ui/window.lua:on_size does.
+        local lp = tonumber(lparam) or 0
+        s.width = lp % 65536
+        s.height = math.floor(lp / 65536) % 65536
         if s.width == 0 then s.width = DEFAULT_W end
         if s.height == 0 then s.height = DEFAULT_H end
         w.user32.InvalidateRect(s.hwnd, nil, 0)
@@ -316,7 +331,10 @@ function M._paint(s, hdc)
     local bg_brush = g.CreateSolidBrush(COLOR.bg)
     local rc = ffi.new("RECT")
     rc.left, rc.top, rc.right, rc.bottom = 0, 0, width, height
-    g.FillRect(mem, rc, bg_brush)
+    -- FillRect is exported by USER32, not GDI32 (a Win16 legacy: it takes an
+    -- HDC but lives with the window manager), so calling it on the gdi32
+    -- namespace fails symbol resolution and took the whole paint down.
+    w.user32.FillRect(mem, rc, bg_brush)
     g.DeleteObject(bg_brush)
 
     -- ---- grid ----------------------------------------------------------
@@ -649,7 +667,14 @@ function M.show()
             wc.lpfnWndProc = WndProcCallback
             wc.lpszClassName = WND_CLASS
             wc.hInstance = w.kernel32.GetModuleHandleA(nil)
-            wc.hCursor = w.user32.LoadCursorA(nil, w.gdi.IDC_ARROW)
+            -- MakeIntResource: the second LoadCursorA argument is an LPCTSTR
+            -- that Win32 only ever compares with the predefined atoms for the
+            -- low 16 bits, so the integer atom is cast to a pointer, exactly
+            -- as the MAKEINTRESOURCE macro does.  Passing the bare number
+            -- fails LuaJIT's FFI conversion ("cannot convert 'number' to
+            -- 'const char *'"), which made every wave.show() raise.
+            wc.hCursor = w.user32.LoadCursorA(
+                nil, ffi.cast("const char*", w.gdi.IDC_ARROW))
             w.user32.RegisterClassA(wc)
             s.class_registered = true
         end

@@ -12,6 +12,16 @@ for any pixel source.
 
 local M = {}
 
+-- Resolved at the TOP of the file on purpose: M.save below tests `ffi` with
+-- `if jit and ffi`, and a `local` declared after that function compiles those
+-- reads to GGET of the (nonexistent) global, so every save answered
+-- "ffi unavailable" -- the wave.snapshot BMP export silently never wrote a
+-- file.  tests/lint_fields.lua now scans this file too.
+local ffi = require("ffi")
+-- Snapshot paths can carry CJK (wave.snapshot(path) is called from a script or
+-- a save dialog), so the write goes through the UTF-8 path boundary.
+local fs_path = require("fs_path")
+
 local function u16(v)
     return string.char(v % 256, math.floor(v / 256) % 256)
 end
@@ -36,13 +46,10 @@ function M.save(path, width, height, pixels, stride)
     return nil, "ffi unavailable"
 end
 
-local ffi = require("ffi")
-
 function M._save_ffi(path, width, height, pixels, stride)
-    local f, err = io.open(path, "wb")
+    local f, err = fs_path.open(path, "wb")
     if not f then return nil, tostring(err) end
 
-    local row_bytes = width * 3
     local data_size = stride * height
     -- BITMAPFILEHEADER: 'BM', size, reserved, reserved, offset-to-bits.
     local header = table.concat({
@@ -66,12 +73,15 @@ function M._save_ffi(path, width, height, pixels, stride)
     f:write(header)
     f:write(info)
     -- Pixel rows: source is top-down; BMP files are bottom-up, so write the
-    -- LAST source row first.  Bulk-copy each row in one write (stride
-    -- padding included — the row's trailing pad bytes are whatever GetDIBits
-    -- left there; harmless in the file, keeps this branch-free).
-    local base = 0
+    -- LAST source row first.  Each row is written with its full STRIDE
+    -- (row_bytes + pad), because the format -- and the biSizeImage written
+    -- above -- counts stride bytes per row: writing only row_bytes produced a
+    -- file shorter than its own header claimed (66 vs 70 bytes at 2x2, the
+    -- case where width*3 is not 4-byte aligned), which viewers render as a
+    -- mangled bottom row.  The trailing pad bytes are whatever GetDIBits left
+    -- there; harmless in the file and keeps this branch-free.
     for row = height - 1, 0, -1 do
-        f:write(ffi.string(pixels + row * stride, row_bytes))
+        f:write(ffi.string(pixels + row * stride, stride))
     end
     f:close()
     return true
