@@ -16,11 +16,22 @@
 
 package.path = "./ui/?.lua;./core/?.lua;" .. package.path
 
-local LUAJIT = arg[-1] or "luajit"
+-- Bytecode dumper.  XCOM_LUAJIT wins so a Windows developer can point the gate
+-- at a stock LuaJIT: the shipped runtime/luvjit.exe is built without jit.bcs
+-- and therefore cannot dump bytecode (see dump_supported()).
+local LUAJIT = os.getenv("XCOM_LUAJIT") or arg[-1] or "luajit"
+-- Quote for io.popen by hand: string.format("%q") escapes backslashes, which
+-- cmd.exe cannot resolve, so every Windows path failed the gate while POSIX
+-- paths (no backslashes) hid the bug.
+local function shq(s)
+    return '"' .. s .. '"'
+end
+local NULL_DEV = package.config:sub(1, 1) == "\\" and "nul" or "/dev/null"
 local FILES = {
     "main.lua",
     "core/ansi.lua", "core/charset.lua", "core/config.lua",
-    "core/receive_copy.lua", "core/script_engine.lua", "core/serial_sim.lua",
+    "core/bmp_writer.lua", "core/fs_path.lua", "core/receive_copy.lua",
+    "core/script_engine.lua", "core/serial_sim.lua",
     "core/view_model.lua", "core/waveform.lua", "core/xcom_ffi.lua",
     "ui/connection_panel.lua", "ui/controls.lua", "ui/imgui_bridge.lua",
     "ui/receive_view.lua", "ui/send_panel.lua", "ui/status_bar.lua",
@@ -56,7 +67,7 @@ end
 -- Check 1: undefined global reads, via the GGET opcodes in the bytecode dump.
 -- --------------------------------------------------------------------------
 local function check_globals(path)
-    local pipe = io.popen(string.format("%q -bl %q 2>/dev/null", LUAJIT, path))
+    local pipe = io.popen(shq(LUAJIT) .. " -bl " .. shq(path) .. " 2>" .. NULL_DEV)
     if not pipe then
         fail("%s: could not run %q -bl", path, LUAJIT)
         return
@@ -72,7 +83,7 @@ local function check_globals(path)
     if not (ok == true and (code or 0) == 0) then
         -- The diagnostic was suppressed above; re-run to capture it.
         local err = io.popen(
-            string.format("%q -bl %q 2>&1 >/dev/null", LUAJIT, path))
+            shq(LUAJIT) .. " -bl " .. shq(path) .. " 2>&1 >" .. NULL_DEV)
         local detail = err and err:read("*a") or ""
         if err then
             err:close()
@@ -86,6 +97,89 @@ local function check_globals(path)
         if not BUILTINS[name] and not seen[name] then
             seen[name] = true
             fail("%s reads undefined global %q (forward reference or typo?)", path, name)
+        end
+    end
+end
+
+-- --------------------------------------------------------------------------
+-- Probe: can this interpreter produce a `luajit -bl` listing at all?  Checked
+-- once, on the first listed file.  A stripped driver answers "unknown luaJIT
+-- command or jit.* modules not installed", and reading that as "the file does
+-- not compile" prints 18 bogus syntax errors on Windows and buries the one
+-- real finding -- exactly how a GGET regression reached CI.  A usable dump
+-- starts with "main <path:0,0>".
+-- --------------------------------------------------------------------------
+local dump_ok
+local function dump_supported()
+    if dump_ok == nil then
+        local pipe = io.popen(shq(LUAJIT) .. " -bl " .. shq(FILES[1]) .. " 2>&1")
+        local first = (pipe and pipe:read("*l")) or ""
+        if pipe then
+            pipe:close()
+        end
+        dump_ok = first:match("^main%s*<") ~= nil
+    end
+    return dump_ok
+end
+
+-- --------------------------------------------------------------------------
+-- Check 1b: file-scope helper assignment that has no `local` in front of it.
+--
+-- Pure text, so it runs on any interpreter, including the dump-less luvjit.exe.
+-- It catches the same defect class as the GGET scan one step earlier: this
+-- codebase forward-declares its file-scope helpers (`local a, b,` at the top,
+-- bodies assigned near the bottom).  Add a helper at the bottom and forget the
+-- top, and every read compiles to GGET -- nil at call time, so the feature
+-- silently does nothing -- plus a global in _G that another module can
+-- overwrite.  That is precisely how ui/window.lua lost unique_port_by_hwid.
+-- --------------------------------------------------------------------------
+-- Consumes the line break.  Matching only the body ("([^\r\n]*)") leaves the
+-- newline in the subject, so LuaJIT gmatch yields an extra empty string per
+-- line: line numbers double, and a wrapped `local a, b,` continuation lands
+-- on the empty match and is missed.
+local function each_line(text)
+    return (text .. "\n"):gmatch("([^\r\n]*)\r?\n")
+end
+
+local function local_declared_names(text)
+    local lines = {}
+    for line in each_line(text) do
+        lines[#lines + 1] = line
+    end
+    local declared, i = {}, 1
+    while i <= #lines do
+        local line = lines[i]
+        local rest = line:match("^local%s+(.-)%s*=") or line:match("^local%s+(.+)$")
+        if rest and not line:match("^local%s+function") then
+            for name in rest:gmatch("[%a_][%w_]*") do
+                declared[name] = true
+            end
+            while i <= #lines and lines[i]:match(",%s*$") do
+                i = i + 1
+                for name in (lines[i] or ""):gmatch("[%a_][%w_]*") do
+                    declared[name] = true
+                end
+            end
+        end
+        i = i + 1
+    end
+    return declared
+end
+
+local function check_file_scope_globals(path)
+    local text = read_file(path)
+    if not text then
+        return
+    end
+    local declared = local_declared_names(text)
+    local lineno = 0
+    for line in each_line(text) do
+        lineno = lineno + 1
+        local name = line:match("^([%a_][%w_]*)%s*=%s*function")
+        if name and not declared[name] then
+            fail("%s:%d assigns file-scope %q with no `local %s` declaration"
+                 .. ": reads of it compile to GGET (nil) and it leaks a global",
+                 path, lineno, name, name)
         end
     end
 end
@@ -148,7 +242,16 @@ local function check_win32_fields()
 end
 
 for _, path in ipairs(FILES) do
-    check_globals(path)
+    check_file_scope_globals(path)
+end
+if dump_supported() then
+    for _, path in ipairs(FILES) do
+        check_globals(path)
+    end
+else
+    print("SKIP  GGET scan: " .. LUAJIT .. " cannot dump bytecode (no jit.bcs)."
+          .. "  Set XCOM_LUAJIT to a stock LuaJIT to enable it; Check 1b above"
+          .. " covers the same defect class statically, on any interpreter.")
 end
 check_win32_fields()
 

@@ -19,6 +19,20 @@ end
 
 -- ---- helpers: temp script dir --------------------------------------------
 local script_dir = "./_test_scripts"
+local function rm_rf(path)
+    local req = uv.fs_scandir(path)
+    if not req then return end
+    while true do
+        local name = uv.fs_scandir_next(req)
+        if not name then break end
+        uv.fs_unlink(path .. "/" .. name)
+    end
+    uv.fs_rmdir(path)
+end
+-- Sweep first: the "scan adds new script" assertion below is count-based, so a
+-- script left behind by an earlier aborted run (the suite builds its own
+-- scripts here) would falsify it.  Same helper runs again at the end.
+rm_rf(script_dir)
 uv.fs_mkdir(script_dir, 493)
 
 local function write_script(name, text)
@@ -148,6 +162,28 @@ local r1 = engine:process_rx("begin half")
 eq("partial held", r1, nil)  -- nothing complete to show yet
 local r2 = engine:process_rx("HIDE end\nnext\n")
 eq("joined line dropped, next kept", r2, "next\n")
+-- framed: the display bridge already closed the frame, so an unterminated
+-- emit is decided now instead of being held a second time.
+eq("framed partial is decided",
+    engine:process_rx("visible tail", nil, true), "visible tail")
+eq("framed partial dropped", engine:process_rx("xxHIDE", nil, true), nil)
+-- Force-flush contract (unframed callers): an idle gap publishes the held
+-- partial line via pump -> flush_pending, and the NEXT batch must carry it.
+-- The order matters: process_rx used to clear pending_output at the top and
+-- only re-read it after the hooks, so the flushed line was silently lost.
+eq("unterminated line held", engine:process_rx("show me"), nil)
+engine.last_rx_ms = uv.now() - 1000    -- pretend the 200 ms idle gap elapsed
+engine:pump()
+eq("idle flush published the held line", engine.pending_output, "show me")
+eq("next batch carries the flushed line", engine:process_rx("tail\n"),
+   "show metail\n")
+-- ... and a batch the hooks DROP must not take the flushed line with it.
+eq("second unterminated line held", engine:process_rx("kept me"), nil)
+engine.last_rx_ms = uv.now() - 1000
+engine:pump()
+eq("flushed line published again", engine.pending_output, "kept me")
+eq("dropped batch still shows the flushed line",
+   engine:process_rx("top SECRET bottom\n"), "kept me")
 
 -- ---- 6) highlight rule aggregation -----------------------------------------
 write_script("hl.lua", [[
@@ -214,16 +250,6 @@ local r = engine:process_rx(huge)  -- > 8 KiB pending, no newline
 eq("oversize pending flushed as visible line", r, huge)
 
 -- ---- cleanup ---------------------------------------------------------------
-local function rm_rf(path)
-    local req = uv.fs_scandir(path)
-    if not req then return end
-    while true do
-        local name = uv.fs_scandir_next(req)
-        if not name then break end
-        uv.fs_unlink(path .. "/" .. name)
-    end
-    uv.fs_rmdir(path)
-end
 engine:shutdown()
 rm_rf(script_dir)
 

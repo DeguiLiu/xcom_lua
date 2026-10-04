@@ -218,6 +218,14 @@ eq("C3 mid-send: still <=1 live timer (no accumulation)", pump_c.live_count(), 1
 engine_c:dispatch_ui_event("send_file.lua:file", "click", "stop")
 eq("C4 Stop: live timers drained to 0", pump_c.live_count(), 0)
 ok("C5 Stop: Send button restored", spec_of(rec_c):find("button:start:Send", 1, true) ~= nil)
+-- Stop deliberately KEEPS the fd: Resume reads from the same handle, and a
+-- reopened file would lose the position of a file another process is still
+-- writing (see the stop branch in scripts/send_file.lua).  That single
+-- outstanding open/close pair is the contract, so it is asserted here instead
+-- of being left to look like a leak in the accounting further down.
+eq("C6 Stop keeps the handle open for Resume", fs.open - fs.close, 1)
+engine_c:shutdown()   -- host-side sweep at teardown (same as engine_b)
+eq("C7 shutdown sweeps the retained handle", fs.open, fs.close)
 
 -- ===========================================================================
 -- D) port closed mid-send -> running=false, Send restored, logged
