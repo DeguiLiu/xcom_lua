@@ -284,3 +284,29 @@
   - 接线：`_imgui_send_single` 只在 `core_send` **成功**后 `_remember_send_command`（被拒的发送不进历史；重复不重推、不标脏）；`_init_imgui` 播种；`_save_config` 写 `[send] history_count` + `history.N`；main.lua 读回（count 为上界，防旧键复活）。DLL 侧新增 `xcom_imgui_set_send_history(packed, count)`（NUL 分隔，同 highlight rules 的编组方式）。
 - **顺带修掉一类真 bug（INI 不转义）**：`core/config.lua` 过去把字符串**裸写**，而 `parse_value` 会 trim 首尾空白、把 `1234`/`true` 读回成数字/布尔；**含换行的值会把后面几行变成新键，直接损坏配置文件**。现改为「需要时才加引号 + 转义」（`\n \r \t \\ \"`），裸格式保持默认以保证旧文件与 diff 不变；读取侧对引号值原样取用、对裸值沿用历史语义（**向后兼容**）。新增 `test_config` 12)/13)/14)：原子写、带换行/首尾空格/引号/反斜杠/CJK/空串往返、旧的裸格式仍按原义解析、未闭合引号不吞值。**写这套测试时抓到我自己第一版的 bug**：闭合引号扫描没跳过 `\"`，`say "hi"` 被截成 `say \` —— 已改为逐字符跳过转义。
 - **测试基线**：Lua **26 套件全绿**（新增 test_send_history 40；config 41→60；multi_send 179→200；tx_echo 23→33；rx_display_caps 43）；宿主 C++ **11/11**；语法门禁 32 OK / 0 FAIL（含 bridge 交叉检查）；`git diff --check` 干净；`check_dll_exports.sh` 预期列出 **4 个缺失导出**（font_prefs ×2、selection_dragging、set_send_history）。
+
+### 本轮（第 12 轮）：拖选冻结给出进程内证明，2026-10-04
+> 用户要求：用 `xcom_imgui_selection_dragging` 做"贴底拖选冻结"的断言，不要再靠截图猜。
+- **结论：冻结行为成立，且这套断言真的有鉴别力。** `tests/e2e_drag_freeze.lua` 打开真实窗口 + VIRTUAL 模拟器
+  （`sim:set_rate(8192)`），注入 `SetCursorPos` + `mouse_event` 真 OS 消息走完手势，再从渲染帧内部读数：
+  按住 55 个采样 **chased +0px**，同期 scroll_max 长了 2730~4605px（约 150~250 行到）；松手后 moved 0px（尾部已在
+  4.3k px 之外）；滚轮回底后跟随恢复（跟了 1215~1230px，24/24 采样都在尾部）；选区 504~505 B。3/3 轮 PASS。
+- **反证（关键，否则 PASS 无意义）**：删掉 `if (receive_follow_tail_ && !ImGui::IsMouseDown(Left))` 的门控重编，
+  同一条检查立刻 chased **+2700px**（恰等于尾部增长量）、松手后仍被拖走 780px、选区涨到 11844 B，两条断言同时红。
+- **新增 3 个只读导出**（bridge `xcom_imgui_get_receive_rect/_scroll/_selection`，Lua `imgui_bridge.lua:receive_rect/receive_scroll/receive_selection`，
+  全部 `optional_export` 探测，旧 DLL 返回 nil 时驱动直接报"rebuild xcom_imgui.dll"而不是拿陈旧值凑 PASS）：
+  像素截图无法区分"点击没落进接收区"和"拖拽正常"（两者画面都不动、都还没高亮）——上一轮像素探针的
+  `interaction=False` 就是坐标没命中的假阴性。判据必须来自帧内状态。
+- **两个坑（实测踩过，写进文档）**：
+  1. 导出的矩形在 ImGui 空间 = **客户区**坐标，`SetCursorPos`/屏幕像素要 `ClientToScreen`；漏了就点在窗口外。
+  2. `WindowFromPoint` 的 POINT 是**按值**形参，LuaJIT FFI 无法表达（`'struct' cannot be indexed with 'number'`），
+     所以"点是否属于本窗口"改由"是否进入拖拽态"证明（4 个候选点扫，未进入就换点），顺带筛掉落在窗口上却被别的控件吃掉的情况；
+     按下前还要重新置顶一次——注入的点击跟随命中测试，不跟随我们的意图。
+- **按下后 0~1 个采样（0~135px）的追视是消息排队延迟**：那一刻 DLL 还不知道键已下，门控无从生效。驱动把它单列成
+  "engage 前的合法位移"（`ENGAGE_TIMEOUT=20`），不计失败也不静默吞掉——早期版本把它算进断言，结果同一条检查一绿一红。
+- **纠正历史错误断言**：`ui/window.lua` 的 `_smoke_env_hooks` 头注释与 `scripts/smoke_ui.lua` 都写着"合成鼠标到不了 ImGui 后端"，
+  实为错误（后端吃 `WM_MOUSEMOVE`/`WM_LBUTTONDOWN`，`Window:dispatch()` 每条消息先转 `imgui:on_wndproc`）。
+  两处改为"用 env 而非点击是为了不依赖窗口位置/DPI/桌面状态"，并指向新的 E2E。`docs/receive-selection.md` 同步作废旧条并补上"拖选冻结的进程内验证"一节。
+- **门禁**：MSVC 重编 `xcom_imgui.dll`（894976 B）已入库，`dumpbin` 核对新导出全部存在；Lua 26 套件 **23 OK**（失败的 3 项 = 本机环境项：
+  `test_shipped_scripts` 类 Unix 目录列举、`test_rx_charset_batch` 本机有真 DLL、`test_wave_ring` `os.clock` 粒度，与本轮无关）；
+  宿主 C++ ctest **11/11**；`lint_fields` clean（18 files）；ABI layout pins OK。

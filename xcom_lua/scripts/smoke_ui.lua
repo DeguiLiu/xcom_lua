@@ -2,8 +2,10 @@
 -- @name 示波器自动化冒烟
 -- @desc 自动生成正弦/锯齿两路波形驱动示波器面板，供截图冒烟验证渲染链路。
 --
--- Automated screenshot verification cannot synthesize mouse clicks into the
--- ImGui backend, so this script drives the scope from data instead: when
+-- Automated screenshot verification drives the scope from data rather than from
+-- clicks: injection does reach the backend (tests/e2e_drag_freeze.lua proves a
+-- full drag-select that way), but it needs the window raised and its coordinates
+-- converted, while data needs neither.  When
 -- enabled (Lua script console, config [script] enabled, or the XCOM_SMOKE_*
 -- env route in window.lua:_smoke_env_hooks), it pushes a 2-channel signal
 -- every 20 ms through the same wave.push surface wave_demo.lua uses

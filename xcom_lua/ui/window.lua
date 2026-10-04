@@ -3053,11 +3053,16 @@ end
 -- ---------------------------------------------------------------------------
 -- Headless UI smoke hooks (automated screenshot verification).
 --
--- Synthetic mouse input cannot reach the ImGui backend, so a verification
--- script forces the floating windows open through env vars instead of
--- clicks.  Both branches are strict no-ops unless the env var equals "1",
--- so normal runs see zero behavior change.  Called once from Window:start()
--- after the imgui bridge and the _scope_open/_settings_open mirrors exist.
+-- Env vars rather than clicks because a verification script must not depend on
+-- where the window happens to sit, on the DPI scale, or on what else is on the
+-- desktop.  Injecting a real mouse event DOES reach the backend -
+-- tests/e2e_drag_freeze.lua drives a whole drag-select gesture that way and
+-- asserts it from inside the render loop - but it needs the window raised, the
+-- client-to-screen conversion and a z-order that nothing steals, which a
+-- screenshot harness has no business depending on.  Both branches here are
+-- strict no-ops unless the env var equals "1", so normal runs see zero behavior
+-- change.  Called once from Window:start() after the imgui bridge and the
+-- _scope_open/_settings_open mirrors exist.
 -- ---------------------------------------------------------------------------
 
 function Window:_smoke_env_hooks()
@@ -3081,8 +3086,8 @@ function Window:_smoke_env_hooks()
         self._scope_open = false
     end
     if os.getenv("XCOM_SMOKE_OPEN") == "1" and self._sim_active then
-        -- Synthetic clicks cannot reach ImGui, so the end-to-end simulator
-        -- check opens the VIRTUAL session programmatically: stamp the combo
+        -- The end-to-end simulator check opens the VIRTUAL session
+        -- programmatically, so it does not care where the window sits: stamp the combo
         -- selection exactly like a user pick would (_serial_config reads
         -- _imgui_port first) and issue the same core_open the "打开" button
         -- routes through.  The connected edge in _render_ui_state then arms

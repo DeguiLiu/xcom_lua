@@ -149,6 +149,7 @@ O(1) 零猜测。
   `rx_bytes`、`pool_exhausted=0` 正常。
 - 在线 E2E：`XCOM_SMOKE_OPEN=1 XCOM_SMOKE_SIM_PROFILE=text` 启动，日志区渲染模拟数据，无报错。
 - **拖选交互本身需人工验证一次**（合成鼠标点击无法到达 ImGui Win32 后端）：
+  > 注（2026-10-04）：本条作废——手势已由 `tests/e2e_drag_freeze.lua` 进程内自动化证明，见文末「拖选冻结的进程内验证」。
   滚动流中拖选 → 松开 → 高亮应随文本上滚直至不可见；按住拖动期间视图应停住。
 - 已补（本轮）：**边缘自动滚动**（拖到可视区上/下边缘每帧滚一行，选区可越过屏幕）、
   **双击选词 / 三击选行**（`receive_selection.hpp` + 主机测试）、**Shift+单击延伸**。
@@ -165,3 +166,56 @@ O(1) 零猜测。
   （`QueueReceiveCopy`），由 Lua 侧 `service_receive_copy` 用 `core/receive_copy.lua` 的纯函数
   `strip_timestamps` 按「复制时去除时间戳」开关处理后写剪贴板；该开关默认关闭、经
   `[display] strip_timestamp_on_copy` 持久化。
+
+## 拖选冻结的进程内验证（2026-10-04，自动化）
+
+**结论：合成鼠标能送达 ImGui Win32 后端，"拖选冻结需人工验证"这一条已不成立。**
+`tests/e2e_drag_freeze.lua` 把整条手势做成了进程内断言，实测 3/3 轮全绿；反证实验（删掉门控）必红，
+说明断言真的在测东西，不是自我安慰。
+
+### 为什么截图不够
+按下点没落进接收区、和拖拽完全正常，在截图上是同一个样子（画面不动、高亮还没出现）。
+上一轮像素探针正是这样给出假阴性：`interaction=False` 只说明坐标没命中，不能说明功能坏了。
+判据必须来自渲染帧内部。
+
+### 三个只读导出（`xcom_imgui_bridge.cpp`）
+- `xcom_imgui_get_receive_rect`：接收区子窗口的矩形，唯一权威的按下点。用 layout.toml 在 Lua 里
+  反推会落到侧栏、发送框或自绘滚动条列上——三者都会吃掉点击却不进入拖拽，检查于是变成空转。
+- `xcom_imgui_get_receive_scroll`：`(scroll_y, scroll_max)`，冻结的判据就是"y 不动而 max 在长"。
+  两者在同一次帧尾捕获，Begin 已把 `Scroll.y` 钳到本帧范围，所以稳定跟随时读到的就是 `y == max`。
+- `xcom_imgui_get_receive_selection`：选区的绝对字节区间。`selection_dragging()==1` 只证明
+  "进入了拖拽态"，命中测试没落到行上时选区仍为空，所以两者都要看。
+
+### 手势怎么送进去
+`SetCursorPos` + `mouse_event` 注入的是真 OS 消息，而 ImGui 的 Win32 后端消费的正是
+`WM_MOUSEMOVE` / `WM_LBUTTONDOWN`；`Window:dispatch()` 每条消息都先转 `imgui:on_wndproc`，
+所以注入走的是和真实鼠标完全相同的状态机。两个坑都实测过：
+1. 导出的矩形在 ImGui 空间，也就是**客户区**坐标；`SetCursorPos` 要的是屏幕物理像素，
+   中间必须 `ClientToScreen`。漏掉这一步，第一次尝试就点在窗口外的空气上。
+2. `WindowFromPoint` 的 POINT 是**按值**形参，本项目的 FFI 层无法表达
+   （`'struct' cannot be indexed with 'number'`）。因此"点是否属于本窗口"改由结果证明：
+   按下后若在超时内没有进入拖拽态，就判该候选点无效并换下一个——顺带把"落在窗口上但被别的
+   控件吃掉"一起筛掉。按下前还会重新置顶一次，因为注入的跟随命中测试走，不跟随我们的意图。
+
+### 实测（`text` profile 8 KiB/s，log 矩形 733x372，窗口 920x650）
+| 阶段 | 断言 | 数据（3 轮） |
+| --- | --- | --- |
+| 前置 | 可滚动且贴底 | y=max=603~678 |
+| 按住 55 采样 | 拖拽态持续 | 55/55，选区 504~505 B |
+| 按住约 1.4 s | 视图冻结 | chased **+0px**，同期 scroll_max 长了 2730~4605px（约 150~250 行） |
+| 松手 16 采样 | 不重新吸底 | moved 0px（尾部已在 4.3k px 之外） |
+| 滚轮回底 | 重新吸底 | y=max=4728~4788 |
+| 其后 24 采样 | 跟随恢复 | 又跟了 1215~1230px，24/24 都在尾部 |
+
+按下之后那 0~1 个采样（0~135px）的位移是 OS 消息排队延迟：那一刻 DLL 还不知道按键已下，
+门控无从生效。驱动把它单独记成"进入拖拽前的合法追视"，不计入失败，也不静默吞掉。
+
+### 反证（敏感性验证）
+把 `if (runtime.receive_follow_tail_ && !ImGui::IsMouseDown(ImGuiMouseButton_Left))` 的门控删掉重编：
+chased **+2700px**（恰好等于尾部增长量），松手后仍被拖走 780px，选区一路涨到 11844 B，
+两条断言同时变红。改回原样后 3/3 轮转绿。
+
+### 运行前提
+需要带这三个导出的 `runtime/xcom_imgui.dll`；旧 DLL 上驱动直接报
+"rebuild runtime/xcom_imgui.dll"，不会拿陈旧状态凑出一个 PASS。
+`tools/check_dll_exports.sh` 负责把 cdef 与已提交二进制之间的这类漂移挡在 CI 里。
