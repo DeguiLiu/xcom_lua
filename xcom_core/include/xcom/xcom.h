@@ -67,6 +67,14 @@
  *  - XcomSnapshot gains uint32_t flow_hold_events, appended AFTER the v1.5
  *    counters. The counter already existed in the core's internal metrics
  *    (rising flow-control holds: CTS/DSR/RLSD/XOFF); this only exports it.
+ * v1.7 (2026-10-03):
+ *  - XcomSnapshot gains uint32_t modem_lines, appended AFTER flow_hold_events.
+ *    It is a level, not a counter: bit 31 set means GetCommModemStatus succeeded
+ *    on the open handle; bits 0..3 are CTS/DSR/RING/RLSD (MS_*_ON). Zero means
+ *    "no sample" (closed, virtual, or the call failed) and must not be read as
+ *    "every line is low". A caller whose struct_size stops at flow_hold_events
+ *    (84 bytes) still receives the v1.6 prefix; the new field is written only
+ *    when the caller's buffer is large enough.
  *
  *  !!! LIST_BOUNDARY HAZARD (read before changing either side) !!!
  *  XcomPortInfo has NO struct_size field (unlike XcomCreateOptions,
@@ -102,7 +110,7 @@ extern "C" {
 #endif
 
 #define XCOM_VERSION_MAJOR 1
-#define XCOM_VERSION_MINOR 6
+#define XCOM_VERSION_MINOR 7
 #define XCOM_VERSION_PATCH 0
 
 /* ---------------------------------------------------------------------------
@@ -275,6 +283,11 @@ typedef struct XcomSnapshot {
    * corruption, so it never faults the link. The matching internal metric
    * (CoreCtx::metrics.flow_hold_events) predates this export. */
   uint32_t flow_hold_events;
+  /* Live modem-input snapshot (GetCommModemStatus), appended AFTER v1.6.
+   * Not a counter. bit 31 = a sample was taken; bits 0..3 = CTS/DSR/RING/RLSD
+   * asserted. 0 = no sample. A drop of a line that was previously asserted is
+   * a hint (bridge-chip MCU power loss), never a fault by itself. */
+  uint32_t modem_lines;
 } XcomSnapshot;
 
 enum {

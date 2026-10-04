@@ -1,5 +1,5 @@
 --[[--------------------------------------------------------------------------
-core/xcom_ffi.lua - LuaJIT FFI binding for xcom_core.dll (xcom.h v1.6 ABI).
+core/xcom_ffi.lua - LuaJIT FFI binding for xcom_core.dll (xcom.h v1.7 ABI).
 
 This module ONLY declares the C ABI and loads the DLL.  It is not callable on
 Linux (no xcom_core.dll); use `luajit -bl` for syntax checking and review the
@@ -83,6 +83,9 @@ typedef struct XcomSnapshot {
     uint32_t rx_backpressure_events;
     /* v1.6 flow-control stall counter (appended; must match xcom.h) */
     uint32_t flow_hold_events;
+    /* Live modem inputs (appended). bit 31 = sample valid; bits 0..3 =
+       CTS/DSR/RING/RLSD. 0 = no sample. Must match xcom.h. */
+    uint32_t modem_lines;
 } XcomSnapshot;
 
 typedef struct XcomError {
@@ -228,11 +231,11 @@ function M.probe_enabled_by_env()
 end
 
 -- ABI version this binding is built against.  Keep in step with xcom.h's
--- XCOM_VERSION_MAJOR/MINOR/PATCH: the cdef below already declares the v1.6
--- fields and the size pins assert the v1.6 layout, so a stale value here would
+-- XCOM_VERSION_MAJOR/MINOR/PATCH: the cdef below declares the v1.7 fields and
+-- the size pins assert the v1.7 layout, so a stale value here would
 -- make any future capability gate under-report the loaded DLL.
 M.version_major = 1
-M.version_minor = 6
+M.version_minor = 7
 M.version_patch = 0
 
 -- VERSION: (major << 16) | (minor << 8) | patch, as returned by xcom_version().
@@ -406,8 +409,20 @@ function M.list_ports(opts)
     if not l then
         return {}
     end
-    local probe = (type(opts) == "table" and opts.probe == true) or
-                  M.probe_enabled_by_env()
+    -- An explicit opts.probe decides BOTH ways.  The 1 Hz backstop passes
+    -- false deliberately ("NEVER probe": it is a cheap name-set check, not a
+    -- device probe), and the old `opts.probe == true or env` form let
+    -- XCOM_PORT_PROBE=1 override that -- turning the backstop into "exclusively
+    -- open every present port once a second", which is both the most expensive
+    -- form of enumeration and a DTR pulse that can reset an auto-reset board.
+    -- The env flag therefore only speaks when the caller expressed no
+    -- preference (xcom.list_ports() with no options).
+    local probe
+    if type(opts) == "table" and opts.probe ~= nil then
+        probe = opts.probe == true
+    else
+        probe = M.probe_enabled_by_env()
+    end
     local flags = probe and M.PROBE_BUSY or 0
     local cap = M.MAX_PORT_LIST
     local count = ffi.new("uint32_t[1]")
@@ -756,6 +771,7 @@ function M.get_snapshot(h)
     t.rx_loss_offset = s.rx_loss_offset
     t.rx_backpressure_events = s.rx_backpressure_events
     t.flow_hold_events = s.flow_hold_events
+    t.modem_lines = s.modem_lines
     return t
 end
 
@@ -801,7 +817,7 @@ local SIZEOF = {
     create_options   = 8,
     port_config      = 32,
     display_options  = 16,
-    snapshot         = 84,
+    snapshot         = 88,
     error            = 268,
     port_info        = 420,
 }

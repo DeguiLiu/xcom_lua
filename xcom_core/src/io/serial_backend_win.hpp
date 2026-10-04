@@ -236,6 +236,14 @@ struct SerialPortOptions final {
 // lpErrors bitmask and `cb_in_que`/`cb_out_que` the driver queue depths, both
 // for the diagnostic record. `hold_events` is 1 only on a rising edge into a
 // Cts/Dsr/Rlsd/Xoff flow-control hold, so a steady handshake does not repeat.
+// GetCommModemStatus packed into XcomSnapshot::modem_lines. Bit 31 means the
+// call succeeded; a zero word means "no sample", not "all lines low".
+constexpr std::uint32_t kModemCts = 1U << 0U;    // MS_CTS_ON
+constexpr std::uint32_t kModemDsr = 1U << 1U;    // MS_DSR_ON
+constexpr std::uint32_t kModemRing = 1U << 2U;   // MS_RING_ON
+constexpr std::uint32_t kModemRlsd = 1U << 3U;   // MS_RLSD_ON
+constexpr std::uint32_t kModemValid = 1U << 31U;
+
 struct SerialLineStatus final {
     std::uint32_t framing_errors = 0U;   // CE_FRAME
     std::uint32_t parity_errors = 0U;    // CE_RXPARITY
@@ -245,6 +253,7 @@ struct SerialLineStatus final {
     std::uint32_t error_flags = 0U;      // raw ClearCommError lpErrors
     std::uint32_t cb_in_que = 0U;        // COMSTAT.cbInQue
     std::uint32_t cb_out_que = 0U;       // COMSTAT.cbOutQue
+    std::uint32_t modem_lines = 0U;      // kModem* packed sample (0 = not taken)
 };
 
 // Outcome of one manual modem-line write. A bare void made three different
@@ -408,6 +417,9 @@ private:
     // Arming happens in open() before the read thread starts, so no concurrent
     // access is possible.
     std::uint32_t last_holds_ = 0U;
+    // Previous GetCommModemStatus packing, so a steady line does not re-enter
+    // the owner callback. Read-thread-only, armed with last_holds_ in open().
+    std::uint32_t last_modem_ = 0U;
 };
 
 }  // namespace xcom

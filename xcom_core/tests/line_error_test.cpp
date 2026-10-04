@@ -72,8 +72,8 @@ int main()
     // 80. Pinning the version here is deliberate - the assertion is the
     // tripwire that makes an ABI change require someone to re-read this list
     // rather than let the layout drift unnoticed.
-    CHECK(xcom_version() == 0x010600U, "version is 1.6.0");
-    CHECK(sizeof(XcomSnapshot) == 84U, "snapshot ends at 84 after v1.6");
+    CHECK(xcom_version() == 0x010700U, "version is 1.7.0");
+    CHECK(sizeof(XcomSnapshot) == 88U, "snapshot ends at 88 after modem_lines");
     CHECK(offsetof(XcomSnapshot, port_state) == 48U,
           "port_state offset unchanged");
     CHECK(offsetof(XcomSnapshot, framing_errors) == 52U,
@@ -92,6 +92,8 @@ int main()
           "rx_backpressure_events at 76");
     CHECK(offsetof(XcomSnapshot, flow_hold_events) == 80U,
           "flow_hold_events appended at 80 (v1.6)");
+    CHECK(offsetof(XcomSnapshot, modem_lines) == 84U,
+          "modem_lines appended at 84");
 
     XcomHandle handle = create_handle();
     if (handle == nullptr) {

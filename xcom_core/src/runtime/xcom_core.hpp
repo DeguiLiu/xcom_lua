@@ -514,6 +514,9 @@ struct Metrics {
     std::atomic<uint32_t> overrun_errors{0U};
     std::atomic<uint32_t> break_events{0U};
     std::atomic<uint32_t> flow_hold_events{0U};
+    // Last GetCommModemStatus packing (kModem* bits). A level, not a counter:
+    // 0 means no sample. Written by the read thread, read by the 250 ms poll.
+    std::atomic<uint32_t> modem_lines{0U};
 };
 
 // v1.5: fold one ClearCommError line-status report into CoreCtx::metrics and
