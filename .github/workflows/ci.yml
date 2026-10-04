@@ -91,8 +91,10 @@ jobs:
             test_rx_display_pipeline
             test_script_budget
             test_script_meta
+            test_send_history
             test_send_file_retry
             test_shipped_scripts
+            test_tx_echo
             test_view_model
             test_wave_ring
             test_xcom_ffi
@@ -222,6 +224,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The ImGui bridge needs <d3d11.h>, the vendored ImGui and implot. With
+      # mingw-w64 installed the syntax gate parses it too; without it the gate
+      # prints SKIP and a typo in the largest translation unit in the tree only
+      # surfaces in the Windows build job (or not at all, on a Linux-only
+      # change). The package also provides the objdump the DLL export check
+      # below needs, which is why both steps share this job.
+      - name: Install mingw-w64 cross compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends g++-mingw-w64-x86-64
+
       - name: Check out coact at the pinned revision
         uses: actions/checkout@v4
         with:
@@ -231,6 +244,15 @@ jobs:
 
       - name: Parse serial / ABI translation units
         run: tools/check_cpp_syntax.sh
+
+      # Source-only tripwire on the committed binaries. The Lua FFI layer
+      # degrades silently when the DLL behind it is older (that is what
+      # optional_export exists for), so a cdef change without the matching
+      # Windows rebuild is invisible at run time and has shipped twice. This
+      # reads the PE export tables and fails when the runtime DLL does not
+      # export something the Lua layer declares.
+      - name: Check committed DLL exports against the Lua ABI declarations
+        run: tools/check_dll_exports.sh
 
   # ---------------------------------------------------------------------------
   # Executes the hardware-free C++ suites that no other job can run. They are

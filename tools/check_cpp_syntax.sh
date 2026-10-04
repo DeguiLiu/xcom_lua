@@ -133,6 +133,37 @@ for tu in "${TUS[@]}"; do
     fi
 done
 
+# The ImGui bridge is the largest TU in the tree and the one excluded from the
+# list above: it needs <d3d11.h>, the vendored ImGui and implot.  A mingw-w64
+# cross compiler supplies all three, so when one is installed the bridge is
+# parsed here too — that is the only way a Linux-side edit of it gets a
+# type-check before the Windows CI job builds the real DLL.  Absent toolchain =
+# a SKIP line, never a failure (the gate must stay trustworthy on any machine).
+# Point XCOM_MINGW_CXX / XCOM_MINGW_SYSROOT at a non-default install if needed.
+MINGW_CXX="${XCOM_MINGW_CXX:-}"
+if [ -z "$MINGW_CXX" ]; then
+    for candidate in x86_64-w64-mingw32-g++-posix x86_64-w64-mingw32-g++; do
+        if command -v "$candidate" >/dev/null 2>&1; then MINGW_CXX="$candidate"; break; fi
+    done
+fi
+MINGW_SYSROOT="${XCOM_MINGW_SYSROOT:-/usr/x86_64-w64-mingw32/include}"
+BRIDGE=xcom_lua/native/xcom_imgui/xcom_imgui_bridge.cpp
+if [ -n "$MINGW_CXX" ] && [ -d "$MINGW_SYSROOT" ]; then
+    out=$("$MINGW_CXX" -fsyntax-only -std=c++17 -Wall -Wextra -finput-charset=UTF-8 \
+          -DWIN32_LEAN_AND_MEAN -idirafter "$MINGW_SYSROOT" \
+          -Ithird_party/xcom_imgui/imgui -Ithird_party/xcom_imgui/implot \
+          -Ixcom_lua/native/xcom_imgui "$BRIDGE" 2>&1)
+    if grep -q 'error:' <<< "$out"; then
+        echo "FAIL  $BRIDGE (mingw-w64 cross check)"
+        grep 'error:' <<< "$out" | head -10
+        fail=1
+    else
+        echo "OK    $BRIDGE (mingw-w64 cross check)"
+    fi
+else
+    echo "SKIP  $BRIDGE (no mingw-w64 cross compiler / sysroot)"
+fi
+
 if [ "$fail" -ne 0 ]; then
     echo
     echo "C++ syntax check FAILED (see the error lines above)."
