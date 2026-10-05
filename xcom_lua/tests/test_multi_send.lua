@@ -1553,5 +1553,58 @@ do
     os.remove(win.config_path)
 end
 
+-- ===========================================================================
+-- AN) Click latency: _render_ui_state re-enabled ten hidden Win32 controls on
+--     EVERY 250 ms poll.  Measured in the real window that cost 2.9 ms mean /
+--     7.3 ms max inside poll_status, i.e. 92% of that poll and the largest
+--     single stall in the message loop -- bigger than a whole frame, and the
+--     thing a click's frame waited behind.  The set can only move on an HSM
+--     transition (or when a control is created), so it is pushed on change and
+--     left alone otherwise.
+-- ===========================================================================
+do
+    local w32 = require("win32")
+    local pushed = {}
+    w32.user32.EnableWindow = function(hwnd, on)
+        pushed[#pushed + 1] = { hwnd = hwnd, on = on }
+    end
+    local win = new_fake_window()
+    win.connected = true
+    win.recv = nil
+    win._display_timer = nil
+    win.conn = { port = { hwnd = 11 }, open = { hwnd = 12 },
+                 close = { hwnd = 13 } }
+    win.send = { single = { send = { hwnd = 14 } },
+                 multi = { btn_send_enabled = { hwnd = 15 } } }
+    local state = { connected = true, params_enabled = true,
+                    open_enabled = false, close_enabled = true,
+                    send_enabled = true }
+    win.vm.ui_state = function() return state end
+
+    win:_render_ui_state()
+    eq("AN1 first render pushes every control that exists", #pushed, 5)
+    eq("AN2 params controls follow params_enabled", pushed[1].on, 1)
+    eq("AN3 open button follows open_enabled", pushed[2].on, 0)
+
+    pushed = {}
+    win:_render_ui_state()
+    eq("AN4 an unchanged state pushes nothing", #pushed, 0)
+
+    state.send_enabled = false
+    win:_render_ui_state()
+    eq("AN5 a transition pushes only what moved", #pushed, 2)
+    eq("AN6 the new value is what lands", pushed[2].on, 0)
+
+    -- A control that appears after the first render must still get its push:
+    -- the cache is keyed by the control, not by a packed state signature.
+    pushed = {}
+    win.conn.baud = { hwnd = 17 }
+    win:_render_ui_state()
+    eq("AN7 a newly created control is pushed once", #pushed, 1)
+    eq("AN8 and it follows the current state", pushed[1].on, 1)
+
+    w32.user32.EnableWindow = nil
+end
+
 print(string.format("\n%d passed, %d failed", pass_n, fail_n))
 os.exit(fail_n == 0 and 0 or 1)
