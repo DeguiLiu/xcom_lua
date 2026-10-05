@@ -387,3 +387,12 @@
   **Gitee release v1.4.6 已发布**（两个可下载附件 + 源码包）；**GitHub 侧 403**：现有 fine-grained PAT 缺 `Contents: write`，
   分支与标签已推，release 待授权后补建：
   `gh release create v1.4.6 -R DeguiLiu/xcom_lua --title "XCOM v1.4.6" --notes-file dist/release-notes-v1.4.6.md dist/xcom-release-v1.4.6.zip dist/xcom-v1.4.6-x64.msi`。
+- **点击手感：先量化再动手（v1.4.7）**。三次进程内探针（真窗口 + VIRTUAL 模拟器 + `uv.hrtime` 分阶段计时）给出的基线：
+  一帧实际约 **3 ms**（`imgui.frame` ~0.8 + `draw` ~0.25 + `render` ~1.2，其余为 Lua 泵），绘制帧间隔 ~22 ms（~44 fps）；
+  点击由 WndProc `request_frame(16 ms)` 拉帧，所以**点击反馈本来就在一帧之内**——"优化点击"不成立，
+  真正的病灶是**消息循环里 250 ms 状态轮询的 3.15 ms 停顿（max 7.9 ms）**：`_render_ui_state` 每轮无条件对
+  十个隐藏 Win32 控件调 `EnableWindow`，占该轮询 92%。改成按控件缓存（`push_enabled`，以控件表为键，控件新增/替换仍会推一次）后：
+  `_render_ui_state` **2.897 → 0.033 ms**，`poll_status` **3.150 → 0.383 ms**（max 7.86 → 2.49 ms），
+  `uv.run` 的最坏迭代 **11.5 → 1.9 ms**；帧耗时与 fps 不变（本来就不是瓶颈）。
+  回归门禁 `test_multi_send` AN1-AN8（首次全推 5 个、状态不变 0 次、仅推变化 2 个、新控件补推 1 次）。
+  另一处发现：模拟器 **1 MB/s**（纯测试夹具，真串口不经过 Lua）时 `sim.pump` 自身 2.5 ms / max 9.4 ms——那是夹具的生成+注入成本，不是产品路径。
