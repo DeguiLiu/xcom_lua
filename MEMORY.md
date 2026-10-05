@@ -377,3 +377,13 @@
 - **未做视觉结论**：`xcom-ui-audit` 的 audit.py 两次都返回全黑（DXGI 跨进程截屏在本会话失效，见 skill 已知陷阱 #1），
   本轮只报功能与门禁，不对观感下判断；真实窗口的渲染/交互由 `e2e_drag_freeze` 的帧内读数证明（按住 55/55 采样
   chased +0px、同期尾部 +2820px、松手 parked 0px、轮回到尾后 follow 24/24 在尾）。
+- **本轮发布 v1.4.6**：版本号唯一来源是 `CMakeLists.txt` 的 `project(XCOM VERSION …)`，改为 1.4.6 后重编启动器
+  （VS_VERSION_INFO 必须对齐，`build_release.ps1` 的版本门禁 v1.4.5 曾因此翻车过），两枚 DLL 未变（ninja `no work to do`）。
+  产物：`dist/xcom-release-v1.4.6.zip`（4376681 B / 175 项 / sha256 2E2450B8…854D）与 `dist/xcom-v1.4.6-x64.msi`
+  （4621914 B / 173 组件 / sha256 12A178B7…8A6D）。发布级验证：`STAGE_PARSE_OK` 与 CRT 闭包门禁通过；用**打包后的 bytecode**
+  跑**打包后的 scripts/**，19/19 插件加载成功（含 8 个中文名，label 取到 @name 如「发送转16进制」）；打包的
+  `runtime/xcom.exe` 冒烟启动出 "XCOM Serial Console" 窗口并保持存活。`dist/` 被 .gitignore 忽略，故本次提交只有版本号 +
+  重编启动器（373e46e）。
+  **Gitee release v1.4.6 已发布**（两个可下载附件 + 源码包）；**GitHub 侧 403**：现有 fine-grained PAT 缺 `Contents: write`，
+  分支与标签已推，release 待授权后补建：
+  `gh release create v1.4.6 -R DeguiLiu/xcom_lua --title "XCOM v1.4.6" --notes-file dist/release-notes-v1.4.6.md dist/xcom-release-v1.4.6.zip dist/xcom-v1.4.6-x64.msi`。
