@@ -1380,10 +1380,15 @@ end
 
 -- ===========================================================================
 -- AK) Config durability ("勾选项没记住" 的极端情形): a real widget interaction
---     marks the config dirty and a debounced write lands once, instead of the
+--     marks the config dirty and a throttled write lands, instead of the
 --     settings waiting for the shutdown save (a killed process lost them).
---     The debounce is what keeps this from rewriting the INI per keystroke,
---     which is why the write-through extreme (LLCOM) is not copied.
+--     The throttle is what keeps this from rewriting the INI per keystroke,
+--     which is why the write-through extreme (LLCOM) is not copied; the
+--     DEADLINE is not restarted by later interactions, so the newest value is
+--     never more than one window away from the disk (the old stop+start
+--     quiet-period could hold it in memory for 5 s, and a hard exit there
+--     lost the tick -- reproduced against a real luv loop in
+--     tests/e2e_config_durability.lua, which the fake timers here cannot do).
 -- ===========================================================================
 do
     local win = new_fake_window()
@@ -1401,30 +1406,52 @@ do
     win._config_save_callback = function() win:_flush_config_save() end
     win:_dispatch_imgui_actions(65536)      -- minimize: a real interaction
     eq("AK3 a real interaction marks the config dirty", win._config_dirty, true)
-    eq("AK4 the debounce is armed at the coalescing interval",
-       win._config_save_timer.initial, 5000)
-    eq("AK5 it is a one-shot (repeat 0)",
+    -- The class table owns the published default (window.lua sets
+    -- Window.CONFIG_SAVE_THROTTLE_MS for the tests), read through the fake
+    -- window's metatable: a rename or an accidental removal fails here.
+    eq("AK4 the write is armed at the throttle window",
+       win._config_save_timer.initial, getmetatable(win).CONFIG_SAVE_THROTTLE_MS)
+    -- The bound that makes the tick durable: an abrupt exit loses at most this
+    -- window.  The old 5000 ms quiet period is what tests/e2e_config_durability
+    -- showed losing a click, so this asserts the property, not the constant.
+    eq("AK5 the window is short enough to bound the loss",
+       getmetatable(win).CONFIG_SAVE_THROTTLE_MS <= 1000, true)
+    eq("AK6 it is a one-shot (repeat 0)",
        win._config_save_timer.repeat_ms, 0)
+    eq("AK7 arming a write is a pending write", win._config_save_pending, true)
 
-    -- A second interaction inside the window restarts it: still exactly one
-    -- pending write, not two.
+    -- A further interaction inside the window RIDES ALONG: the deadline is not
+    -- restarted (the old behaviour), so the tick cannot be pushed into the
+    -- future by a held spinner -- and still exactly one write is pending.
     win:_dispatch_imgui_actions(65536)
-    eq("AK6 a further interaction keeps one pending write", saves, 0)
+    eq("AK8 a further interaction keeps one pending write",
+       tostring(win._config_save_pending) .. "/" .. tostring(saves), "true/0")
 
     win._config_save_timer:fire()
-    eq("AK7 the quiet period writes once", saves, 1)
-    eq("AK8 the flush clears the dirty flag", win._config_dirty, false)
+    eq("AK9 the window writes once", saves, 1)
+    eq("AK10 the flush clears the dirty flag", win._config_dirty, false)
+    eq("AK11 the flush clears the pending flag", win._config_save_pending, false)
     win._config_save_timer:fire()
-    eq("AK9 nothing dirty means no second write", saves, 1)
+    eq("AK12 nothing dirty means no second write", saves, 1)
+
+    -- A mark AFTER the flush must arm a new window: the value that arrived
+    -- while the write was in flight would otherwise never reach the disk.
+    win:_dispatch_imgui_actions(65536)
+    eq("AK13 a mark after the flush re-arms",
+       tostring(win._config_save_pending) .. "/" .. tostring(saves), "true/1")
+    win._config_save_timer:fire()
+    eq("AK14 it writes on its own window", saves, 2)
 
     -- Shutdown must disarm the timer: its callback would otherwise run against
     -- a half-torn-down window (bridge destroyed, core closed).
     win:_dispatch_imgui_actions(65536)
-    eq("AK10 dirty again before shutdown", win._config_dirty, true)
+    eq("AK15 dirty again before shutdown", win._config_dirty, true)
     win._config_save_timer:stop()
     win._config_dirty = false
-    eq("AK11 the shutdown path clears the flag the timer would have flushed",
-       win._config_dirty, false)
+    win._config_save_pending = false
+    eq("AK16 the shutdown path clears the flags the timer would have flushed",
+       tostring(win._config_dirty) .. "/" .. tostring(win._config_save_pending),
+       "false/false")
 end
 
 -- ===========================================================================
@@ -1637,6 +1664,120 @@ do
     eq("AO4 a writable path reports true", win:_save_config(), true)
     eq("AO5 nothing is latched after success", win._config_save_failed, false)
     os.remove("_test_ao.ini")
+end
+
+-- ===========================================================================
+-- AP) Script-console ENABLE checkbox: a click must reach the engine.
+--     TWO writers share the one int buffer C++ fills in on a click
+--     (bridge cpp:3036-3040): that click, and Window:_pump_script_console
+--     copying engine state back.  The pump runs BEFORE the frame is drawn
+--     (render_imgui: pump, then draw), so re-copying the engine into the buffer
+--     on every pump erased the click before the read-back could see it: every
+--     enable checkbox in the console was dead in both directions and the tick
+--     read as "it undid itself".  AP pins the frame ordering (seed once, apply
+--     the click, then mirror the engine) that replaced it.
+-- ===========================================================================
+do
+    local SCRIPT = "加上换行回车.lua"
+
+    -- Console bridge stand-in: set_scripts allocates the int buffer and
+    -- remembers the index-aligned list, exactly like imgui_bridge.set_scripts.
+    local function new_console_bridge()
+        local b = {}
+        function b:set_scripts(names)
+            local enabled = ffi.new("int[?]", #names)
+            self._script_enabled_buf = enabled
+            self._script_names = names
+            return enabled
+        end
+        -- The pump probes these before calling them; nil means "no such
+        -- feature" on an older DLL, so they must exist but return nothing.
+        function b:take_editor_save() return nil end
+        function b:take_script_events() return nil end
+        function b:take_script_command() return nil end
+        return b
+    end
+
+    -- Engine stand-in for the enable state (the real engine's own behaviour is
+    -- pinned in tests/test_script_engine.lua): `refuse` models a script that
+    -- fails to load, which enable() swallows by leaving the record off.
+    local function new_console_engine(opts)
+        local eng = { _list_gen = 1, _enable_calls = 0 }
+        local on = opts.start_enabled and true or false
+        function eng:script_names() return { SCRIPT } end
+        function eng:script_labels() return { "发送追加换行回车" } end
+        function eng:script_tooltips() return { "" } end
+        function eng:is_enabled() return on end
+        function eng:enable(_, want)
+            self._enable_calls = self._enable_calls + 1
+            want = want and true or false
+            if want and opts.refuse then return end   -- load failed
+            on = want
+        end
+        return eng
+    end
+
+    local win = new_fake_window()
+    local b = new_console_bridge()
+    win.imgui = b
+    win._scripts_console_open = true
+    win.scripts = new_console_engine({ start_enabled = true })
+
+    win:_pump_script_console()
+    eq("AP1 opening the console seeds the checkbox from the engine",
+       b._script_enabled_buf[0], 1)
+
+    -- The user unticks while the frame is drawn: the C++ checkbox writes the
+    -- buffer itself, i.e. between this pump and the next one.
+    b._script_enabled_buf[0] = 0
+    win:_pump_script_console()
+    eq("AP2 the untick reaches the engine", win.scripts:is_enabled(), false)
+    eq("AP3 and the buffer still shows it", b._script_enabled_buf[0], 0)
+
+    b._script_enabled_buf[0] = 1
+    win:_pump_script_console()
+    eq("AP4 the tick reaches the engine", win.scripts:is_enabled(), true)
+    eq("AP5 and is still shown", b._script_enabled_buf[0], 1)
+
+    -- A click the engine REFUSES must be undone in the buffer and must not be
+    -- retried on every frame (a script that fails to load would re-log the
+    -- failure 60 times a second otherwise).
+    local refused = new_console_engine({ start_enabled = false, refuse = true })
+    win.scripts = refused
+    win._script_enabled_shadow = nil          -- fresh list -> fresh seed
+    win:_pump_script_console()
+    eq("AP6 the refused engine starts off", refused:is_enabled(), false)
+    b._script_enabled_buf[0] = 1
+    win:_pump_script_console()
+    eq("AP7 a refused tick is not left showing", b._script_enabled_buf[0], 0)
+    local attempts = refused._enable_calls
+    win:_pump_script_console()
+    win:_pump_script_console()
+    eq("AP8 the refused enable is not retried every frame",
+       refused._enable_calls, attempts)
+
+    -- An enable that did not come from a click is mirrored into the buffer.
+    local eng3 = new_console_engine({ start_enabled = false })
+    win.scripts = eng3
+    win._script_enabled_shadow = nil
+    win:_pump_script_console()
+    eq("AP9 fresh engine seeds off", b._script_enabled_buf[0], 0)
+    eng3:enable(SCRIPT, true)
+    win:_pump_script_console()
+    eq("AP10 an engine-side enable is mirrored into the buffer",
+       b._script_enabled_buf[0], 1)
+
+    -- Closing the console drops the shadow, so reopening re-seeds from the
+    -- engine instead of disabling everything the config had enabled.
+    win.scripts = new_console_engine({ start_enabled = true })
+    win._scripts_console_open = false
+    win:_pump_script_console()
+    ok("AP11 closing the console clears the shadow",
+       win._script_enabled_shadow == nil)
+    win._scripts_console_open = true
+    win:_pump_script_console()
+    eq("AP12 reopening re-seeds from the engine (no mass disable)",
+       b._script_enabled_buf[0], 1)
 end
 
 print(string.format("\n%d passed, %d failed", pass_n, fail_n))

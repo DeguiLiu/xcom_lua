@@ -264,15 +264,61 @@ function M.load(path)
     return M.parse(content or "")
 end
 
+--[[-------------------------------------------------------------------------
+writable_path(path, fallback_dir, mkdir) -> path, fell_back
+
+Pick the file the settings are READ from and WRITTEN to.  The MSI installs
+per-machine into %ProgramFiles%\XCOM (installer/xcom.wxs), where a standard
+user cannot rewrite the config.ini next to the executable - and the client is
+manifested, so Windows does NOT redirect the write to VirtualStore.  Every
+save then fails and the user sees precisely "it forgot my tick again".
+
+The probe is a real append-open, i.e. the same access a save performs, so an
+ACL or a read-only attribute is caught the same way a failed save would be;
+the file it may create is the one a save would have created anyway.  When the
+install copy cannot be written, BOTH the load and the save move to
+`fallback_dir` (the client passes %APPDATA%\XCOM).  Moving only the write
+would reload the stale install copy on the next launch and lose the settings
+anyway - reading the same path that is written is the whole point.
+
+`mkdir` is injected by the caller so this module stays free of host APIs; it
+is consulted only when the fallback file does not exist yet.  Returns the
+original path and false when no fallback is available or usable.
+------------------------------------------------------------------------]]--
+function M.writable_path(path, fallback_dir, mkdir)
+    local probe = fs_path.open(path, "ab")
+    if probe then
+        probe:close()
+        return path, false
+    end
+    if not fallback_dir then
+        return path, false
+    end
+    local alt = fallback_dir .. "/config.ini"
+    local alt_probe = fs_path.open(alt, "ab")
+    if not alt_probe and mkdir and mkdir(fallback_dir) then
+        alt_probe = fs_path.open(alt, "ab")
+    end
+    if not alt_probe then
+        return path, false
+    end
+    alt_probe:close()
+    return alt, true
+end
+
 function M.save(path, data)
     local text = M.serialize(data)
     -- Write a sibling file and rename it over the target, never the target
     -- itself: io.open(path, "wb") truncates first, so a process killed (or a
     -- disk that fills) between the truncate and the close leaves the user with
     -- a DESTROYED config -- strictly worse than the change not being saved.
-    -- The temp file is a sibling so the rename cannot cross a volume, and the
-    -- rename is attempted FIRST because it is the atomic path everywhere but
-    -- Windows (where it refuses an existing destination).
+    -- The temp file is a sibling so the rename cannot cross a volume.
+    -- fs_path.rename is the atomic replace (MoveFileExW on Windows, rename(2)
+    -- elsewhere), so this first rename is the one that normally succeeds.  The
+    -- remove+rename below is only the fallback for a host where that call
+    -- cannot replace an existing destination; it is destructive (the live
+    -- config is gone until the rename lands) and that is exactly why the
+    -- atomic path is taken first.
     local tmp = path .. ".tmp"
     local f = fs_path.open(tmp, "wb")
     if not f then

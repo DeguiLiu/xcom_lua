@@ -34,6 +34,7 @@ if arg and arg[0] and arg[0]:sub(1, 1) ~= "@" then
 end
 
 local config = require("config")
+local fs_path = require("fs_path")
 local window = require("window")
 local w = require("win32")
 local xcom = require("xcom_ffi")
@@ -73,6 +74,23 @@ end
 
 local APP_DIR = (arg and arg[0] and arg[0]:match("^(.*)[/\\]")) or "."
 local CONFIG_PATH = APP_DIR .. "/config.ini"
+
+-- Where the settings actually live.  The MSI installs per-machine into
+-- %ProgramFiles%\XCOM (installer/xcom.wxs), where a standard user cannot
+-- rewrite the file that sits next to the executable -- and the client is
+-- manifested, so Windows does NOT redirect the write to VirtualStore.  Without
+-- this, every save fails and the user sees "it forgot my tick" after every
+-- restart.  The chosen path is used for the load below AND handed to the
+-- window for its saves, because a fallback that moved only the write would
+-- reload the stale install copy on the next launch (see
+-- core/config.lua:writable_path).
+local CONFIG_FALLBACK = false
+do
+    local appdata = os.getenv("APPDATA")
+    local fallback_dir = appdata and (appdata .. "/XCOM") or nil
+    CONFIG_PATH, CONFIG_FALLBACK =
+        config.writable_path(CONFIG_PATH, fallback_dir, fs_path.mkdir)
+end
 
 -- Load persisted settings (safe defaults on missing/corrupt file).
 local cfg_data = config.load(CONFIG_PATH)
@@ -234,4 +252,13 @@ if not win:init_window() then
     os.exit(2)
 end
 win:start()
+if CONFIG_FALLBACK then
+    -- A settings file that is not where the user would look for it has to say
+    -- so: same visible-channel rule as the failed-save report in
+    -- Window:_save_config (the launcher hides the console, so stderr alone
+    -- would never be seen).
+    io.stderr:write("[config] install directory is not writable; settings: "
+        .. CONFIG_PATH .. "\n")
+    win:set_status_deferred("settings are stored in " .. CONFIG_PATH)
+end
 return win:run()

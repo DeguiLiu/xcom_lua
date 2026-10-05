@@ -502,6 +502,7 @@ function M.new(cfg, cfg_data, config_path)
     self._reconnect_candidate_names = nil -- uniquely-matching re-enumerated names
     self._config_dirty = false            -- a widget changed something unwritten
     self._config_save_timer = nil         -- debounce handle for the above
+    self._config_save_pending = false     -- a write is already scheduled
     -- Send-box command history, newest first ([send] history.N in the config).
     -- sanitize() drops blanks and caps the list, so a hand-edited file cannot
     -- produce a widget that shows empty rows.
@@ -1110,16 +1111,28 @@ local DEVICE_CHANGE_DEBOUNCE_MS = 500
 Window.DEVICE_CHANGE_DEBOUNCE_MS = DEVICE_CHANGE_DEBOUNCE_MS
 
 -- Config durability.  _save_config runs at shutdown only, so a process killed
--- by Task Manager, a crash or a power cut loses every tick set in that session
--- -- the same class of complaint as the multipage ticks that were written but
--- never read back.  LLCOM is the opposite extreme (a full settings.json
--- rewrite inside every property setter, including each window-drag event), so
--- this takes the middle: a real widget interaction marks the config dirty, and
--- the write happens once the interaction has been quiet for this long.  The
--- write itself is atomic (core/config.lua save renames a temp file over the
--- target), which is what makes a periodic save safe to do while running.
-local CONFIG_SAVE_DEBOUNCE_MS = 5000
-Window.CONFIG_SAVE_DEBOUNCE_MS = CONFIG_SAVE_DEBOUNCE_MS
+-- by Task Manager, a crashed console, a logoff or a power cut loses every tick
+-- set in that session -- the same class of complaint as the multipage ticks
+-- that were written but never read back.
+--
+-- The window between "the tick is on screen" and "the tick is on disk" is the
+-- whole risk, so it is now bounded by a THROTTLE instead of a quiet period: a
+-- real widget interaction marks the config dirty and arms one write, further
+-- interactions inside the window ride along with it (a held spinner repeats
+-- ~30/s, so re-arming on every one of them would push the deadline out
+-- forever and the setting would never land).  At most one write per window,
+-- and -- the property the quiet period did NOT have -- nothing the user did is
+-- ever more than this long away from the disk.  Measured with a real luv loop:
+-- a click was lost by a hard exit 1.5 s later under the old 5 s deadline; it
+-- is on disk 0.5-0.6 s later now.
+--
+-- LLCOM stays the rejected extreme (a full settings.json rewrite inside every
+-- property setter, including each window-drag event): 2 writes/s of a ~1 KiB
+-- file is not that, and the write is atomic (core/config.lua saves by
+-- renaming a temp file over the target), which is what makes it safe while
+-- running.
+local CONFIG_SAVE_THROTTLE_MS = 500
+Window.CONFIG_SAVE_THROTTLE_MS = CONFIG_SAVE_THROTTLE_MS
 
 -- True while the port list may be rebuilt safely: OFFLINE (CLOSED/FAULT) and
 -- not inside the reconnect grace window.  OPEN/OPENING/CLOSING all return
@@ -1412,12 +1425,13 @@ function Window:on_close()
     if self._script_watch_timer then self._script_watch_timer:stop() end
     if self._device_change_timer then self._device_change_timer:stop() end
     if self._ports_backstop_timer then self._ports_backstop_timer:stop() end
-    -- The debounced config write must not fire during teardown: the explicit
+    -- The throttled config write must not fire during teardown: the explicit
     -- _save_config below is the last write, and the timer's callback would
     -- run against a half-torn-down window (bridge destroyed, core closed).
     if self._config_save_timer then
         self._config_save_timer:stop()
         self._config_dirty = false
+        self._config_save_pending = false
     end
     if self._sequence_timer then self:_stop_sequence() end
     -- Abandon any in-flight reset sequence: the timer must not fire after the
@@ -1611,8 +1625,8 @@ function Window:_save_config()
 end
 
 -- Durability of the settings the user just changed, without the write-through
--- storm: mark on a real interaction, coalesce, write once the interaction has
--- been quiet (see CONFIG_SAVE_DEBOUNCE_MS).  A no-op when there is no config
+-- storm: mark on a real interaction, coalesce, write once the throttle window
+-- has passed (see CONFIG_SAVE_THROTTLE_MS).  A no-op when there is no config
 -- path to write to (the fake windows in the headless suites) but the dirty
 -- flag still latches, so the tests can pin the coalescing.
 function Window:_mark_config_dirty()
@@ -1623,18 +1637,26 @@ function Window:_mark_config_dirty()
         return
     end
     self._config_dirty = true
-    -- restart() is not on the luv timer surface this file already uses
-    -- elsewhere; stop+start is the same single-shot with a fresh deadline, and
-    -- it is what coalesces a burst of interactions into one write.
+    -- A write is already scheduled and will run within the throttle window,
+    -- which covers everything marked up to that point: leave the deadline
+    -- where it is.  Re-arming here (the old stop+start) would restart the
+    -- countdown on every message, so a burst of interactions -- and any
+    -- process that dies inside it -- kept the newest value in memory only.
+    if self._config_save_pending then
+        return
+    end
+    self._config_save_pending = true
     self._config_save_timer:stop()
-    self._config_save_timer:start(CONFIG_SAVE_DEBOUNCE_MS, 0,
+    self._config_save_timer:start(CONFIG_SAVE_THROTTLE_MS, 0,
                                   self._config_save_callback)
 end
 
--- Timer callback: one write for a burst of interactions.  The flag is cleared
--- BEFORE the save so a failure (or a nested mark from the save path) leaves
--- the next mark armed rather than being swallowed by this one.
+-- Timer callback: one write covering everything marked since the window
+-- opened.  Both flags are cleared BEFORE the save so a failure (or a nested
+-- mark from the save path) leaves the next mark armed rather than being
+-- swallowed by this one.
 function Window:_flush_config_save()
+    self._config_save_pending = false
     if not self._config_dirty then
         return
     end
@@ -2711,8 +2733,8 @@ function Window:_dispatch_imgui_actions(actions)
         self:request_frame(FRAME_INTERVAL_ACTIVE_MS)
         -- Same signal, second use: non-zero action bits mean a real widget
         -- interaction, which is exactly when a setting may have changed.  The
-        -- save itself is debounced (CONFIG_SAVE_DEBOUNCE_MS), so holding a
-        -- stepper or typing does not rewrite the INI per keystroke.
+        -- save itself is throttled (CONFIG_SAVE_THROTTLE_MS), so holding a
+        -- stepper or typing coalesces into at most one write per window.
         self:_mark_config_dirty()
     end
 end
@@ -3234,18 +3256,34 @@ function Window:_pump_script_console()
             if signature ~= self._script_list_signature then
                 self._script_list_signature = signature
                 self.imgui:set_scripts(names, labels, descs)
+                -- set_scripts allocates a FRESH zeroed buffer, so buffer and
+                -- shadow both have to be seeded again for it.
+                self._script_enabled_shadow = nil
             end
             self._script_list_gen = gen
         end
-        -- Copy enable state engine -> C++ checkbox buffer once per frame
-        -- only when the console is open (the checkboxes write back through
-        -- the same buffer the engine reads below).
+        -- Enable checkboxes: seed the checkbox buffer (and the shadow that
+        -- tells a click apart from an engine-side change, see step 4) ONCE per
+        -- fresh buffer / console-open -- never on every frame.  This pump runs
+        -- BEFORE the frame is drawn (see render_imgui), while the C++ checkbox
+        -- writes the very same buffer during that draw (bridge cpp:3036-3040),
+        -- so re-copying the engine into it here would erase the click before
+        -- step 4 could read it back.
         if self._scripts_console_open and self.imgui._script_enabled_buf then
-            names = names or self.scripts:script_names()
-            local buf = self.imgui._script_enabled_buf
-            for i, name in ipairs(names) do
-                buf[i - 1] = self.scripts:is_enabled(name) and 1 or 0
+            if not self._script_enabled_shadow then
+                names = names or self.scripts:script_names()
+                local buf = self.imgui._script_enabled_buf
+                local shadow = {}
+                for i, name in ipairs(names) do
+                    local on = self.scripts:is_enabled(name) and true or false
+                    shadow[i] = on
+                    buf[i - 1] = on and 1 or 0
+                end
+                self._script_enabled_shadow = shadow
             end
+        else
+            -- Console closed (or no buffer yet): the next open re-seeds both.
+            self._script_enabled_shadow = nil
         end
     end
     -- 2) Editor save event (Ctrl+S): write the file, reload the script.
@@ -3310,15 +3348,34 @@ function Window:_pump_script_console()
             end
         end
     end
-    -- 4) Enable-state feedback: C++ checkboxes -> engine (the buffer is
-    --    Lua-owned; compare against the engine state and apply deltas).
-    if self._scripts_console_open and self.imgui._script_enabled_buf then
-        local names = self.scripts:script_names()
-        local buf = self.imgui._script_enabled_buf
-        for i, name in ipairs(names) do
+    -- 4) Enable-state feedback.  TWO writers touch this single int buffer: the
+    --    C++ checkbox, on a click during the draw, and this pump, writing the
+    --    engine state back.  The shadow of what this pump last wrote is what
+    --    tells them apart -- a buffer value differing from the shadow IS the
+    --    user's click, and a shadow differing from the engine is a change that
+    --    did not come from a click (a script that fails to load and disables
+    --    itself, _script_create_new, a reload).  Clicks are consumed first so a
+    --    failed enable is not retried on every frame; the mirror runs second,
+    --    so it can never overwrite the click it just applied.  Collapsing this
+    --    into one engine -> buffer copy (the previous shape) discarded every
+    --    click before it could be read, which made the console's checkboxes
+    --    dead in both directions.
+    local buf = self.imgui._script_enabled_buf
+    local list = self.imgui._script_names
+    local shadow = self._script_enabled_shadow
+    if self._scripts_console_open and buf and list and shadow then
+        for i, name in ipairs(list) do
             local want = buf[i - 1] ~= 0
-            if want ~= self.scripts:is_enabled(name) then
+            if want ~= shadow[i] then
                 self.scripts:enable(name, want)
+                shadow[i] = want
+            end
+        end
+        for i, name in ipairs(list) do
+            local actual = self.scripts:is_enabled(name) and true or false
+            if shadow[i] ~= actual then
+                shadow[i] = actual
+                buf[i - 1] = actual and 1 or 0
             end
         end
     end

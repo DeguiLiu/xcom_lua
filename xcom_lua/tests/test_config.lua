@@ -226,5 +226,145 @@ do
     os.remove(path)
 end
 
+-- 15) Atomic save: core/config.lua writes a temp file and renames it over the
+--     target, which is what makes the throttled mid-session write safe (a
+--     crash between truncate and close would otherwise destroy the config).
+--     The CRT rename this used to rely on FAILS on Windows when the target
+--     exists, so the old code deleted the live config first and renamed into
+--     the hole -- a window where the user's settings did not exist on disk.
+--     fs_path.rename must therefore replace an existing target, and the save
+--     must leave no .tmp behind.  Everything asserted through io.open: the
+--     point is what is on disk, not what the module returned.
+do
+    local fs_path = require("fs_path")
+    local path = os.tmpname()
+    local data = { [""] = {} }
+    config.set(data, "send", "crlf", false)
+    check("SAVE1 the first save writes the file", config.save(path, data))
+    local f = io.open(path, "rb")
+    local first = f and f:read("*a")
+    f:close()
+    check("SAVE2 the file carries the value", first ~= nil
+          and first:find("crlf = false", 1, true) ~= nil)
+
+    -- Overwrite a file that already exists: this is the case that used to go
+    -- through remove()+rename() on Windows.
+    config.set(data, "send", "crlf", true)
+    check("SAVE3 overwriting an existing file succeeds", config.save(path, data))
+    f = io.open(path, "rb")
+    local second = f and f:read("*a")
+    f:close()
+    check("SAVE4 the new value replaced the old one", second ~= nil
+          and second:find("crlf = true", 1, true) ~= nil
+          and second:find("crlf = false", 1, true) == nil)
+    check("SAVE5 no temp file is left behind",
+          io.open(path .. ".tmp", "rb") == nil)
+
+    -- The rename itself, directly: it must replace, not fail.  (fs_path.encodes
+    -- tells us whether this host even has the wide path; the CRT fallback is
+    -- the documented behaviour there, and this assertion is the Windows one.)
+    local src = path .. ".src"
+    local s = io.open(src, "wb")
+    s:write("NEW\n")
+    s:close()
+    check("SAVE6 rename replaces an existing destination",
+          fs_path.rename(src, path) == true)
+    f = io.open(path, "rb")
+    local renamed = f and f:read("*a")
+    f:close()
+    eq("SAVE7 the destination now holds the renamed bytes", renamed, "NEW\n")
+    os.remove(path)
+end
+
+-- 16) Where the settings live: config.writable_path picks the file the client
+--     READS and WRITES.  A per-machine install into %ProgramFiles% is not
+--     writable by a standard user (and the manifest stops the VirtualStore
+--     redirect), so every save failed and the user saw "it forgot my setting".
+--     The probe must answer "use the install copy" when it is writable, and
+--     "use the fallback" -- creating it if needed -- when it is not.
+do
+    local IS_WINDOWS = package.config:sub(1, 1) == "\\"
+    local root = os.getenv("TEMP") or os.getenv("TMPDIR") or "/tmp"
+    local tag = tostring(os.time()) .. "-" .. tostring(math.random(1, 99999))
+    local dir = root .. "/xcom_cfg_test_" .. tag
+    local function mkd(path)
+        local rc = os.execute('mkdir "' .. path .. '"')
+        -- LuaJIT returns (true, "exit", 0) here; Lua 5.1 returns the raw status
+        -- code.  Accept both rather than pinning one host's convention.
+        return rc == true or rc == 0
+    end
+    if mkd(dir) then
+        local path = dir .. "/config.ini"
+        local choice, fell_back = config.writable_path(path, dir .. "/alt", mkd)
+        eq("W1 a writable install copy is kept", choice, path)
+        eq("W2 and no fallback is reported", fell_back, false)
+
+        -- An install copy that cannot even be opened for append (a read-only
+        -- directory, a missing one, or -- on Windows -- a read-only file) is
+        -- what the probe must catch: the save would fail there, and the client
+        -- is manifested, so nothing redirects it.
+        local absent = dir .. "/no_such_dir/config.ini"
+        local alt = dir .. "/alt"
+        local alt_choice, alt_fell_back =
+            config.writable_path(absent, alt, mkd)
+        eq("W3 an unusable install copy falls back", alt_fell_back, true)
+        eq("W4 the fallback is the file the client will read next launch",
+           alt_choice, alt .. "/config.ini")
+        -- Close the handle: a leaked one holds the file against the rename the
+        -- next save performs (caught here the first time this ran).
+        local alt_probe = io.open(alt_choice, "rb")
+        check("W5 the fallback file now exists", alt_probe ~= nil)
+        if alt_probe then alt_probe:close() end
+        -- The fallback must be usable, not merely chosen: what is written
+        -- there is what the next launch reads.
+        local fb = { [""] = {} }
+        config.set(fb, "multipage", "crlf", true)
+        check("W6 the fallback accepts a save", config.save(alt_choice, fb))
+        eq("W7 and reads back", config.get(config.load(alt_choice),
+           "multipage", "crlf", false), true)
+
+        -- No fallback available (no %APPDATA%): keep the install path so the
+        -- failure report in _save_config still names the file the user owns.
+        local keep, none = config.writable_path(absent, nil, mkd)
+        eq("W8 without a fallback the install path is returned", keep, absent)
+        eq("W9 and the caller learns nothing was moved", none, false)
+
+        -- Windows-only cases.  W10-W12 create the directory through
+        -- fs_path.mkdir (CreateDirectoryW) rather than a shell, because the
+        -- whole point of the CJK case is the UTF-8 path: a `mkdir` through
+        -- cmd.exe would go back through the code page and "prove" nothing.
+        -- W13/W14 are the MSI shape: the directory is writable by an admin,
+        -- the file is not -- the probe has to catch the FILE, not the dir.
+        if IS_WINDOWS then
+            local cjk_fs = require("fs_path")
+            local cjk = dir .. "/备用"
+            local cjk_choice, cjk_fell_back =
+                config.writable_path(absent, cjk, cjk_fs.mkdir)
+            eq("W10 a CJK fallback directory is created and used",
+               tostring(cjk_fell_back) .. "/" .. cjk_choice,
+               "true/" .. cjk .. "/config.ini")
+            check("W11 a CJK fallback accepts a save",
+                  config.save(cjk_choice, fb))
+
+            local f = io.open(path, "wb")
+            f:write("[send]\ncrlf = true\n")
+            f:close()
+            os.execute('attrib +R "' .. path .. '"')
+            local ro_choice, ro_fell_back =
+                config.writable_path(path, dir .. "/alt2", mkd)
+            eq("W12 a read-only install copy falls back", ro_fell_back, true)
+            eq("W13 to the fallback path", ro_choice, dir .. "/alt2/config.ini")
+            -- Restore the attribute or the recursive cleanup cannot delete it.
+            os.execute('attrib -R "' .. path .. '"')
+            os.execute('rmdir /s /q "' .. dir .. '"')
+        else
+            print("SKIP  W10-W13 (Windows path/attribute cases)")
+            os.execute('rm -rf "' .. dir .. '"')
+        end
+    else
+        print("SKIP  W1-W13 (cannot create a scratch directory)")
+    end
+end
+
 print(string.format("\nconfig tests: %d passed, %d failed", passed, failed))
 os.exit(failed == 0 and 0 or 1)

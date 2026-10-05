@@ -37,6 +37,9 @@ if ffi_ok and package.config:sub(1, 1) == "\\" then
                             const unsigned short* src, int srcLen,
                             char* dst, int dstLen, const char* defChar,
                             int* usedDefChar);
+    int MoveFileExW(const unsigned short* from, const unsigned short* to,
+                    unsigned long flags);
+    int CreateDirectoryW(const unsigned short* path, void* security);
     ]]
     local ok, k = pcall(ffi.load, "kernel32")
     if ok then
@@ -46,6 +49,7 @@ end
 
 local CP_UTF8, CP_ACP = 65001, 0
 local MB_ERR_INVALID_CHARS = 0x00000008
+local MOVEFILE_REPLACE_EXISTING = 0x00000001
 local NON_ASCII = "[\128-\255]"
 
 -- Grown-only scratch, the core/charset.lua pattern: a stream of CJK paths
@@ -104,8 +108,100 @@ function M.remove(path)
     return os.remove(M.to_crt(path))
 end
 
+-- One UTF-16 buffer, grown only, holding both paths of a rename as the
+-- double-NUL-terminated "from\0to\0" pair the wide API wants.  Nulling the
+-- separator instead of allocating per path keeps this allocation-free after
+-- the first non-trivial call, matching to_crt's scratch discipline.
+local wpair, wpair_n = nil, 0
+
+-- UTF-8 -> UTF-16 for the two paths of one rename.  Returns two
+-- unsigned-short pointers (into the shared scratch) or nil when the host has no
+-- kernel32 or a path is not valid UTF-8 (a legacy ANSI path never gets
+-- converted twice: the caller falls back to the narrow CRT call).
+local function to_wide_pair(from, to)
+    local nf = kernel32.MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+        from, #from, nil, 0)
+    if nf <= 0 then
+        return nil
+    end
+    local nt = kernel32.MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+        to, #to, nil, 0)
+    if nt <= 0 then
+        return nil
+    end
+    local need = nf + 1 + nt + 1
+    if wpair_n < need then
+        wpair_n = need
+        wpair = ffi.new("unsigned short[?]", need)
+    end
+    if kernel32.MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+            from, #from, wpair, nf) <= 0 then
+        return nil
+    end
+    wpair[nf] = 0
+    if kernel32.MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+            to, #to, wpair + nf + 1, nt) <= 0 then
+        return nil
+    end
+    wpair[nf + 1 + nt] = 0
+    return wpair, wpair + nf + 1
+end
+
+-- One UTF-16 path in the same scratch, NUL-terminated.
+local wone, wone_n = nil, 0
+
+local function to_wide_one(path)
+    local n = kernel32.MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+        path, #path, nil, 0)
+    if n <= 0 then
+        return nil
+    end
+    if wone_n < n + 1 then
+        wone_n = n + 1
+        wone = ffi.new("unsigned short[?]", n + 1)
+    end
+    if kernel32.MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+            path, #path, wone, n) <= 0 then
+        return nil
+    end
+    wone[n] = 0
+    return wone
+end
+
+-- Atomic replace.  The CRT rename this used to call FAILS on Windows whenever
+-- the destination exists (measured: "File exists"), so every config write had
+-- to delete the live config.ini first and rename the temp file into the hole
+-- -- a window in which the user's settings did not exist on disk at all, and a
+-- crash inside it destroyed them (the .tmp was left behind).  MoveFileExW with
+-- REPLACE_EXISTING is the atomic replace the comment in core/config.lua always
+-- claimed, and it needs the wide API because the path is UTF-8 (see the module
+-- header).  Any failure falls back to the CRT call, so a host without
+-- kernel32 (the Linux review host) and a legacy ANSI path behave as before.
 function M.rename(from, to)
+    if kernel32 then
+        local wide_from, wide_to = to_wide_pair(from, to)
+        if wide_from and
+           kernel32.MoveFileExW(wide_from, wide_to, MOVEFILE_REPLACE_EXISTING) ~= 0 then
+            return true
+        end
+    end
     return os.rename(M.to_crt(from), M.to_crt(to))
+end
+
+-- Create one directory (Windows only; the client uses it for the
+-- %APPDATA%\XCOM fallback config directory).  CreateDirectoryW rather than
+-- os.execute("mkdir"): the path is UTF-8 and a shell would go through the code
+-- page again, which is the bug this module exists to prevent.  A false return
+-- means either "no kernel32" or "the directory could not be created".
+function M.mkdir(path)
+    if not kernel32 then
+        return false
+    end
+    local wide = to_wide_one(path)
+    if not wide then
+        return false
+    end
+    return kernel32.CreateDirectoryW(wide, nil) ~= 0
 end
 
 -- loadfile with a UTF-8 path: the source is read through the converted path,
