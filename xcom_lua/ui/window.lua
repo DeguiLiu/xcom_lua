@@ -1588,7 +1588,26 @@ function Window:_save_config()
     for index = 1, #history do
         config.set(data, "send", "history." .. (index - 1), history[index])
     end
-    config.save(self.config_path, data)
+    -- A failed write used to be completely invisible, and the symptom the user
+    -- sees is "it forgot my settings again" -- indistinguishable from a missing
+    -- save path.  The classic cause is an install under Program Files, where a
+    -- standard user cannot rewrite the INI that sits next to the executable
+    -- (the app is manifested, so no VirtualStore redirection).  Say so on the
+    -- status bar the user is looking at (the debounced save fires 5 s after the
+    -- interaction, i.e. while the app is still up) and keep one line on stderr
+    -- for a log capture; the latch keeps a retry loop from spamming it.
+    if not config.save(self.config_path, data) then
+        if not self._config_save_failed then
+            self._config_save_failed = true
+            io.stderr:write("[config] cannot write " .. tostring(self.config_path)
+                .. " - settings will not persist (read-only directory?)\n")
+        end
+        self:set_status_deferred("settings NOT saved: " ..
+            tostring(self.config_path) .. " is not writable")
+        return false
+    end
+    self._config_save_failed = false
+    return true
 end
 
 -- Durability of the settings the user just changed, without the write-through

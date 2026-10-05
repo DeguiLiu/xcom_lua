@@ -1606,5 +1606,38 @@ do
     w32.user32.EnableWindow = nil
 end
 
+-- ===========================================================================
+-- AO) A config write that FAILS must be visible.  Before this, config.save's
+--     result was dropped, so a settings file the process cannot rewrite (an
+--     install under Program Files, run by a standard user) looked exactly like
+--     "the app forgot my tick again" with no hint anywhere.
+-- ===========================================================================
+do
+    local win = new_fake_window()
+    -- Buffers the save path reads that no earlier section touches.
+    win.imgui.auto_save = ffi.new("int[1]", 0)
+    win.imgui.auto_clear = ffi.new("int[1]", 0)
+    win.imgui.auto_clear_bytes = ffi.new("int[1]", 0)
+    -- The fake bridge deliberately leaves page store/load out (see J above);
+    -- the save path snapshots the current page, so give it a no-op.
+    win.imgui._store_page = function() end
+    -- "main.lua/xcom_probe.ini" has a regular file where a directory would have
+    -- to be, so the write fails on every platform (Windows and POSIX alike).
+    win.config_path = "main.lua/xcom_probe.ini"
+    win._status_dirty = nil
+    eq("AO1 a failed save reports false", win:_save_config(), false)
+    ok("AO2 the failure reaches the visible status text",
+       type(win._status_dirty) == "string" and
+       win._status_dirty:find("NOT saved", 1, true) ~= nil)
+    ok("AO3 the message names the file",
+       win._status_dirty:find("main.lua/xcom_probe.ini", 1, true) ~= nil)
+
+    -- A later successful write clears the latch, so the warning is not sticky.
+    win.config_path = "_test_ao.ini"
+    eq("AO4 a writable path reports true", win:_save_config(), true)
+    eq("AO5 nothing is latched after success", win._config_save_failed, false)
+    os.remove("_test_ao.ini")
+end
+
 print(string.format("\n%d passed, %d failed", pass_n, fail_n))
 os.exit(fail_n == 0 and 0 or 1)
