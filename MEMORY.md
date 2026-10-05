@@ -362,9 +362,16 @@
   `script_engine` 里已成死字段的 `_labels_dirty` 删除（`_list_gen` 已接管）。
 - **门禁与工具差异**：`tools/check_dll_exports.sh` 在 Windows 无 objdump，改用 `dumpbin /exports` 等价核对——
   `xcom_imgui.dll` 46/46 声明导出齐全（上轮补的 4 个已在），`xcom_core.dll` 无缺项（`XCOM_LINE_LEAVE_ALONE` 是常量宏，
-  bash 门禁正则只匹配小写 `xcom_`，不误报）。`lint_fields` 的 GGET 扫描在本机 SKIP（`luvjit.exe`/`luajit.exe` 都没编 `jit.bcs`），
-  靠新增的 Check 1b 静态兜底——已用临时文件验证它**真的会 FAIL**（自造 `forgotten_helper = function()` 即刻红），
-  即静态门禁有牙齿，不是装饰。`test_send_file_caps`/`test_serial_sim` 要在 `xcom_lua/tests` 下跑（`package.path="../core/?.lua"`）。
+  bash 门禁正则只匹配小写 `xcom_`，不误报）。`test_send_file_caps`/`test_serial_sim` 要在 `xcom_lua/tests` 下跑
+  （`package.path="../core/?.lua"`）。
+- **门禁补强（GGET 扫描本机可跑通）**：`lint_fields` 的 GGET 扫描在本机原本一律 SKIP，本轮用仓库自带源码
+  （`luajit2-2.1-agentzh` + MSVC `msvcbuild.bat`）编了一枚带 dumper 的 luajit，并实测出探针自身两个坑：
+  ① 探针原本要求首行是 `main <path:0,0>`，而 2.1 打的是 `-- BYTECODE --` 头，于是**有 dumper 也会被判 SKIP**
+  （正是探针要防的"静默丢覆盖"）；② `io.popen` 走 `cmd /c`，而 cmd 会剥掉"以引号开头"的实参首尾引号，
+  带空格的解释器路径会被拆坏（`'D:\...\luajit.exe" -bl "main.lua' is not recognized`）——必须整体再包一层，
+  POSIX 不需要。修完两种情况都自洽：有 dumper → 20 个文件全扫描且干净；没有 → SKIP 并给出"用 XCOM_LUAJIT +
+  LUA_PATH 指到 <luajit-src>/?.lua"的解法。反证：自造 `return declared + forgotten_global` 立刻红
+  （`reads undefined global "forgotten_global"`），Check 1b 同样验证会红——两条门禁都有牙齿。
 - **环境坑（务必记住）**：`runtime/luajit.exe` 与 `luv.dll` **ABI 不同**——`require("luv")` 能过，但一碰 timer 就
   0xC0000005 崩溃，所以一切涉及 luv 的套件/门禁只能用 `runtime/luvjit.exe`（`run_xcom_lua.cmd` 早有同义注释）。
 - **未做视觉结论**：`xcom-ui-audit` 的 audit.py 两次都返回全黑（DXGI 跨进程截屏在本会话失效，见 skill 已知陷阱 #1），
