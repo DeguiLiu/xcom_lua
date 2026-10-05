@@ -19,7 +19,12 @@ package.path = "./ui/?.lua;./core/?.lua;" .. package.path
 -- Bytecode dumper.  XCOM_LUAJIT wins so a Windows developer can point the gate
 -- at a stock LuaJIT: the shipped runtime/luvjit.exe is built without jit.bcs
 -- and therefore cannot dump bytecode (see dump_supported()).
-local LUAJIT = os.getenv("XCOM_LUAJIT") or arg[-1] or "luajit"
+-- An exported-but-empty XCOM_LUAJIT means "unset" (Lua treats "" as truthy, so
+-- `set XCOM_LUAJIT=` would otherwise become the interpreter name and turn the
+-- whole scan into "''""' is not recognized" failures).
+local LUAJIT = os.getenv("XCOM_LUAJIT")
+if LUAJIT == "" then LUAJIT = nil end
+LUAJIT = LUAJIT or arg[-1] or "luajit"
 -- Quote for io.popen by hand: string.format("%q") escapes backslashes, which
 -- cmd.exe cannot resolve, so every Windows path failed the gate while POSIX
 -- paths (no backslashes) hid the bug.
@@ -27,6 +32,19 @@ local function shq(s)
     return '"' .. s .. '"'
 end
 local NULL_DEV = package.config:sub(1, 1) == "\\" and "nul" or "/dev/null"
+
+-- io.popen hands the string to `cmd.exe /c` on Windows, and cmd strips the
+-- first and last quote of an argument that starts with one -- so the quoted
+-- executable path (which is necessary as soon as it contains a space) arrives
+-- mangled: 'D:\...\luajit.exe" -bl "main.lua' is not recognized.  Wrapping the
+-- whole command once more re-adds the pair cmd removes.  POSIX sh has no such
+-- rule and needs the plain form, so the wrap is Windows-only.
+local function popen_cmd(exe, args)
+    if package.config:sub(1, 1) == "\\" then
+        return shq(shq(exe) .. " " .. args)
+    end
+    return shq(exe) .. " " .. args
+end
 local FILES = {
     "main.lua",
     "core/ansi.lua", "core/charset.lua", "core/config.lua",
@@ -67,7 +85,8 @@ end
 -- Check 1: undefined global reads, via the GGET opcodes in the bytecode dump.
 -- --------------------------------------------------------------------------
 local function check_globals(path)
-    local pipe = io.popen(shq(LUAJIT) .. " -bl " .. shq(path) .. " 2>" .. NULL_DEV)
+    local pipe = io.popen(popen_cmd(LUAJIT,
+        "-bl " .. shq(path) .. " 2>" .. NULL_DEV))
     if not pipe then
         fail("%s: could not run %q -bl", path, LUAJIT)
         return
@@ -82,8 +101,8 @@ local function check_globals(path)
     local ok, why, code = pipe:close()
     if not (ok == true and (code or 0) == 0) then
         -- The diagnostic was suppressed above; re-run to capture it.
-        local err = io.popen(
-            shq(LUAJIT) .. " -bl " .. shq(path) .. " 2>&1 >" .. NULL_DEV)
+        local err = io.popen(popen_cmd(LUAJIT,
+            "-bl " .. shq(path) .. " 2>&1 >" .. NULL_DEV))
         local detail = err and err:read("*a") or ""
         if err then
             err:close()
@@ -106,18 +125,39 @@ end
 -- once, on the first listed file.  A stripped driver answers "unknown luaJIT
 -- command or jit.* modules not installed", and reading that as "the file does
 -- not compile" prints 18 bogus syntax errors on Windows and buries the one
--- real finding -- exactly how a GGET regression reached CI.  A usable dump
--- starts with "main <path:0,0>".
+-- real finding -- exactly how a GGET regression reached CI.
+--
+-- A usable listing announces itself one of two ways: LuaJIT 2.1 prints
+-- "-- BYTECODE -- <chunk>" banners, older builds print "main <path:0,0>".
+-- Requiring either one alone silently turns the whole GGET scan into a SKIP on
+-- the builds that use the other, which is the failure mode this probe exists to
+-- prevent; accepting anything that merely is not the driver's marker is just as
+-- wrong in the other direction, because a wrong or empty XCOM_LUAJIT makes the
+-- shell answer "'""' is not recognized" and that would be read as "this file
+-- does not compile" 20 times over.  So the probe wants a positive signature and
+-- SKIPs otherwise.
 -- --------------------------------------------------------------------------
 local dump_ok
 local function dump_supported()
     if dump_ok == nil then
-        local pipe = io.popen(shq(LUAJIT) .. " -bl " .. shq(FILES[1]) .. " 2>&1")
-        local first = (pipe and pipe:read("*l")) or ""
+        local pipe = io.popen(popen_cmd(LUAJIT,
+            "-bl " .. shq(FILES[1]) .. " 2>&1"))
+        -- The banner is on the first lines; the older "main <...>" header is
+        -- the first non-empty line.
+        local first = ""
+        local banner = false
+        for _ = 1, 8 do
+            local line = pipe and pipe:read("*l")
+            if not line then break end
+            if line ~= "" and first == "" then
+                first = line
+            end
+            if line:find("-- BYTECODE", 1, true) then banner = true end
+        end
         if pipe then
             pipe:close()
         end
-        dump_ok = first:match("^main%s*<") ~= nil
+        dump_ok = banner or first:match("^main%s*<") ~= nil
     end
     return dump_ok
 end
@@ -249,9 +289,12 @@ if dump_supported() then
         check_globals(path)
     end
 else
-    print("SKIP  GGET scan: " .. LUAJIT .. " cannot dump bytecode (no jit.bcs)."
-          .. "  Set XCOM_LUAJIT to a stock LuaJIT to enable it; Check 1b above"
-          .. " covers the same defect class statically, on any interpreter.")
+    print("SKIP  GGET scan: " .. LUAJIT .. " cannot dump bytecode."
+          .. "  Point XCOM_LUAJIT at a LuaJIT built with the dumper (its jit/"
+          .. " tree, or jit.bcs, must be reachable: a locally built luajit"
+          .. " needs LUA_PATH to include <luajit-src>/?.lua and /?/?.lua)."
+          .. "  Check 1b above covers the same defect class statically, on any"
+          .. " interpreter.")
 end
 check_win32_fields()
 
