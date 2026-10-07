@@ -295,7 +295,7 @@ constexpr Lang kLangZh{
     /*serial_field_labels*/ {"波特率", "数据位", "停止位", "校验位", "流控"},
     /*subtitle*/ "串口助手",
     /*menu_select_all*/ "全选", /*menu_copy*/ "复制", /*menu_paste*/ "粘贴",
-    /*menu_copy_sel*/ "复制选中", /*menu_copy_all*/ "复制保留尾部",
+    /*menu_copy_sel*/ "复制选中", /*menu_copy_all*/ "复制全部",
     /*menu_copy_strip_ts*/ "复制时去除时间戳", /*menu_clear_log*/ "清空日志",
     /*menu_save_log*/ "保存日志到文件...", /*menu_resume*/ "继续显示",
     /*script_new*/ "新建", /*script_open_folder*/ "打开文件夹",
@@ -341,7 +341,7 @@ constexpr Lang kLangEn{
     /*serial_field_labels*/ {"BAUD", "DATA", "STOP", "PARITY", "FLOW"},
     /*subtitle*/ "SERIAL CONSOLE",
     /*menu_select_all*/ "Select all", /*menu_copy*/ "Copy", /*menu_paste*/ "Paste",
-    /*menu_copy_sel*/ "Copy selection", /*menu_copy_all*/ "Copy retained tail",
+    /*menu_copy_sel*/ "Copy selection", /*menu_copy_all*/ "Copy all",
     /*menu_copy_strip_ts*/ "Copy without timestamps", /*menu_clear_log*/ "Clear log",
     /*menu_save_log*/ "Save log to file...", /*menu_resume*/ "Resume display",
     /*script_new*/ "New", /*script_open_folder*/ "Open folder",
@@ -2226,12 +2226,14 @@ void ArrowScrollbar(const ImVec2 bar_min, const ImVec2 bar_max, float row_h,
         const bool has_text = !runtime.receive_text_.empty();
         const Lang& lang = runtime.lang();
         // Flat menu: the receive context menu has NO second level (user ask).
+        // The COPY group is exactly two entries (user ask): selection and the
+        // whole log.  The third one it used to carry ("copy without
+        // timestamps") was a policy switch, not a copy -- the policy still
+        // lives in one place (core/receive_copy.lua, honouring
+        // [display] strip_timestamp_on_copy) and nothing in the UI toggles it.
         // The copy items do NOT touch the clipboard here: they queue the
         // requested bytes (QueueReceiveCopy) and the Lua bridge writes the
-        // clipboard after applying the optional timestamp strip.  That keeps
-        // the strip policy in ONE place (core/receive_copy.lua, unit-tested
-        // headless) instead of duplicating the pattern in C++.  Ctrl+C mirrors
-        // "Copy selection".
+        // clipboard after applying that strip.  Ctrl+C mirrors "Copy selection".
         if (ImGui::MenuItem(lang.menu_copy_sel, nullptr, false, has_sel)) {
             QueueReceiveCopy(runtime, runtime.receive_sel_begin_,
                              runtime.receive_sel_end_);
@@ -2242,17 +2244,6 @@ void ArrowScrollbar(const ImVec2 bar_min, const ImVec2 bar_max, float row_h,
             QueueReceiveCopy(runtime, runtime.receive_base_,
                              runtime.receive_base_ +
                                  runtime.receive_text_.size());
-        }
-        // Copy policy: when on, the injected "[HH:MM:SS.mmm] " prefixes are
-        // stripped before the clipboard write.  The toggle is a Lua-owned int
-        // (registered via xcom_imgui_set_copy_strip) so the Lua side both
-        // persists and applies it; the item hides when the bridge did not
-        // register the pointer (older Lua/DLL pairing).
-        if (runtime.copy_strip_ts_ != nullptr) {
-            bool strip = *runtime.copy_strip_ts_ != 0;
-            if (ImGui::MenuItem(lang.menu_copy_strip_ts, nullptr, strip)) {
-                *runtime.copy_strip_ts_ = strip ? 0 : 1;
-            }
         }
         ImGui::Separator();
         // Select every retained byte: base..base+size is exactly the window, so

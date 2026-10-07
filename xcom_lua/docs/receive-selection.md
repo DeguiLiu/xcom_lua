@@ -32,8 +32,11 @@
 4. 高亮实时出现：与该行相交时，在文字**底下**（先画色块再提交 `TextUnformatted`）画
    `ImGuiCol_TextSelectedBg` 色矩形；选到行尾色块铺满整行宽度。
 5. 松开左键：锚点回 `kNoSelAnchor`；命中过则选区持久保留，纯点击空白则清零。
-6. 右键菜单：`Copy selection`（`substr` + `SetClipboardText`）、`Copy all`、`Clear log`
-   （返回 `ActionClear`，Lua 调 `set_receive_text("")`）。
+6. 右键菜单的**复制组只有两项**：`复制选中`（`Copy selection`）与 `复制全部`（`Copy all`），
+   两者都只把区间入队（`QueueReceiveCopy`），剪贴板由 Lua 侧写。`全选`、十六进制/时间戳/暂停、
+   保存日志/清空日志仍在菜单中（2026-10-07 用户要求：复制相关命令保留两个即可）。
+   `复制全部` 只覆盖**仍在窗口内**的尾部（`receive_limit_`，默认 64 KiB - 1），更早的字节已被裁剪
+   出视图，字节忠实的来源是自动保存日志。
 7. 清除选区没有独立操作：下次按下即隐式清空；滚动/跟随新数据**不会**清除已有高亮。
 
 ## 数据结构：以字节偏移为唯一坐标
@@ -165,7 +168,8 @@ O(1) 零猜测。
   路由按焦点域判定，输入框持有焦点时不抢占）。复制不再由 C++ 直接写剪贴板，而是把请求入队
   （`QueueReceiveCopy`），由 Lua 侧 `service_receive_copy` 用 `core/receive_copy.lua` 的纯函数
   `strip_timestamps` 按「复制时去除时间戳」开关处理后写剪贴板；该开关默认关闭、经
-  `[display] strip_timestamp_on_copy` 持久化。
+  `[display] strip_timestamp_on_copy` 持久化。该开关的菜单项已随「复制组压到两项」移除，
+  当前无 UI 入口（`xcom_imgui_set_copy_strip` 导出保留，值取自配置文件；策略逻辑与单测未动）。
 
 ## 拖选冻结的进程内验证（2026-10-04，自动化）
 
