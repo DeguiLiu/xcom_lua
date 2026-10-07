@@ -5128,7 +5128,15 @@ function Window:start()
         -- smoke path otherwise, and the tail/scroll verification needs the
         -- data to arrive from outside the ImGui frame -- which is exactly
         -- what the sim pump does.  Unset in normal runs: no behaviour change.
-        enabled = os.getenv("XCOM_SIM_FORCE") == "1",
+        --
+        -- self.sim_force is the same switch for a harness that must select the
+        -- fixture deterministically (tests/e2e_drag_freeze.lua sets it before
+        -- start()).  It exists because a suite CANNOT turn itself on from
+        -- inside the process: uv.os_setenv writes the Win32 block and CRT
+        -- _putenv writes the calling DLL's copy, but LuaJIT's os.getenv reads
+        -- its own statically linked CRT, which sees neither.  Verified on this
+        -- box: both calls report success and os.getenv still returns nil.
+        enabled = self.sim_force or os.getenv("XCOM_SIM_FORCE") == "1",
         -- Low-frequency lifecycle diagnostics (arm/stop/overflow) -> stderr.
         log = function(tag, msg) io.stderr:write("[" .. tag .. "] " .. msg .. "\n") end,
     })

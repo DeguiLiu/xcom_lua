@@ -7,11 +7,16 @@
 -- ffi.C to that handle for the duration of `require`, then restore it — the
 -- patched module captures the function refs once, at load time.
 --
--- Usage from repo root:
+-- Usage (any cwd):
 --     xcom_lua\runtime\luvjit.exe xcom_lua\tests\test_iconv.lua
 
 print("BEGAN")
-local BASE = "xcom_lua/libs/openresty/"
+-- Script-relative (see test_lua51-libs.lua): with a literal "xcom_lua/..." path
+-- the suite only ran from the repo root and failed with "module 'resty.iconv'
+-- not found" everywhere else.
+local script_dir =
+    ((arg and arg[0]) or "tests/test_iconv.lua"):match("^(.*)[/\\]") or "."
+local BASE = script_dir .. "/../../xcom_lua/libs/openresty/"
 package.path = BASE .. "?.lua;" .. package.path
 
 local passed, failed = 0, 0

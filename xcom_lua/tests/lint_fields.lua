@@ -1,5 +1,13 @@
 -- lint_fields.lua - static lint for the Win32 layer, runnable on Linux.
--- Usage: /home/dgliu/.local/openresty/luajit/bin/luajit tests/lint_fields.lua
+-- Usage (Linux):  /home/dgliu/.local/openresty/luajit/bin/luajit tests/lint_fields.lua
+-- Usage (Windows, cwd = xcom_lua): the GGET half needs an interpreter that can
+-- dump bytecode.  The in-tree build has the dumper but resolves jit/*.lua from
+-- LUA_PATH, so both must be set (paths from this checkout's root):
+--     set XCOM_LUAJIT=<repo>\luajit2-2.1-agentzh\src\luajit.exe
+--     set LUA_PATH=<repo>\luajit2-2.1-agentzh\src\?.lua;;
+--     runtime\luajit.exe tests\lint_fields.lua
+-- Verified 2026-10-07: that pair scans all 20 files (no SKIP).  Unset, it
+-- prints SKIP for the GGET half and only the static half runs.
 --
 -- Catches two bug classes that `luajit -bl` and the pure-Lua unit tests both
 -- miss, and that only surface as a crash or a silently-wrong Win32 call on

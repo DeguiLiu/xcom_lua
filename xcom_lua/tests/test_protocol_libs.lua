@@ -9,10 +9,14 @@
 --   s          zero-terminated string (pack appends NUL)
 --   c<n>       fixed-width string, space-padded
 --
--- Usage from repo root:
---   ./xcom_lua/runtime/luvjit.exe xcom_lua/tests/test_protocol_libs.lua
+-- Usage (any cwd):
+--   xcom_lua/runtime/luvjit.exe xcom_lua/tests/test_protocol_libs.lua
 
-local BASE = "xcom_lua/libs/protocol/"
+-- Script-relative (see test_lua51-libs.lua): a literal "xcom_lua/..." path made
+-- the suite depend on the caller's cwd and report "module 'struct' not found".
+local script_dir =
+    ((arg and arg[0]) or "tests/test_protocol_libs.lua"):match("^(.*)[/\\]") or "."
+local BASE = script_dir .. "/../../xcom_lua/libs/protocol/"
 package.path = BASE .. "?.lua;" .. package.path
 
 local passed, failed = 0, 0

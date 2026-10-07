@@ -3,7 +3,7 @@
 -- LuaJIT process (no nginx host). B-tier modules are expected to fail to
 -- load — we only assert that they fail with a recognisable error.
 --
--- Usage from repo root:
+-- Usage (any cwd):
 --     xcom_lua\runtime\luvjit.exe xcom_lua\tests\test_openresty_lua.lua
 -- or, with package.path pointing at the third_party tree:
 --     LUA_PATH="third_party/openresty-lua/lua/?.lua;third_party/openresty-lua/lualib/?.lua;;" \
@@ -20,9 +20,14 @@
 -- before substituting '?', so a single '?/?.lua' pair resolves both
 -- top-level and nested modules:  tablepool      -> openresty/tablepool.lua
 --                                 resty.lrucache -> openresty/resty/lrucache.lua
-local TPLIB = "xcom_lua/libs/openresty/"
+-- Script-relative (see test_lua51-libs.lua): a literal "xcom_lua/..." path made
+-- the suite depend on the caller's cwd ("module 'tablepool' not found" from
+-- xcom_lua/tests).
+local script_dir =
+    ((arg and arg[0]) or "tests/test_openresty_lua.lua"):match("^(.*)[/\\]") or "."
+local TPLIB = script_dir .. "/../../xcom_lua/libs/openresty/"
 package.path = TPLIB .. "?.lua;"
-            .. "xcom_lua/libs/jit-tools/?.lua;"
+            .. script_dir .. "/../../xcom_lua/libs/jit-tools/?.lua;"
             .. package.path
 print("openresty-lua path: " .. TPLIB)
 

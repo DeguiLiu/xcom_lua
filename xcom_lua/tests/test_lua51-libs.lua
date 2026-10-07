@@ -8,11 +8,16 @@
 -- B-tier (needs C libs or mutates LuaJIT built-ins) is checked as
 -- "loads without throwing" / "file present" only — never deep-executed.
 --
--- Usage:
---   cd D:/workspace/SSCOM_lua
---   ./xcom_lua/runtime/luvjit.exe xcom_lua/tests/test_lua51-libs.lua
+-- Usage (any cwd):
+--   xcom_lua/runtime/luvjit.exe xcom_lua/tests/test_lua51-libs.lua
 
-local BASE = "xcom_lua/libs/lua51/"
+-- Resolve the vendored tree from THIS file's location, never from the cwd.
+-- The path used to be the literal "xcom_lua/libs/lua51/", so running the suite
+-- from xcom_lua/tests -- the natural place for it -- failed every module with a
+-- bogus "module '30log' not found" that looked like a missing vendor tree.
+local script_dir =
+    ((arg and arg[0]) or "tests/test_lua51-libs.lua"):match("^(.*)[/\\]") or "."
+local BASE = script_dir .. "/../../xcom_lua/libs/lua51/"
 local STD  = BASE .. "stdlib-ext/"
 local PL   = BASE .. "penlight/"
 package.path = table.concat({

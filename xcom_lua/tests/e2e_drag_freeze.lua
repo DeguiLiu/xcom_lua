@@ -114,11 +114,27 @@ if not (ok and win) then
     emit("init failed: " .. tostring(win))
     os.exit(2)
 end
+-- The simulator is this suite's DATA SOURCE, and it auto-activates only while
+-- the port enumeration is empty (core/serial_sim.lua:available()).  On a host
+-- that does enumerate a port -- i.e. exactly the host a hardware round uses --
+-- the pump is never armed: the VIRTUAL session still opens, but no byte ever
+-- arrives, no frame is drawn, and the settle phase fails with "rect=0x0",
+-- which reads as "the drag freeze is broken" when nothing was driving the log
+-- at all.  Select the fixture explicitly (window.lua:sim_force), so the suite
+-- measures the same thing on every host; the env var cannot be used here
+-- because LuaJIT's os.getenv cannot see an in-process setenv.
+win.sim_force = true
+emit("[fixture] sim forced on (this suite's data source)")
 if not win:init_window() then
     emit("window create failed")
     os.exit(2)
 end
 win:start()
+
+if not win._sim_active then
+    emit("FAIL: simulator still inactive after sim_force -- no data producer")
+    os.exit(2)
+end
 
 -- Open the simulator exactly as Window:_smoke_env_hooks does, through the same
 -- core_open the "open" button routes through, then raise the rate: the default
